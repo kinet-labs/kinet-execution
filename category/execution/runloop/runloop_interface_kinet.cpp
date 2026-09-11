@@ -1,21 +1,21 @@
-// Copyright (C) 2025-26 Kinet Labs, Inc.
+// Copyright (C) 2025-26 Category Labs, Inc.
 //
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the Apache-2.0 license as published by
+// it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// Apache-2.0 license for more details.
+// GNU General Public License for more details.
 //
-// You should have received a copy of the Apache-2.0 license
-// along with this program.  If not, see <http://www.apache.org/licenses/>.
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include <category/core/fiber/priority_pool.hpp>
 #include <category/core/log.hpp>
-#include <category/core/kinet_exception.hpp>
+#include <category/core/monad_exception.hpp>
 #include <category/execution/ethereum/block_hash_buffer.hpp>
 #include <category/execution/ethereum/block_hash_buffer/util.hpp>
 #include <category/execution/ethereum/core/fmt/bytes_fmt.hpp>
@@ -23,12 +23,12 @@
 #include <category/execution/ethereum/db/trie_db.hpp>
 #include <category/execution/ethereum/state2/block_state.hpp>
 #include <category/execution/ethereum/state3/state.hpp>
-#include <category/execution/kinet/chain/kinet_chain.hpp>
-#include <category/execution/kinet/chain/kinet_devnet.hpp>
-#include <category/execution/kinet/chain/kinet_mainnet.hpp>
-#include <category/execution/kinet/chain/kinet_testnet.hpp>
-#include <category/execution/runloop/runloop_interface_kinet.h>
-#include <category/execution/runloop/runloop_kinet.hpp>
+#include <category/execution/monad/chain/monad_chain.hpp>
+#include <category/execution/monad/chain/monad_devnet.hpp>
+#include <category/execution/monad/chain/monad_mainnet.hpp>
+#include <category/execution/monad/chain/monad_testnet.hpp>
+#include <category/execution/runloop/runloop_interface_monad.h>
+#include <category/execution/runloop/runloop_monad.hpp>
 #include <category/mpt/db.hpp>
 #include <category/vm/vm.hpp>
 
@@ -38,10 +38,10 @@
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
 
-using namespace kinet;
+using namespace monad;
 namespace fs = std::filesystem;
 
-KINET_ANONYMOUS_NAMESPACE_BEGIN
+MONAD_ANONYMOUS_NAMESPACE_BEGIN
 
 unsigned const sq_thread_cpu = 7;
 quill::LogLevel const log_level = quill::LogLevel::Info;
@@ -52,18 +52,18 @@ unsigned const mainnet_chain_id = 143;
 unsigned const devnet_chain_id = 20143;
 unsigned const testnet_chain_id = 10143;
 
-std::unique_ptr<KinetChain> kinet_chain_from_chain_id(uint64_t const chain_id)
+std::unique_ptr<MonadChain> monad_chain_from_chain_id(uint64_t const chain_id)
 {
     if (chain_id == mainnet_chain_id) {
-        return std::make_unique<KinetMainnet>();
+        return std::make_unique<MonadMainnet>();
     }
     if (chain_id == devnet_chain_id) {
-        return std::make_unique<KinetDevnet>();
+        return std::make_unique<MonadDevnet>();
     }
     if (chain_id == testnet_chain_id) {
-        return std::make_unique<KinetTestnet>();
+        return std::make_unique<MonadTestnet>();
     }
-    KINET_ABORT("invalid chain id");
+    MONAD_ABORT("invalid chain id");
 }
 
 struct AccountOverride
@@ -73,13 +73,13 @@ struct AccountOverride
 
 using AccountOverrideMap = std::unordered_map<Address, AccountOverride>;
 
-class KinetRunloopTrieDb : public Db
+class MonadRunloopTrieDb : public Db
 {
     Db &triedb_;
     AccountOverrideMap const &account_override_;
 
 public:
-    KinetRunloopTrieDb(Db &db, AccountOverrideMap const &account_override)
+    MonadRunloopTrieDb(Db &db, AccountOverrideMap const &account_override)
         : triedb_{db}
         , account_override_{account_override}
     {
@@ -205,24 +205,24 @@ public:
     }
 };
 
-struct KinetRunloopImpl
+struct MonadRunloopImpl
 {
-    std::unique_ptr<KinetChain> chain;
+    std::unique_ptr<MonadChain> chain;
     fs::path ledger_dir;
     AccountOverrideMap account_override;
     mpt::Db raw_db;
     mpt::Db secondary_raw_db;
     TrieDb triedb;
     TrieDb secondary_triedb;
-    KinetRunloopTrieDb runloop_db;
-    KinetRunloopTrieDb secondary_runloop_db;
+    MonadRunloopTrieDb runloop_db;
+    MonadRunloopTrieDb secondary_runloop_db;
     vm::VM vm;
     BlockHashBufferFinalized block_hash_buffer;
     fiber::PriorityPool priority_pool;
     uint64_t block_num;
     uint64_t start_block_num;
 
-    KinetRunloopImpl(
+    MonadRunloopImpl(
         uint64_t chain_id, char const *ledger_path, char const *db_path);
 };
 
@@ -230,18 +230,18 @@ mpt::Db get_secondary_raw_db(mpt::Db &db)
 {
     if (db.timeline_active(mpt::timeline_id::secondary)) {
         auto db2 =
-            db.open_secondary_timeline(std::make_unique<KinetOnDiskMachine>());
-        KINET_ASSERT(db2.has_value());
+            db.open_secondary_timeline(std::make_unique<MonadOnDiskMachine>());
+        MONAD_ASSERT(db2.has_value());
         return std::move(*db2);
     }
     return db.activate_secondary_timeline(
-        std::make_unique<KinetOnDiskMachine>());
+        std::make_unique<MonadOnDiskMachine>());
 }
 
-KinetRunloopImpl::KinetRunloopImpl(
+MonadRunloopImpl::MonadRunloopImpl(
     uint64_t const chain_id, char const *const ledger_path,
     char const *const db_path)
-    : chain{kinet_chain_from_chain_id(chain_id)}
+    : chain{monad_chain_from_chain_id(chain_id)}
     , ledger_dir{ledger_path}
     , raw_db{std::make_unique<OnDiskMachine>(), mpt::OnDiskDbConfig{.append = true, .compaction = true, .rewind_to_latest_finalized = true, .rd_buffers = 8192, .wr_buffers = 32, .uring_entries = 128, .sq_thread_cpu = sq_thread_cpu, .dbname_paths = {fs::path{db_path}}}}
     , secondary_raw_db{get_secondary_raw_db(raw_db)}
@@ -253,8 +253,8 @@ KinetRunloopImpl::KinetRunloopImpl(
     , block_hash_buffer{}
     , priority_pool{nthreads, nfibers}
 {
-    KINET_ASSERT(triedb.is_page_encoded() == false);
-    KINET_ASSERT(secondary_triedb.is_page_encoded() == true);
+    MONAD_ASSERT(triedb.is_page_encoded() == false);
+    MONAD_ASSERT(secondary_triedb.is_page_encoded() == true);
     if (triedb.get_root() == nullptr) {
         LOG_INFO("loading from genesis");
         GenesisState const genesis_state = chain->get_genesis_state();
@@ -278,43 +278,43 @@ KinetRunloopImpl::KinetRunloopImpl(
         init_block_hash_buffer_from_triedb(rodb, block_num, block_hash_buffer);
     if (!have_headers) {
         BlockDb block_db{ledger_path};
-        KINET_ASSERT(chain_id == mainnet_chain_id);
-        KINET_ASSERT(init_block_hash_buffer_from_blockdb(
+        MONAD_ASSERT(chain_id == mainnet_chain_id);
+        MONAD_ASSERT(init_block_hash_buffer_from_blockdb(
             block_db, block_num, block_hash_buffer));
     }
 }
 
-KinetRunloopImpl *to_impl(KinetRunloop *const x)
+MonadRunloopImpl *to_impl(MonadRunloop *const x)
 {
-    return reinterpret_cast<KinetRunloopImpl *>(x);
+    return reinterpret_cast<MonadRunloopImpl *>(x);
 }
 
-KinetRunloop *from_impl(KinetRunloopImpl *const x)
+MonadRunloop *from_impl(MonadRunloopImpl *const x)
 {
-    return reinterpret_cast<KinetRunloop *>(x);
+    return reinterpret_cast<MonadRunloop *>(x);
 }
 
-Address to_address(KinetRunloopAddress const *const a)
+Address to_address(MonadRunloopAddress const *const a)
 {
     return std::bit_cast<Address>(*a);
 }
 
-uint256_t to_uint256(KinetRunloopWord const *const x)
+uint256_t to_uint256(MonadRunloopWord const *const x)
 {
     return load_be<uint256_t>(*x);
 }
 
-class RunloopOverrideMethods : public RunloopKinetOverrideMethods
+class RunloopOverrideMethods : public RunloopMonadOverrideMethods
 {
 private:
     uint64_t start_block_num_;
     AccountOverrideMap &account_override_;
-    KinetRunloopTrieDb &runloop_db_;
+    MonadRunloopTrieDb &runloop_db_;
 
 public:
     RunloopOverrideMethods(
         uint64_t const start_block_num, AccountOverrideMap &account_override,
-        KinetRunloopTrieDb &runloop_db)
+        MonadRunloopTrieDb &runloop_db)
         : start_block_num_{start_block_num}
         , account_override_{account_override}
         , runloop_db_{runloop_db}
@@ -368,9 +368,9 @@ public:
     }
 };
 
-KINET_ANONYMOUS_NAMESPACE_END
+MONAD_ANONYMOUS_NAMESPACE_END
 
-extern "C" KinetRunloop *kinet_runloop_new(
+extern "C" MonadRunloop *monad_runloop_new(
     uint64_t const chain_id, char const *const ledger_path,
     char const *const db_path)
 {
@@ -379,18 +379,18 @@ extern "C" KinetRunloop *kinet_runloop_new(
         init_root_logger(log_level);
         is_quill_running = true;
     }
-    return from_impl(new KinetRunloopImpl{chain_id, ledger_path, db_path});
+    return from_impl(new MonadRunloopImpl{chain_id, ledger_path, db_path});
 }
 
-extern "C" void kinet_runloop_delete(KinetRunloop *const runloop)
+extern "C" void monad_runloop_delete(MonadRunloop *const runloop)
 {
     delete to_impl(runloop);
 }
 
 extern "C" void
-kinet_runloop_run(KinetRunloop *const pre_runloop, uint64_t const nblocks)
+monad_runloop_run(MonadRunloop *const pre_runloop, uint64_t const nblocks)
 try {
-    KinetRunloopImpl *const runloop = to_impl(pre_runloop);
+    MonadRunloopImpl *const runloop = to_impl(pre_runloop);
 
     auto const block_num_before = runloop->block_num;
 
@@ -398,10 +398,10 @@ try {
         runloop->start_block_num,
         runloop->account_override,
         runloop->runloop_db};
-    RunloopKinetOverride runloop_override{&override_methods};
+    RunloopMonadOverride runloop_override{&override_methods};
 
     sig_atomic_t const stop = 0;
-    auto const result = runloop_kinet(
+    auto const result = runloop_monad(
         *runloop->chain,
         runloop->ledger_dir,
         runloop->raw_db,
@@ -419,35 +419,35 @@ try {
 
     auto const block_num_after = runloop->block_num;
 
-    if (KINET_UNLIKELY(result.has_error())) {
+    if (MONAD_UNLIKELY(result.has_error())) {
         LOG_ERROR(
             "block {} failed with: {}",
             block_num_after,
             result.assume_error().message().c_str());
-        KINET_ABORT();
+        MONAD_ABORT();
     }
-    KINET_ASSERT(block_num_after - block_num_before == nblocks);
+    MONAD_ASSERT(block_num_after - block_num_before == nblocks);
 }
-catch (KinetException const &e) {
+catch (MonadException const &e) {
     e.print();
     std::terminate();
 }
 
-extern "C" void kinet_runloop_set_balance(
-    KinetRunloop *const pre_runloop, KinetRunloopAddress const *const raw_addr,
-    KinetRunloopWord const *const raw_bal)
+extern "C" void monad_runloop_set_balance(
+    MonadRunloop *const pre_runloop, MonadRunloopAddress const *const raw_addr,
+    MonadRunloopWord const *const raw_bal)
 {
-    KinetRunloopImpl *const runloop = to_impl(pre_runloop);
+    MonadRunloopImpl *const runloop = to_impl(pre_runloop);
     auto const addr = to_address(raw_addr);
     auto const bal = to_uint256(raw_bal);
     runloop->account_override[addr].balance = bal;
 }
 
-extern "C" void kinet_runloop_get_balance(
-    KinetRunloop *const pre_runloop, KinetRunloopAddress const *const raw_addr,
-    KinetRunloopWord *const result_balance)
+extern "C" void monad_runloop_get_balance(
+    MonadRunloop *const pre_runloop, MonadRunloopAddress const *const raw_addr,
+    MonadRunloopWord *const result_balance)
 {
-    KinetRunloopImpl *const runloop = to_impl(pre_runloop);
+    MonadRunloopImpl *const runloop = to_impl(pre_runloop);
     uint256_t bal;
     auto const addr = to_address(raw_addr);
     auto const over_it = runloop->account_override.find(addr);
@@ -463,24 +463,24 @@ extern "C" void kinet_runloop_get_balance(
     store_be(result_balance->bytes, bal);
 }
 
-extern "C" void kinet_runloop_get_primary_state_root(
-    KinetRunloop *const pre_runloop, KinetRunloopWord *const result_state_root)
+extern "C" void monad_runloop_get_primary_state_root(
+    MonadRunloop *const pre_runloop, MonadRunloopWord *const result_state_root)
 {
-    KinetRunloopImpl *const runloop = to_impl(pre_runloop);
+    MonadRunloopImpl *const runloop = to_impl(pre_runloop);
     *result_state_root =
-        std::bit_cast<KinetRunloopWord>(runloop->triedb.state_root());
+        std::bit_cast<MonadRunloopWord>(runloop->triedb.state_root());
 }
 
-extern "C" void kinet_runloop_get_secondary_state_root(
-    KinetRunloop *const pre_runloop, KinetRunloopWord *const result_state_root)
+extern "C" void monad_runloop_get_secondary_state_root(
+    MonadRunloop *const pre_runloop, MonadRunloopWord *const result_state_root)
 {
-    KinetRunloopImpl *const runloop = to_impl(pre_runloop);
-    *result_state_root = std::bit_cast<KinetRunloopWord>(
+    MonadRunloopImpl *const runloop = to_impl(pre_runloop);
+    *result_state_root = std::bit_cast<MonadRunloopWord>(
         runloop->secondary_runloop_db.state_root());
 }
 
-extern "C" void kinet_runloop_dump(KinetRunloop *const pre_runloop)
+extern "C" void monad_runloop_dump(MonadRunloop *const pre_runloop)
 {
-    KinetRunloopImpl *const runloop = to_impl(pre_runloop);
+    MonadRunloopImpl *const runloop = to_impl(pre_runloop);
     std::cout << runloop->triedb.to_json().dump(4) << std::endl;
 }

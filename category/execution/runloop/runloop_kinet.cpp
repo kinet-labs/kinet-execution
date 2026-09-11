@@ -1,19 +1,19 @@
-// Copyright (C) 2025 Kinet Labs, Inc.
+// Copyright (C) 2025 Category Labs, Inc.
 //
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the Apache-2.0 license as published by
+// it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// Apache-2.0 license for more details.
+// GNU General Public License for more details.
 //
-// You should have received a copy of the Apache-2.0 license
-// along with this program.  If not, see <http://www.apache.org/licenses/>.
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-#include "runloop_kinet.hpp"
+#include "runloop_monad.hpp"
 #include "file_io.hpp"
 
 #include <category/core/assert.h>
@@ -43,13 +43,13 @@
 #include <category/execution/ethereum/transaction_gas.hpp>
 #include <category/execution/ethereum/validate_block.hpp>
 #include <category/execution/ethereum/validate_transaction.hpp>
-#include <category/execution/kinet/chain/kinet_chain.hpp>
-#include <category/execution/kinet/core/kinet_block.hpp>
-#include <category/execution/kinet/core/rlp/kinet_block_rlp.hpp>
-#include <category/execution/kinet/db/commit_block_migration.hpp>
-#include <category/execution/kinet/event/record_consensus_events.hpp>
-#include <category/execution/kinet/reserve_balance.hpp>
-#include <category/execution/kinet/validate_kinet_block.hpp>
+#include <category/execution/monad/chain/monad_chain.hpp>
+#include <category/execution/monad/core/monad_block.hpp>
+#include <category/execution/monad/core/rlp/monad_block_rlp.hpp>
+#include <category/execution/monad/db/commit_block_migration.hpp>
+#include <category/execution/monad/event/record_consensus_events.hpp>
+#include <category/execution/monad/reserve_balance.hpp>
+#include <category/execution/monad/validate_monad_block.hpp>
 #include <category/mpt/db.hpp>
 #include <category/vm/evm/switch_traits.hpp>
 #include <category/vm/evm/traits.hpp>
@@ -67,7 +67,7 @@
 #include <variant>
 #include <vector>
 
-KINET_ANONYMOUS_NAMESPACE_BEGIN
+MONAD_ANONYMOUS_NAMESPACE_BEGIN
 
 struct BlockCacheEntry
 {
@@ -108,14 +108,14 @@ void log_tps(
         ntxs,
         tps,
         gps,
-        kinet_procfs_self_resident() / (1L << 20));
+        monad_procfs_self_resident() / (1L << 20));
 };
 
 #pragma GCC diagnostic pop
 
-template <class KinetConsensusBlockHeader>
+template <class MonadConsensusBlockHeader>
 bool has_executed(
-    mpt::Db const &db, KinetConsensusBlockHeader const &header,
+    mpt::Db const &db, MonadConsensusBlockHeader const &header,
     bytes32_t const &block_id)
 {
     auto const prefix = proposal_prefix(block_id);
@@ -126,13 +126,13 @@ bool validate_delayed_execution_results(
     BlockHashBuffer const &block_hash_buffer,
     std::vector<BlockHeader> const &execution_results)
 {
-    if (KINET_UNLIKELY(execution_results.empty())) {
+    if (MONAD_UNLIKELY(execution_results.empty())) {
         return true;
     }
 
     uint64_t expected_block_number = execution_results.front().number;
     for (auto const &result : execution_results) {
-        if (KINET_UNLIKELY(expected_block_number != result.number)) {
+        if (MONAD_UNLIKELY(expected_block_number != result.number)) {
             LOG_ERROR(
                 "Validated blocks not increasing. Expected block {}, got block "
                 "{}",
@@ -143,7 +143,7 @@ bool validate_delayed_execution_results(
 
         auto const block_hash =
             to_bytes(keccak256(rlp::encode_block_header(result)));
-        if (KINET_UNLIKELY(
+        if (MONAD_UNLIKELY(
                 block_hash != block_hash_buffer.get(result.number))) {
             LOG_ERROR(
                 "Delayed execution result mismatch for block {}",
@@ -158,33 +158,33 @@ bool validate_delayed_execution_results(
 Result<void> validate_live_execution_outputs(
     BlockHeader const &input, BlockHeader const &output)
 {
-    if (KINET_UNLIKELY(input.ommers_hash != output.ommers_hash)) {
+    if (MONAD_UNLIKELY(input.ommers_hash != output.ommers_hash)) {
         return BlockError::WrongOmmersHash;
     }
-    if (KINET_UNLIKELY(input.transactions_root != output.transactions_root)) {
+    if (MONAD_UNLIKELY(input.transactions_root != output.transactions_root)) {
         return BlockError::WrongMerkleRoot;
     }
-    if (KINET_UNLIKELY(input.withdrawals_root != output.withdrawals_root)) {
+    if (MONAD_UNLIKELY(input.withdrawals_root != output.withdrawals_root)) {
         return BlockError::WrongMerkleRoot;
     }
 
     // YP eq. 56
-    if (KINET_UNLIKELY(output.gas_used > output.gas_limit)) {
+    if (MONAD_UNLIKELY(output.gas_used > output.gas_limit)) {
         return BlockError::GasAboveLimit;
     }
     return outcome::success();
 }
 
-template <Traits traits, class KinetConsensusBlockHeader>
-    requires is_kinet_trait_v<traits>
+template <Traits traits, class MonadConsensusBlockHeader>
+    requires is_monad_trait_v<traits>
 Result<BlockExecOutput> propose_block(
     bytes32_t const &block_id,
-    KinetConsensusBlockHeader const &consensus_header, Block block,
-    BlockHashChain &block_hash_chain, KinetChain const &chain, Db &db,
+    MonadConsensusBlockHeader const &consensus_header, Block block,
+    BlockHashChain &block_hash_chain, MonadChain const &chain, Db &db,
     vm::VM &vm, fiber::PriorityPool &priority_pool, bool const is_first_block,
     bool const enable_tracing, BlockCache &block_cache,
     ExecutionEventRecorder *const exec_recorder, Db *secondary_db,
-    RunloopKinetOverride const runloop_override)
+    RunloopMonadOverride const runloop_override)
 {
     [[maybe_unused]] auto const block_start = std::chrono::system_clock::now();
     auto const block_begin = std::chrono::steady_clock::now();
@@ -217,7 +217,7 @@ Result<BlockExecOutput> propose_block(
     auto senders_and_authorities =
         combine_senders_and_authorities(senders, recovered_authorities);
 
-    KINET_ASSERT(block_cache
+    MONAD_ASSERT(block_cache
                      .emplace(
                          block_id,
                          BlockCacheEntry{
@@ -227,7 +227,7 @@ Result<BlockExecOutput> propose_block(
                                  std::move(senders_and_authorities)})
                      .second);
     BOOST_OUTCOME_TRY(
-        static_validate_kinet_body<traits>(senders, block.transactions));
+        static_validate_monad_body<traits>(senders, block.transactions));
 
     // Create call frames vectors for tracers
     std::vector<std::vector<CallFrame>> call_frames{block.transactions.size()};
@@ -252,11 +252,11 @@ Result<BlockExecOutput> propose_block(
           parent_senders_and_authorities] = [&] {
             if (block.header.number > 1) {
                 bytes32_t const &parent_id = consensus_header.parent_id();
-                KINET_ASSERT(block_cache.contains(parent_id));
+                MONAD_ASSERT(block_cache.contains(parent_id));
                 BlockCacheEntry const &parent_entry = block_cache.at(parent_id);
                 if (block.header.number > 2) {
                     bytes32_t const &grandparent_id = parent_entry.parent_id;
-                    KINET_ASSERT(block_cache.contains(grandparent_id));
+                    MONAD_ASSERT(block_cache.contains(grandparent_id));
                     BlockCacheEntry const &grandparent_entry =
                         block_cache.at(grandparent_id);
                     return std::tuple{
@@ -290,7 +290,7 @@ Result<BlockExecOutput> propose_block(
     block.header.parent_hash =
         to_bytes(keccak256(rlp::encode_block_header(db.read_eth_header())));
 
-    // EIP-7843: surface the Kinet consensus round to execution via the EL
+    // EIP-7843: surface the Monad consensus round to execution via the EL
     // header's slot_number (in-memory only for now; not RLP-encoded). It is
     // read into evmc_tx_context.block_round by get_tx_context and system_call.
     // NOTE: only this path populates slot_number; RPC/trace re-execution does
@@ -301,7 +301,7 @@ Result<BlockExecOutput> propose_block(
     BlockMetrics block_metrics;
 
     BlockState block_state(db, vm, secondary_db);
-    record_block_marker_event(exec_recorder, KINET_EXEC_BLOCK_PERF_EVM_ENTER);
+    record_block_marker_event(exec_recorder, MONAD_EXEC_BLOCK_PERF_EVM_ENTER);
     BOOST_OUTCOME_TRY(
         auto const results,
         execute_block<traits>(
@@ -318,13 +318,13 @@ Result<BlockExecOutput> propose_block(
             system_call_state_tracer,
             chain_context,
             exec_recorder));
-    record_block_marker_event(exec_recorder, KINET_EXEC_BLOCK_PERF_EVM_EXIT);
+    record_block_marker_event(exec_recorder, MONAD_EXEC_BLOCK_PERF_EVM_EXIT);
 
     // Database commit of state changes (incl. Merkle root calculations)
     block_state.log_debug();
     auto const commit_begin = std::chrono::steady_clock::now();
     auto [state, code, _] = std::move(block_state).release();
-    KINET_ASSERT(state);
+    MONAD_ASSERT(state);
 
     // Allow overriding the state deltas for testing purposes:
     runloop_override.preprocess_state_deltas(&state);
@@ -412,14 +412,14 @@ Result<BlockExecOutput> propose_block(
     return exec_output;
 }
 
-template <class KinetConsensusBlockHeader, class Fn>
+template <class MonadConsensusBlockHeader, class Fn>
 std::optional<bytes32_t> handle_header(
     bytes32_t const &id, byte_string_view data, uint64_t const start_exclusive,
     uint64_t const end_inclusive, Fn const &fn)
 {
     auto const header_res =
-        rlp::decode_consensus_block_header<KinetConsensusBlockHeader>(data);
-    KINET_ASSERT_PRINTF(
+        rlp::decode_consensus_block_header<MonadConsensusBlockHeader>(data);
+    MONAD_ASSERT_PRINTF(
         !header_res.has_error(),
         "Could not rlp decode header: %s",
         to_hex(id).c_str());
@@ -436,11 +436,11 @@ std::optional<bytes32_t> handle_header(
 template <class Fn>
 bytes32_t for_each_header(
     std::filesystem::path const &head, std::filesystem::path const &header_dir,
-    KinetChain const &chain, uint64_t const start_exclusive,
+    MonadChain const &chain, uint64_t const start_exclusive,
     uint64_t const end_inclusive, Fn const &fn)
 {
     bytes32_t const head_id = head_pointer_to_id(head);
-    if (KINET_UNLIKELY(head_id == bytes32_t{})) {
+    if (MONAD_UNLIKELY(head_id == bytes32_t{})) {
         return head_id;
     }
     bytes32_t id = head_id;
@@ -448,24 +448,24 @@ bytes32_t for_each_header(
         auto const data = read_file(id, header_dir);
         byte_string_view view{data};
         auto const ts = rlp::decode_consensus_block_header_timestamp_s(view);
-        KINET_ASSERT_PRINTF(
+        MONAD_ASSERT_PRINTF(
             !ts.has_error(),
             "Could not rlp decode timestamp from header: %s",
             to_hex(id).c_str());
-        auto const rev = chain.get_kinet_revision(ts.value());
+        auto const rev = chain.get_monad_revision(ts.value());
 
         auto const body = [&]<Traits traits> {
             std::optional<bytes32_t> next_id;
-            if constexpr (traits::kinet_rev() >= KINET_FOUR) {
-                next_id = handle_header<KinetConsensusBlockHeaderV2>(
+            if constexpr (traits::monad_rev() >= MONAD_FOUR) {
+                next_id = handle_header<MonadConsensusBlockHeaderV2>(
                     id, data, start_exclusive, end_inclusive, fn);
             }
-            else if constexpr (traits::kinet_rev() >= KINET_THREE) {
-                next_id = handle_header<KinetConsensusBlockHeaderV1>(
+            else if constexpr (traits::monad_rev() >= MONAD_THREE) {
+                next_id = handle_header<MonadConsensusBlockHeaderV1>(
                     id, data, start_exclusive, end_inclusive, fn);
             }
             else {
-                next_id = handle_header<KinetConsensusBlockHeaderV0>(
+                next_id = handle_header<MonadConsensusBlockHeaderV0>(
                     id, data, start_exclusive, end_inclusive, fn);
             }
             if (!next_id.has_value()) {
@@ -476,8 +476,8 @@ bytes32_t for_each_header(
         };
 
         auto const keep_going = [&] {
-            SWITCH_KINET_TRAITS(body.template operator());
-            KINET_ASSERT(false);
+            SWITCH_MONAD_TRAITS(body.template operator());
+            MONAD_ASSERT(false);
         }();
 
         if (!keep_going) {
@@ -487,18 +487,18 @@ bytes32_t for_each_header(
     return head_id;
 }
 
-KINET_ANONYMOUS_NAMESPACE_END
+MONAD_ANONYMOUS_NAMESPACE_END
 
-KINET_NAMESPACE_BEGIN
+MONAD_NAMESPACE_BEGIN
 
-Result<std::pair<uint64_t, uint64_t>> runloop_kinet(
-    KinetChain const &chain, std::filesystem::path const &ledger_dir,
+Result<std::pair<uint64_t, uint64_t>> runloop_monad(
+    MonadChain const &chain, std::filesystem::path const &ledger_dir,
     mpt::Db &raw_db, Db &db, Db *secondary_db, vm::VM &vm,
     BlockHashBufferFinalized &block_hash_buffer,
     fiber::PriorityPool &priority_pool, uint64_t &block_num,
     uint64_t const end_block_num, sig_atomic_t const volatile &stop,
     bool const enable_tracing, ExecutionEventRecorder *const exec_recorder,
-    RunloopKinetOverride const runloop_override)
+    RunloopMonadOverride const runloop_override)
 {
     constexpr auto SLEEP_TIME = std::chrono::microseconds(100);
     uint64_t const start_block_num =
@@ -514,7 +514,7 @@ Result<std::pair<uint64_t, uint64_t>> runloop_kinet(
     uint64_t last_finalized_block_number =
         raw_db.get_latest_finalized_version();
 
-    KINET_ASSERT(last_finalized_block_number != mpt::INVALID_BLOCK_NUM);
+    MONAD_ASSERT(last_finalized_block_number != mpt::INVALID_BLOCK_NUM);
 
     BlockCache block_cache;
     for_each_header(
@@ -525,14 +525,14 @@ Result<std::pair<uint64_t, uint64_t>> runloop_kinet(
         last_finalized_block_number,
         [&block_cache, &priority_pool, body_dir](
             bytes32_t const &id, auto const &header) {
-            KinetConsensusBlockBody const body =
+            MonadConsensusBlockBody const body =
                 read_body(header.block_body_id, body_dir);
             std::vector<std::optional<Address>> const recovered =
                 recover_senders(body.transactions, priority_pool);
             std::vector<Address> senders;
             senders.reserve(recovered.size());
             for (std::optional<Address> const &addr : recovered) {
-                KINET_ASSERT(addr.has_value());
+                MONAD_ASSERT(addr.has_value());
                 senders.emplace_back(addr.value());
             }
             std::vector<std::vector<std::optional<Address>>> const
@@ -542,7 +542,7 @@ Result<std::pair<uint64_t, uint64_t>> runloop_kinet(
             auto senders_and_authorities =
                 combine_senders_and_authorities(senders, recovered_authorities);
 
-            KINET_ASSERT(block_cache
+            MONAD_ASSERT(block_cache
                              .emplace(
                                  id,
                                  BlockCacheEntry{
@@ -560,8 +560,8 @@ Result<std::pair<uint64_t, uint64_t>> runloop_kinet(
     {
         bytes32_t block_id;
         std::variant<
-            KinetConsensusBlockHeaderV0, KinetConsensusBlockHeaderV1,
-            KinetConsensusBlockHeaderV2>
+            MonadConsensusBlockHeaderV0, MonadConsensusBlockHeaderV1,
+            MonadConsensusBlockHeaderV2>
             header;
     };
 
@@ -575,7 +575,7 @@ Result<std::pair<uint64_t, uint64_t>> runloop_kinet(
     std::deque<ToExecute> to_execute;
     std::deque<ToFinalize> to_finalize;
 
-    KINET_ASSERT(block_num > 0);
+    MONAD_ASSERT(block_num > 0);
     uint64_t finalized_block_num = block_num - 1;
 
     while (finalized_block_num < end_block_num && stop == 0) {
@@ -621,7 +621,7 @@ Result<std::pair<uint64_t, uint64_t>> runloop_kinet(
                  &finalized_head_id,
                  &last_finalized_block_number](
                     bytes32_t const &id, auto const &header) {
-                    if (KINET_UNLIKELY(
+                    if (MONAD_UNLIKELY(
                             header.seqno == last_finalized_block_number + 1 &&
                             finalized_head_id != header.parent_id())) {
                         // canonical chain check
@@ -634,7 +634,7 @@ Result<std::pair<uint64_t, uint64_t>> runloop_kinet(
                 });
         }
 
-        if (KINET_UNLIKELY(to_execute.empty() && to_finalize.empty())) {
+        if (MONAD_UNLIKELY(to_execute.empty() && to_finalize.empty())) {
             std::this_thread::sleep_for(SLEEP_TIME);
             continue;
         }
@@ -670,10 +670,10 @@ Result<std::pair<uint64_t, uint64_t>> runloop_kinet(
             auto const &block_hash_buffer =
                 block_hash_chain.find_chain(header.parent_id());
 
-            kinet_c_native_block_input kinet_block_input = {};
+            monad_c_native_block_input monad_block_input = {};
             if constexpr (requires { header.base_fee_trend; }) {
-                kinet_block_input.base_fee_trend = header.base_fee_trend;
-                kinet_block_input.base_fee_moment = header.base_fee_moment;
+                monad_block_input.base_fee_trend = header.base_fee_trend;
+                monad_block_input.base_fee_moment = header.base_fee_moment;
             };
 
             record_block_start(
@@ -686,16 +686,16 @@ Result<std::pair<uint64_t, uint64_t>> runloop_kinet(
                 header.epoch,
                 header.timestamp_ns,
                 ntxns,
-                std::bit_cast<kinet_c_secp256k1_pubkey>(header.author),
-                kinet_block_input);
+                std::bit_cast<monad_c_secp256k1_pubkey>(header.author),
+                monad_block_input);
 
-            KINET_ASSERT(validate_delayed_execution_results(
+            MONAD_ASSERT(validate_delayed_execution_results(
                 block_hash_buffer, header.delayed_execution_results));
 
             auto propose_dispatch = [&]() -> Result<BlockExecOutput> {
                 auto const rev =
-                    chain.get_kinet_revision(header.execution_inputs.timestamp);
-                SWITCH_KINET_TRAITS(
+                    chain.get_monad_revision(header.execution_inputs.timestamp);
+                SWITCH_MONAD_TRAITS(
                     propose_block,
                     block_id,
                     header,
@@ -715,7 +715,7 @@ Result<std::pair<uint64_t, uint64_t>> runloop_kinet(
                     exec_recorder,
                     secondary_db,
                     runloop_override);
-                KINET_ABORT_PRINTF("handled rev value %d", rev);
+                MONAD_ABORT_PRINTF("handled rev value %d", rev);
             };
             BOOST_OUTCOME_TRY(
                 BlockExecOutput const exec_output,
@@ -780,4 +780,4 @@ Result<std::pair<uint64_t, uint64_t>> runloop_kinet(
     return {ntxs, total_gas};
 }
 
-KINET_NAMESPACE_END
+MONAD_NAMESPACE_END

@@ -1,17 +1,17 @@
-// Copyright (C) 2025-26 Kinet Labs, Inc.
+// Copyright (C) 2025-26 Category Labs, Inc.
 //
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the Apache-2.0 license as published by
+// it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// Apache-2.0 license for more details.
+// GNU General Public License for more details.
 //
-// You should have received a copy of the Apache-2.0 license
-// along with this program.  If not, see <http://www.apache.org/licenses/>.
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #pragma once
 
@@ -19,26 +19,26 @@
 
 #include <cstdint>
 
-KINET_NAMESPACE_BEGIN
+MONAD_NAMESPACE_BEGIN
 
-struct RunloopKinetOverrideMethods
+struct RunloopMonadOverrideMethods
 {
-    virtual ~RunloopKinetOverrideMethods() {}
+    virtual ~RunloopMonadOverrideMethods() {}
 
     virtual uint64_t start_block_num() const = 0;
     virtual void
     preprocess_state_deltas(std::unique_ptr<StateDeltas> *) const = 0;
 };
 
-// Options to override kinet runloop functionality. It is assumed that the
+// Options to override monad runloop functionality. It is assumed that the
 // runloop is only invoked a single time if `override_methods_` is `nullptr`.
-class RunloopKinetOverride
+class RunloopMonadOverride
 {
-    RunloopKinetOverrideMethods const *override_methods_;
+    RunloopMonadOverrideMethods const *override_methods_;
 
 public:
-    RunloopKinetOverride(
-        RunloopKinetOverrideMethods const *override_methods = nullptr)
+    RunloopMonadOverride(
+        RunloopMonadOverrideMethods const *override_methods = nullptr)
         : override_methods_{override_methods}
     {
     }
@@ -48,7 +48,7 @@ public:
     // considered to be the first when `override_methods_` is `nullptr`.
     uint64_t start_block_num(uint64_t const runloop_start) const
     {
-        if (KINET_LIKELY(override_methods_ == nullptr)) {
+        if (MONAD_LIKELY(override_methods_ == nullptr)) {
             return runloop_start;
         }
         return override_methods_->start_block_num();
@@ -57,11 +57,11 @@ public:
     // Overrides the state deltas when `override_methods_` is not `nullptr`.
     void preprocess_state_deltas(std::unique_ptr<StateDeltas> *sd) const
     {
-        if (KINET_LIKELY(override_methods_ == nullptr)) {
+        if (MONAD_LIKELY(override_methods_ == nullptr)) {
             return;
         }
         override_methods_->preprocess_state_deltas(sd);
     }
 };
 
-KINET_NAMESPACE_END
+MONAD_NAMESPACE_END
