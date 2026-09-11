@@ -26,9 +26,6 @@
 [submodule "third_party/yellowpaper"]
 	path = third_party/yellowpaper
 	url = https://github.com/ethereum/yellowpaper.git
-[submodule "ethash"]
-	path = ethash
-	url = https://github.com/chfast/ethash.git
 [submodule "core/third_party/nanobench"]
 	path = third_party/nanobench
 	url = https://github.com/martinus/nanobench.git
