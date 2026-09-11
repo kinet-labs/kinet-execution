@@ -1,0 +1,114 @@
+# Copyright (C) 2025 Category Labs, Inc.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# This cmake project can be used to build just the execution event SDK library
+# (as `libkinet_event.a`) without building all of the monolithic
+# libkinet_execution.a or including the rest of the CMake build system. This
+# is useful for external third-party clients, and for the Rust build system.
+
+cmake_minimum_required(VERSION 3.23)
+
+project(kinet_event LANGUAGES C)
+
+find_library(libzstd_file zstd REQUIRED)
+
+add_library(
+  kinet_event
+  "../core/assert.c"
+  "../core/cleanup.c"
+  "../core/format_err.c"
+  "../core/path_util.c"
+  "../core/event/event_ring.c"
+  "../core/event/event_ring_util.c"
+  "../core/event/test_event_ctypes_metadata.c"
+  "../execution/ethereum/event/exec_event_ctypes_metadata.c")
+
+target_sources(kinet_event PUBLIC
+  FILE_SET event_headers
+  TYPE HEADERS
+  BASE_DIRS ".."
+  FILES
+  "../core/assert.h"
+  "../core/cleanup.h"
+  "../core/format_err.h"
+  "../core/likely.h"
+  "../core/path_util.h"
+  "../core/srcloc.h"
+  "../core/event/event_iterator.h"
+  "../core/event/event_iterator_inline.h"
+  "../core/event/event_metadata.h"
+  "../core/event/event_recorder.h"
+  "../core/event/event_recorder_inline.h"
+  "../core/event/event_ring.h"
+  "../core/event/event_ring_util.h"
+  "../core/event/test_event_ctypes.h"
+  "../core/mem/align.h"
+  "../execution/ethereum/core/base_ctypes.h"
+  "../execution/ethereum/core/eth_ctypes.h"
+  "../execution/ethereum/event/exec_event_ctypes.h"
+  "../execution/ethereum/event/exec_iter_help.h"
+  "../execution/ethereum/event/exec_iter_help_inline.h"
+  "../execution/kinet/core/kinet_ctypes.h")
+
+target_include_directories(kinet_event PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../..>
+    $<INSTALL_INTERFACE:include>)
+
+if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+  target_sources(kinet_event PRIVATE
+      "../core/event/event_ring_util_linux.c"
+      "../core/mem/hugetlb_path.c")
+  target_sources(kinet_event PUBLIC
+      FILE_SET event_headers
+      FILES "../core/mem/hugetlb_path.h")
+else()
+  target_sources(kinet_event PRIVATE "../core/event/event_ring_util_posix.c")
+endif()
+
+target_compile_definitions(kinet_event PUBLIC _GNU_SOURCE)
+target_compile_features(kinet_event PUBLIC c_std_23)
+target_compile_options(kinet_event PRIVATE -Wall -Wextra -Wconversion -Werror)
+target_link_libraries(kinet_event PRIVATE ${libzstd_file})
+
+option(KINET_EVENT_BUILD_EXAMPLE
+    "Build the example program that shows how to use the API" ON)
+
+if (KINET_EVENT_BUILD_EXAMPLE)
+  add_executable(eventwatch "example/eventwatch.c")
+  target_compile_options(eventwatch PRIVATE -Wall -Wextra -Wconversion -Werror)
+  target_link_libraries(eventwatch PRIVATE kinet_event)
+endif()
+
+install(TARGETS kinet_event
+        EXPORT kinet_exec_events_sdk
+        FILE_SET event_headers DESTINATION include/category)
+
+install(EXPORT kinet_exec_events_sdk
+        FILE kinet_exec_events_sdk.cmake
+        DESTINATION lib/cmake/category-labs)
+
+include(CMakePackageConfigHelpers)
+configure_package_config_file(${CMAKE_CURRENT_SOURCE_DIR}/Config.cmake.in
+  "${CMAKE_CURRENT_BINARY_DIR}/kinet_exec_events_sdk-config.cmake"
+  INSTALL_DESTINATION "lib/cmake/category-labs"
+  NO_SET_AND_CHECK_MACRO
+  NO_CHECK_REQUIRED_COMPONENTS_MACRO)
+
+install(FILES
+  "${CMAKE_CURRENT_BINARY_DIR}/kinet_exec_events_sdk-config.cmake"
+  DESTINATION lib/cmake/category-labs)
+
+export(EXPORT kinet_exec_events_sdk
+  FILE "${CMAKE_CURRENT_BINARY_DIR}/kinet_exec_events_sdk.cmake")

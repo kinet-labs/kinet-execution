@@ -1,0 +1,58 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/core/config.hpp>
+#include <category/execution/ethereum/db/file_db.hpp>
+
+#include <cstdint>
+#include <filesystem>
+#include <vector>
+
+KINET_NAMESPACE_BEGIN
+
+struct Block;
+
+class BlockDb
+{
+    FileDb db_;
+
+public:
+    BlockDb() = delete;
+    BlockDb(Block const &) = delete;
+    BlockDb(BlockDb &&) = default;
+    explicit BlockDb(std::filesystem::path const &dir);
+    virtual ~BlockDb() = default;
+
+    virtual bool get(uint64_t, Block &) const;
+};
+
+class RlpBlockDb : public BlockDb
+{
+    std::vector<Block> rlp_blocks_;
+
+    void import_rlp(std::filesystem::path const &rlp_path);
+
+public:
+    RlpBlockDb(
+        std::filesystem::path const &dir,
+        std::filesystem::path const &rlp_path);
+    ~RlpBlockDb() override = default;
+
+    bool get(uint64_t, Block &) const override;
+};
+
+KINET_NAMESPACE_END

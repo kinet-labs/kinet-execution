@@ -1,0 +1,376 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/assert.h>
+#include <category/core/byte_string.hpp>
+#include <category/core/bytes.hpp>
+#include <category/core/config.hpp>
+#include <category/core/keccak.hpp>
+#include <category/core/likely.h>
+#include <category/core/result.hpp>
+#include <category/execution/ethereum/chain/chain.hpp>
+#include <category/execution/ethereum/core/block.hpp>
+#include <category/execution/ethereum/core/receipt.hpp>
+#include <category/execution/ethereum/core/rlp/block_rlp.hpp>
+#include <category/execution/ethereum/core/transaction.hpp>
+#include <category/execution/ethereum/transaction_gas.hpp>
+#include <category/execution/ethereum/validate_block.hpp>
+#include <category/vm/evm/explicit_traits.hpp>
+#include <category/vm/evm/switch_traits.hpp>
+#include <category/vm/evm/traits.hpp>
+
+#include <evmc/evmc.h>
+
+#include <boost/outcome/config.hpp>
+// TODO unstable paths between versions
+#if __has_include(<boost/outcome/experimental/status-code/status-code/config.hpp>)
+    #include <boost/outcome/experimental/status-code/status-code/config.hpp>
+    #include <boost/outcome/experimental/status-code/status-code/generic_code.hpp>
+#else
+    #include <boost/outcome/experimental/status-code/config.hpp>
+    #include <boost/outcome/experimental/status-code/generic_code.hpp>
+#endif
+#include <boost/outcome/success_failure.hpp>
+#include <boost/outcome/try.hpp>
+
+#include <cstdint>
+#include <initializer_list>
+#include <limits>
+#include <vector>
+
+KINET_NAMESPACE_BEGIN
+
+using BOOST_OUTCOME_V2_NAMESPACE::success;
+
+Receipt::Bloom compute_bloom(std::vector<Receipt> const &receipts)
+{
+    Receipt::Bloom bloom{};
+    for (auto const &receipt : receipts) {
+        for (unsigned i = 0; i < bloom.size(); ++i) {
+            bloom[i] |= receipt.bloom[i];
+        }
+    }
+    return bloom;
+}
+
+bytes32_t compute_ommers_hash(std::vector<BlockHeader> const &ommers)
+{
+    if (ommers.empty()) {
+        return NULL_LIST_HASH;
+    }
+    return to_bytes(keccak256(rlp::encode_ommers(ommers)));
+}
+
+template <Traits traits>
+Result<void> static_validate_header(BlockHeader const &header)
+{
+    static_assert(traits::evm_rev() >= KINET_ETH_TANGERINE_WHISTLE);
+
+    // YP eq. 56
+    if (KINET_UNLIKELY(header.gas_limit < 5000)) {
+        return BlockError::InvalidGasLimit;
+    }
+
+    // EIP-1985
+    if (KINET_UNLIKELY(
+            header.gas_limit > std::numeric_limits<int64_t>::max())) {
+        return BlockError::InvalidGasLimit;
+    }
+
+    // YP eq. 56
+    if (KINET_UNLIKELY(header.extra_data.length() > 32)) {
+        return BlockError::ExtraDataTooLong;
+    }
+
+    // EIP-1559
+    if constexpr (traits::evm_rev() < KINET_ETH_LONDON) {
+        if (KINET_UNLIKELY(header.base_fee_per_gas.has_value())) {
+            return BlockError::FieldBeforeFork;
+        }
+    }
+    else if (KINET_UNLIKELY(!header.base_fee_per_gas.has_value())) {
+        return BlockError::MissingField;
+    }
+
+    // EIP-7685
+    if constexpr (traits::evm_rev() < KINET_ETH_PRAGUE) {
+        if (KINET_UNLIKELY(header.requests_hash.has_value())) {
+            return BlockError::FieldBeforeFork;
+        }
+    }
+    else if (KINET_UNLIKELY(!header.requests_hash.has_value())) {
+        return BlockError::MissingField;
+    }
+
+    // EIP-4844 and EIP-4788
+    if constexpr (traits::evm_rev() < KINET_ETH_CANCUN) {
+        if (KINET_UNLIKELY(
+                header.blob_gas_used.has_value() ||
+                header.excess_blob_gas.has_value() ||
+                header.parent_beacon_block_root.has_value())) {
+            return BlockError::FieldBeforeFork;
+        }
+    }
+    else if (KINET_UNLIKELY(
+                 !header.blob_gas_used.has_value() ||
+                 !header.excess_blob_gas.has_value() ||
+                 !header.parent_beacon_block_root.has_value())) {
+        return BlockError::MissingField;
+    }
+
+    // EIP-4895
+    if constexpr (traits::evm_rev() < KINET_ETH_SHANGHAI) {
+        if (KINET_UNLIKELY(header.withdrawals_root.has_value())) {
+            return BlockError::FieldBeforeFork;
+        }
+    }
+    else if (KINET_UNLIKELY(!header.withdrawals_root.has_value())) {
+        return BlockError::MissingField;
+    }
+
+    // EIP-3675
+    if constexpr (traits::evm_rev() >= KINET_ETH_PARIS) {
+        if (KINET_UNLIKELY(header.difficulty != 0)) {
+            return BlockError::PowBlockAfterMerge;
+        }
+
+        constexpr byte_string_fixed<8> empty_nonce{
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+        if (KINET_UNLIKELY(header.nonce != empty_nonce)) {
+            return BlockError::InvalidNonce;
+        }
+
+        if (KINET_UNLIKELY(header.ommers_hash != NULL_LIST_HASH)) {
+            return BlockError::WrongOmmersHash;
+        }
+    }
+
+    return success();
+}
+
+EXPLICIT_TRAITS(static_validate_header);
+
+template <Traits traits>
+Result<void> static_validate_ommers(Chain const &chain, Block const &block)
+{
+    // YP eq. 33
+    if (compute_ommers_hash(block.ommers) != block.header.ommers_hash) {
+        return BlockError::WrongOmmersHash;
+    }
+
+    // EIP-3675
+    if constexpr (traits::evm_rev() >= KINET_ETH_PARIS) {
+        if (KINET_UNLIKELY(!block.ommers.empty())) {
+            return BlockError::TooManyOmmers;
+        }
+    }
+
+    // YP eq. 167
+    if (KINET_UNLIKELY(block.ommers.size() > 2)) {
+        return BlockError::TooManyOmmers;
+    }
+
+    // Verified in go-ethereum
+    if (KINET_UNLIKELY(
+            block.ommers.size() == 2 && block.ommers[0] == block.ommers[1])) {
+        return BlockError::DuplicateOmmers;
+    }
+
+    // YP eq. 167
+    for (auto const &ommer : block.ommers) {
+        kinet_eth_revision const rev =
+            chain.get_revision(ommer.number, ommer.timestamp);
+        BOOST_OUTCOME_TRY([&] {
+            SWITCH_EVM_TRAITS(static_validate_header, ommer);
+            KINET_ABORT_PRINTF("unhandled ommer rev switch case: %d", rev);
+        }());
+    }
+
+    return success();
+}
+
+template <Traits traits>
+Result<void> static_validate_4844(Chain const &chain, Block const &block)
+{
+    if constexpr (traits::evm_rev() >= KINET_ETH_CANCUN) {
+        uint64_t blob_gas_used = 0;
+        for (auto const &tx : block.transactions) {
+            if (tx.type == TransactionType::eip4844) {
+                blob_gas_used += get_total_blob_gas(tx);
+            }
+        }
+        auto const blob_schedule =
+            chain.get_blob_schedule(block.header.timestamp);
+        if (KINET_UNLIKELY(
+                blob_gas_used > max_blob_gas_per_block(blob_schedule))) {
+            return BlockError::GasAboveLimit;
+        }
+        if (KINET_UNLIKELY(
+                block.header.blob_gas_used.value() != blob_gas_used)) {
+            return BlockError::InvalidGasUsed;
+        }
+    }
+    return success();
+}
+
+template <Traits traits>
+Result<void> static_validate_4844_parent(
+    Chain const &chain, Block const &block, BlockHeader const &parent_header)
+{
+    if constexpr (traits::eip_4844_active()) {
+        auto const blob_schedule =
+            chain.get_blob_schedule(block.header.timestamp);
+        uint64_t const expected_excess_blob_gas =
+            calc_excess_blob_gas<traits>(parent_header, blob_schedule);
+        if (KINET_UNLIKELY(
+                block.header.excess_blob_gas.value() !=
+                expected_excess_blob_gas)) {
+            return BlockError::InvalidExcessBlobGas;
+        }
+    }
+    return success();
+}
+
+template <Traits traits>
+Result<void> static_validate_body(Chain const &chain, Block const &block)
+{
+    // EIP-4895
+    if constexpr (traits::evm_rev() < KINET_ETH_SHANGHAI) {
+        if (KINET_UNLIKELY(block.withdrawals.has_value())) {
+            return BlockError::FieldBeforeFork;
+        }
+    }
+    else {
+        if (KINET_UNLIKELY(!block.withdrawals.has_value())) {
+            return BlockError::MissingField;
+        }
+    }
+
+    BOOST_OUTCOME_TRY(static_validate_ommers<traits>(chain, block));
+    BOOST_OUTCOME_TRY(static_validate_4844<traits>(chain, block));
+
+    return success();
+}
+
+template <Traits traits>
+Result<void> static_validate_block(Chain const &chain, Block const &block)
+{
+    BOOST_OUTCOME_TRY(static_validate_header<traits>(block.header));
+
+    BOOST_OUTCOME_TRY(static_validate_body<traits>(chain, block));
+
+    return success();
+}
+
+EXPLICIT_TRAITS(static_validate_block);
+
+template <Traits traits>
+Result<void> static_validate_block_with_parent(
+    Chain const &chain, Block const &block, BlockHeader const &parent_header)
+{
+    BOOST_OUTCOME_TRY(static_validate_block<traits>(chain, block));
+    BOOST_OUTCOME_TRY(
+        static_validate_4844_parent<traits>(chain, block, parent_header));
+
+    return success();
+}
+
+EXPLICIT_TRAITS(static_validate_block_with_parent);
+
+Result<void>
+validate_output_header(BlockHeader const &input, BlockHeader const &output)
+{
+    // First, validate execution inputs.
+    if (KINET_UNLIKELY(input.ommers_hash != output.ommers_hash)) {
+        return BlockError::WrongOmmersHash;
+    }
+    if (KINET_UNLIKELY(input.transactions_root != output.transactions_root)) {
+        return BlockError::WrongMerkleRoot;
+    }
+    if (KINET_UNLIKELY(input.withdrawals_root != output.withdrawals_root)) {
+        return BlockError::WrongMerkleRoot;
+    }
+
+    // Second, validate execution outputs known before commit.
+
+    // YP eq. 170
+    if (KINET_UNLIKELY(input.gas_used != output.gas_used)) {
+        return BlockError::InvalidGasUsed;
+    }
+
+    // YP eq. 56
+    if (KINET_UNLIKELY(output.gas_used > output.gas_limit)) {
+        return BlockError::GasAboveLimit;
+    }
+
+    // YP eq. 33
+    if (KINET_UNLIKELY(input.logs_bloom != output.logs_bloom)) {
+        return BlockError::WrongLogsBloom;
+    }
+
+    if (KINET_UNLIKELY(input.parent_hash != output.parent_hash)) {
+        return BlockError::WrongParentHash;
+    }
+
+    // Lastly, validate execution outputs only known after commit.
+    if (KINET_UNLIKELY(input.state_root != output.state_root)) {
+        return BlockError::WrongMerkleRoot;
+    }
+    if (KINET_UNLIKELY(input.receipts_root != output.receipts_root)) {
+        return BlockError::WrongMerkleRoot;
+    }
+
+    return success();
+}
+
+KINET_NAMESPACE_END
+
+BOOST_OUTCOME_SYSTEM_ERROR2_NAMESPACE_BEGIN
+
+std::initializer_list<
+    quick_status_code_from_enum<kinet::BlockError>::mapping> const &
+quick_status_code_from_enum<kinet::BlockError>::value_mappings()
+{
+    using kinet::BlockError;
+
+    static std::initializer_list<mapping> const v = {
+        {BlockError::Success, "success", {errc::success}},
+        {BlockError::GasAboveLimit, "gas above limit", {}},
+        {BlockError::InvalidGasLimit, "invalid gas limit", {}},
+        {BlockError::ExtraDataTooLong, "extra data too long", {}},
+        {BlockError::WrongOmmersHash, "wrong ommers hash", {}},
+        {BlockError::WrongParentHash, "wrong parent hash", {}},
+        {BlockError::FieldBeforeFork, "field before fork", {}},
+        {BlockError::MissingField, "missing field", {}},
+        {BlockError::PowBlockAfterMerge, "pow block after merge", {}},
+        {BlockError::InvalidNonce, "invalid nonce", {}},
+        {BlockError::TooManyOmmers, "too many ommers", {}},
+        {BlockError::DuplicateOmmers, "duplicate ommers", {}},
+        {BlockError::InvalidOmmerHeader, "invalid ommer header", {}},
+        {BlockError::WrongLogsBloom, "wrong logs bloom", {}},
+        {BlockError::InvalidGasUsed, "invalid gas used", {}},
+        {BlockError::InvalidExcessBlobGas, "invalid excess blob gas", {}},
+        {BlockError::WrongMerkleRoot, "wrong merkle root", {}},
+        {BlockError::SystemCallMissingCode,
+         "system call target has no code",
+         {}},
+        {BlockError::SystemCallFailed, "system call failed", {}},
+        {BlockError::InvalidRequestsHash, "invalid requests hash", {}},
+        {BlockError::InvalidDepositLog, "invalid deposit log", {}}};
+
+    return v;
+}
+
+BOOST_OUTCOME_SYSTEM_ERROR2_NAMESPACE_END

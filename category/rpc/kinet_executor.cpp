@@ -1,0 +1,2335 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/rpc/kinet_executor.h>
+#include <category/rpc/overrides.hpp>
+
+#include <category/core/address.hpp>
+#include <category/core/assert.h>
+#include <category/core/byte_string.hpp>
+#include <category/core/bytes.hpp>
+#include <category/core/fiber/fiber_group.hpp>
+#include <category/core/fiber/fiber_thread_pool.hpp>
+#include <category/core/fiber/priority_pool.hpp>
+#include <category/core/hex.hpp>
+#include <category/core/int.hpp>
+#include <category/core/keccak.hpp>
+#include <category/core/likely.h>
+#include <category/core/log.hpp>
+#include <category/core/kinet_exception.hpp>
+#include <category/core/result.hpp>
+#include <category/core/rlp/decode_error.hpp>
+#include <category/core/runtime/uint256.hpp>
+#include <category/core/seeded_fast_hash.hpp>
+#include <category/execution/ethereum/block_hash_buffer.hpp>
+#include <category/execution/ethereum/chain/chain.hpp>
+#include <category/execution/ethereum/chain/chain_config.h>
+#include <category/execution/ethereum/core/block.hpp>
+#include <category/execution/ethereum/core/rlp/address_rlp.hpp>
+#include <category/execution/ethereum/core/rlp/block_rlp.hpp>
+#include <category/execution/ethereum/core/rlp/bytes_rlp.hpp>
+#include <category/execution/ethereum/core/rlp/transaction_rlp.hpp>
+#include <category/execution/ethereum/core/transaction.hpp>
+#include <category/execution/ethereum/core/withdrawal.hpp>
+#include <category/execution/ethereum/db/trie_rodb.hpp>
+#include <category/execution/ethereum/db/util.hpp>
+#include <category/execution/ethereum/evmc_host.hpp>
+#include <category/execution/ethereum/execute_block.hpp>
+#include <category/execution/ethereum/execute_block_header.hpp>
+#include <category/execution/ethereum/execute_transaction.hpp>
+#include <category/execution/ethereum/rlp/decode.hpp>
+#include <category/execution/ethereum/state2/block_state.hpp>
+#include <category/execution/ethereum/state3/state.hpp>
+#include <category/execution/ethereum/trace/call_frame.hpp>
+#include <category/execution/ethereum/trace/call_tracer.hpp>
+#include <category/execution/ethereum/trace/rlp/call_frame_rlp.hpp>
+#include <category/execution/ethereum/trace/state_tracer.hpp>
+#include <category/execution/ethereum/trace/tracer_config.h>
+#include <category/execution/ethereum/tx_context.hpp>
+#include <category/execution/ethereum/types/incarnation.hpp>
+#include <category/execution/ethereum/validate_block.hpp>
+#include <category/execution/ethereum/validate_transaction.hpp>
+#include <category/execution/ethereum/validate_transaction_error.hpp>
+#include <category/execution/kinet/chain/chain_factory.hpp>
+#include <category/execution/kinet/chain/kinet_chain.hpp>
+#include <category/execution/kinet/reserve_balance.hpp>
+#include <category/mpt/db.hpp>
+#include <category/mpt/ondisk_db_config.hpp>
+#include <category/rpc/chain_context_buffer.hpp>
+#include <category/rpc/eth_simulate_block_hash_buffer.hpp>
+#include <category/rpc/lazy_block_hash.hpp>
+#include <category/vm/evm/revision.h>
+#include <category/vm/evm/status_code.h>
+#include <category/vm/evm/switch_traits.hpp>
+#include <category/vm/evm/traits.hpp>
+#include <category/vm/vm.hpp>
+
+#include <boost/fiber/future/promise.hpp>
+#include <boost/outcome/try.hpp>
+#include <boost/scope_exit.hpp>
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <format>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include <string.h>
+
+#include <ankerl/unordered_dense.h>
+#include <evmc/evmc.h>
+#include <evmc/evmc.hpp>
+#include <nlohmann/json.hpp>
+
+using namespace kinet;
+using namespace kinet::vm;
+
+namespace
+{
+    char const *const UNEXPECTED_EXCEPTION_ERR_MSG = "unexpected error";
+    char const *const EXCEED_QUEUE_SIZE_ERR_MSG =
+        "failure to submit eth_call to thread pool: queue size exceeded";
+    char const *const ETH_SIMULATE_EXCEED_QUEUE_SIZE_ERR_MSG =
+        "failure to submit eth_simulateV1 to thread pool: queue size exceeded";
+    char const *const TIMEOUT_ERR_MSG =
+        "failure to execute eth_call: queuing time exceeded timeout threshold";
+    char const *const PRESTATE_TRACER_SUPPORT_ERR_MSG =
+        "only the prestate tracer and the statediff "
+        "tracer are supported";
+    char const *const CANNOT_TRACE_GENESIS_ERR_MSG =
+        "cannot trace genesis block";
+    char const *const RECOVER_SENDER_ERR_MSG = "failed to recover sender";
+    char const *const TRANSACTIONS_CONTEXT_ERR_MSG =
+        "failed to recover the transactions context";
+    char const *const PARENT_TRANSACTIONS_CONTEXT_ERR_MSG =
+        "failed to recover the parent transactions context";
+    char const *const GRANDPARENT_TRANSACTIONS_CONTEXT_ERR_MSG =
+        "failed to recover the grandparent transactions context";
+    char const *const TRANSACTION_OUT_OF_BOUNDS_ERR_MSG =
+        "transaction out of bounds";
+    static ankerl::unordered_dense::segmented_set<Address>
+        empty_senders_and_authorities{};
+
+    void apply_state_overrides(
+        BlockState &block_state, Incarnation const incarnation,
+        kinet_state_override const &state_overrides)
+    {
+        State state{block_state, incarnation};
+
+        for (auto const &[address, state_delta] :
+             state_overrides.override_sets) {
+            // This would avoid seg-fault on storage override for
+            // non-existing accounts
+            if (KINET_UNLIKELY(!state.account_exists(address))) {
+                state.create_contract(address);
+            }
+
+            if (state_delta.balance.has_value()) {
+                uint256_t const new_balance = state_delta.balance.value();
+                uint256_t const current_balance = state.get_balance(address);
+                if (new_balance > current_balance) {
+                    state.add_to_balance(
+                        address, new_balance - current_balance);
+                }
+                else {
+                    state.subtract_from_balance(
+                        address, current_balance - new_balance);
+                }
+            }
+
+            if (state_delta.nonce.has_value()) {
+                state.set_nonce(address, state_delta.nonce.value());
+            }
+
+            if (state_delta.code.has_value()) {
+                state.set_code(address, state_delta.code.value());
+            }
+
+            auto const update_state =
+                [&address = address, &state = state](
+                    ankerl::unordered_dense::
+                        segmented_map<bytes32_t, bytes32_t> const &diff) {
+                    for (auto const &[key, value] : diff) {
+                        state.set_storage(address, key, value);
+                    }
+                };
+
+            // Remove single storage
+            if (!state_delta.state_diff.empty()) {
+                // we need to access the account first before accessing its
+                // storage
+                (void)state.get_nonce(address);
+                update_state(state_delta.state_diff);
+            }
+
+            // Remove all override
+            if (!state_delta.state.empty()) {
+                state.set_to_state_incarnation(address);
+                update_state(state_delta.state);
+            }
+        }
+        KINET_ASSERT_THROW(
+            block_state.can_merge(state), "failed to apply state override");
+        block_state.merge(state);
+    }
+
+    template <Traits traits>
+    Result<evmc::Result> eth_call_impl(
+        Chain const &chain, Transaction const &txn, BlockHeader const &header,
+        uint64_t const block_number, bytes32_t const &block_id,
+        Address const &sender,
+        std::vector<std::optional<Address>> const &authorities, TrieRODb &tdb,
+        vm::VM &vm, BlockHashBuffer const &buffer,
+        kinet_state_override const &state_overrides,
+        CallTracerBase &call_tracer, trace::StateTracer &state_tracer)
+    {
+        Transaction enriched_txn{txn};
+
+        // static_validate_transaction checks sender's signature and chain_id.
+        // However, eth_call doesn't have signature (it can be simulated from
+        // any account). Solving this issue by setting chain_id and signature to
+        // complied values
+        enriched_txn.sc.chain_id = chain.get_chain_id();
+        enriched_txn.sc.signature.r = 1;
+        enriched_txn.sc.signature.s = 1;
+
+        BOOST_OUTCOME_TRY(static_validate_transaction<traits>(
+            enriched_txn,
+            header.base_fee_per_gas,
+            header.excess_blob_gas,
+            chain.get_chain_id(),
+            chain.get_blob_schedule(header.timestamp)));
+
+        tdb.set_block_and_prefix(block_number, block_id);
+        BlockState block_state{tdb, vm};
+        // avoid conflict with block reward txn
+        Incarnation const incarnation{block_number, Incarnation::LAST_TX - 1u};
+        apply_state_overrides(block_state, incarnation, state_overrides);
+
+        State state{block_state, incarnation};
+
+        // validate_transaction expects nonce to match.
+        // However, eth_call doesn't take a nonce parameter.
+        // Solving the issue by manually setting nonce to match with the
+        // expected nonce
+        enriched_txn.nonce = state.get_nonce(sender);
+
+        // Safe to pass empty code to validation here because the above override
+        // will always mark this transaction as coming from an EOA.
+        {
+            State state{block_state, incarnation};
+            // validate_transaction expects the sender of a transaction is EOA,
+            // not CA. However, eth_call allows the sender to be CA to simulate
+            // a subroutine. Solving this issue by manually setting account to
+            // be EOA for validation
+            state.set_code(sender, {});
+            BOOST_OUTCOME_TRY(validate_ethereum_transaction<traits>(
+                enriched_txn, sender, state, state_tracer));
+        }
+
+        auto const senders = std::vector{sender};
+        auto const authorities_vec =
+            std::vector<std::vector<std::optional<Address>>>{{authorities}};
+        auto const senders_and_authorities =
+            combine_senders_and_authorities(senders, authorities_vec);
+
+        // Note that the chain context constructed for a simulated transaction
+        // does not consider the parent and grandparent blocks. This means that
+        // every transaction simulated will be allowed to empty an undelegated
+        // sender's balance.
+        auto const chain_context = [&] {
+            if constexpr (is_kinet_trait_v<traits>) {
+                return ChainContext<traits>{
+                    .grandparent_senders_and_authorities =
+                        empty_senders_and_authorities,
+                    .parent_senders_and_authorities =
+                        empty_senders_and_authorities,
+                    .senders_and_authorities = senders_and_authorities,
+                    .senders = senders,
+                    .authorities = authorities_vec,
+                };
+            }
+            else {
+                return ChainContext<traits>{};
+            }
+        }();
+
+        auto const tx_context = get_tx_context<traits>(
+            enriched_txn,
+            sender,
+            header,
+            chain.get_chain_id(),
+            chain.get_blob_schedule(header.timestamp));
+
+        EvmcHost<traits> host{
+            call_tracer,
+            state_tracer,
+            tx_context,
+            buffer,
+            state,
+            enriched_txn,
+            header.base_fee_per_gas,
+            0,
+            chain_context};
+        auto execution_result = ExecuteTransactionNoValidation<traits>{
+            chain,
+            enriched_txn,
+            sender,
+            authorities,
+            header,
+        }(state, host);
+
+        // compute gas_refund and gas_used
+        auto const gas_refund = compute_gas_refund<traits>(
+            enriched_txn,
+            static_cast<uint64_t>(execution_result.gas_left),
+            static_cast<uint64_t>(execution_result.gas_refund));
+        auto const gas_used = enriched_txn.gas_limit - gas_refund;
+        call_tracer.on_finish(gas_used);
+
+        execution_result.gas_refund = static_cast<int64_t>(gas_refund);
+
+        trace::run_tracer<traits>(state_tracer, state);
+
+        return execution_result;
+    }
+
+    std::pair<
+        std::vector<Address>, std::vector<std::vector<std::optional<Address>>>>
+    recover_senders_and_authorities(
+        std::vector<Transaction> const &transactions)
+    {
+        std::vector<Address> senders;
+        senders.reserve(transactions.size());
+        for (auto const &txn : transactions) {
+            auto const sender = recover_sender(txn);
+            KINET_ASSERT_THROW(sender.has_value(), RECOVER_SENDER_ERR_MSG);
+            senders.emplace_back(sender.value());
+        }
+
+        std::vector<std::vector<std::optional<Address>>> authorities;
+        authorities.reserve(transactions.size());
+        for (auto const &txn : transactions) {
+            std::vector<std::optional<Address>> txn_authorities;
+            txn_authorities.reserve(txn.authorization_list.size());
+            for (auto const &auth : txn.authorization_list) {
+                txn_authorities.emplace_back(recover_authority(auth));
+            }
+            authorities.emplace_back(std::move(txn_authorities));
+        }
+
+        return {std::move(senders), authorities};
+    }
+
+    template <Traits traits>
+    Result<nlohmann::json> eth_trace_block_or_transaction_impl(
+        Chain const &chain,
+        ankerl::unordered_dense::segmented_set<Address> const
+            &grandparent_senders_and_authorities,
+        ankerl::unordered_dense::segmented_set<Address> const
+            &parent_senders_and_authorities,
+        ankerl::unordered_dense::segmented_set<Address> const
+            &senders_and_authorities,
+        std::vector<Address> const &senders,
+        std::vector<std::vector<std::optional<Address>>> const &authorities,
+        BlockHeader const &header, std::vector<Transaction> const &transactions,
+        bool const trace_transaction, uint64_t const transaction_index,
+        BlockState &block_state, LazyBlockHash const &buffer,
+        fiber::FiberGroup &tx_exec_pool, enum kinet_tracer_config tracer_config)
+    {
+        KINET_ASSERT_THROW(
+            transactions.size() == senders.size(),
+            "transactions and senders size mismatch");
+        KINET_ASSERT_THROW(
+            transactions.size() == authorities.size(),
+            "transactions and authorities size mismatch");
+
+        size_t const transactions_size = [&]() {
+            if (trace_transaction) {
+                KINET_ASSERT_THROW(
+                    transaction_index <
+                        static_cast<uint64_t>(transactions.size()),
+                    TRANSACTION_OUT_OF_BOUNDS_ERR_MSG);
+                return transaction_index + 1;
+            }
+            return transactions.size();
+        }();
+
+        std::span<Transaction const> const transactions_view{
+            transactions.data(), transactions_size};
+        std::span<Address const> const senders_view{
+            senders.data(), transactions_size};
+        std::span<std::vector<std::optional<Address>> const> const
+            authorities_view{authorities.data(), transactions_size};
+
+        // TODO(EXE-60): this re-execution path (and the sibling eth_call /
+        // eth_simulate paths in this file) receives a BlockHeader whose
+        // slot_number is unset (it is in-memory only, not RLP-encoded), so
+        // once SLOTNUM (EIP-7843) is wired the round read via
+        // evmc_tx_context.block_round would be 0. On this historical-trace
+        // path that diverges from how the block actually executed; the
+        // eth_call/eth_simulate paths run against synthetic headers where a 0
+        // round may be acceptable. Repopulate slot_number from the persisted
+        // KinetConsensusBlockHeader::block_round where a real round exists, per
+        // EXE-60.
+        // Execute block header
+        execute_block_header<traits>(
+            block_state, header, /*exec_recorder=*/nullptr);
+        BlockMetrics metrics{};
+
+        std::vector<std::unique_ptr<trace::StateTracer>> state_tracers{};
+        state_tracers.reserve(transactions_size);
+
+        std::vector<std::unique_ptr<CallTracerBase>> noop_call_tracers{};
+        noop_call_tracers.reserve(transactions_size);
+
+        for (size_t i = 0; i < transactions_size; ++i) {
+            noop_call_tracers.emplace_back(std::make_unique<NoopCallTracer>());
+        }
+        std::span<std::unique_ptr<CallTracerBase>> const noop_call_tracers_view{
+            noop_call_tracers.data(), transactions_size};
+
+        auto const chain_context = [&] {
+            if constexpr (is_kinet_trait_v<traits>) {
+                return ChainContext<traits>{
+                    .grandparent_senders_and_authorities =
+                        grandparent_senders_and_authorities,
+                    .parent_senders_and_authorities =
+                        parent_senders_and_authorities,
+                    .senders_and_authorities = senders_and_authorities,
+                    .senders = senders,
+                    .authorities = authorities,
+                };
+            }
+            else {
+                return ChainContext<traits>{};
+            }
+        }();
+
+        // Trace single transaction
+        if (trace_transaction) {
+            // We allocate just one trace entry here as we only need to return
+            // the trace result of `transactions[transaction_index]`.
+
+            for (size_t i = 0; i < transactions_size - 1; ++i) {
+                state_tracers.emplace_back(
+                    std::make_unique<trace::StateTracer>(std::monostate{}));
+            }
+
+            nlohmann::json trace{};
+            state_tracers.emplace_back(
+                tracer_config == PRESTATE_TRACER
+                    ? std::make_unique<trace::StateTracer>(
+                          trace::PrestateTracer{trace, header.beneficiary})
+                    : std::make_unique<trace::StateTracer>(
+                          trace::StateDiffTracer{trace}));
+
+            std::span<std::unique_ptr<trace::StateTracer>> const
+                state_tracers_view{state_tracers.data(), transactions_size};
+
+            BOOST_OUTCOME_TRY(execute_block_transactions<traits>(
+                chain,
+                header,
+                transactions_view,
+                senders_view,
+                authorities_view,
+                block_state,
+                buffer,
+                tx_exec_pool,
+                metrics,
+                noop_call_tracers_view,
+                state_tracers_view,
+                chain_context,
+                /*exec_recorder=*/nullptr));
+            return Result<nlohmann::json>{std::move(trace)};
+        }
+        else {
+            // Helper to create a trace log entry of the form:
+            //   {"result": { execution trace goes here }, "txHash": "0x..."}
+            auto const trace_entry =
+                [&transactions](
+                    uint64_t const transaction_index) -> nlohmann::json {
+                bytes32_t const tx_hash = to_bytes(keccak256(
+                    rlp::encode_transaction(transactions[transaction_index])));
+                nlohmann::json entry{
+                    {"result", nlohmann::json{}},
+                    {"txHash", std::format("0x{}", to_hex(tx_hash))}};
+                return entry;
+            };
+
+            // Trace an entire block
+            std::vector<nlohmann::json> traces{};
+            traces.reserve(transactions_size);
+            for (size_t i = 0; i < transactions_size; ++i) {
+                traces.emplace_back(trace_entry(i));
+                if (tracer_config == PRESTATE_TRACER) {
+                    state_tracers.emplace_back(
+                        std::make_unique<trace::StateTracer>(
+                            trace::PrestateTracer{
+                                traces[i]["result"], header.beneficiary}));
+                }
+                else {
+                    state_tracers.emplace_back(
+                        std::make_unique<trace::StateTracer>(
+                            trace::StateDiffTracer{traces[i]["result"]}));
+                }
+            }
+
+            std::span<std::unique_ptr<trace::StateTracer>> const
+                state_tracers_view{state_tracers.data(), transactions_size};
+
+            BOOST_OUTCOME_TRY(execute_block_transactions<traits>(
+                chain,
+                header,
+                transactions_view,
+                senders_view,
+                authorities_view,
+                block_state,
+                buffer,
+                tx_exec_pool,
+                metrics,
+                noop_call_tracers_view,
+                state_tracers_view,
+                chain_context,
+                /*exec_recorder=*/nullptr));
+
+            // Compose state traces
+            return Result<nlohmann::json>{std::move(traces)};
+        }
+    }
+
+    void store_output_header(
+        Block const &block, std::vector<Receipt> const &receipts,
+        bytes32_t const &block_hash, std::vector<bytes32_t> const &txn_hashes,
+        nlohmann::json &output)
+    {
+        auto const format_hex = [](auto const &b) {
+            return std::format("0x{}", evmc::hex(b));
+        };
+
+        BlockHeader const &header = block.header;
+
+        // TODO(dhil): Computing the correct information for some of these
+        // fields currently requires a roundtrip to the db. However, in
+        // simulation mode we only have readonly access to the db.
+
+        output["hash"] = format_hex(block_hash);
+        output["parentHash"] = format_hex(header.parent_hash);
+        output["sha3Uncles"] = format_hex(header.ommers_hash);
+        output["miner"] = format_hex(header.beneficiary);
+        {
+            auto const encoded = rlp::encode_block(block);
+            output["size"] = std::format("0x{:x}", encoded.size());
+        }
+        // TODO(dhil): We currently do not have a way to compute roots
+        // information in simulation mode.
+        output["stateRoot"] = format_hex(header.state_root);
+        output["transactionsRoot"] = format_hex(header.transactions_root);
+        output["receiptsRoot"] = format_hex(header.receipts_root);
+        // In the absence of withdrawals we default to `NULL_HASH`.
+        output["withdrawalsRoot"] =
+            format_hex(header.withdrawals_root.value_or(NULL_HASH));
+        {
+            Receipt::Bloom bloom = compute_bloom(receipts);
+            output["logsBloom"] =
+                format_hex(byte_string_view{bloom.data(), bloom.size()});
+        }
+        output["difficulty"] =
+            std::format("0x{}", to_string(header.difficulty, 16));
+        output["number"] = std::format("0x{:x}", header.number);
+        output["gasLimit"] = std::format("0x{:x}", header.gas_limit);
+        output["gasUsed"] = std::format("0x{:x}", header.gas_used);
+        output["timestamp"] = std::format("0x{:x}", header.timestamp);
+        output["extraData"] = format_hex(header.extra_data);
+        output["mixHash"] = format_hex(header.prev_randao);
+        output["nonce"] = std::format("0x0000000000000000");
+        output["baseFeePerGas"] = std::format(
+            "0x{}", to_string(header.base_fee_per_gas.value_or(0), 16));
+        {
+            output["uncles"] = nlohmann::json::array();
+            for (auto const &uncle : block.ommers) {
+                output["uncles"].emplace_back(format_hex(
+                    to_bytes(keccak256(rlp::encode_block_header(uncle)))));
+            }
+        }
+        {
+            output["transactions"] = nlohmann::json::array();
+            for (auto const &txn_hash : txn_hashes) {
+                output["transactions"].emplace_back(format_hex(txn_hash));
+            }
+        }
+        {
+            output["withdrawals"] = nlohmann::json::array();
+            for (auto const &withdrawal :
+                 block.withdrawals.value_or(std::vector<Withdrawal>{})) {
+                output["withdrawals"].emplace_back(nlohmann::json{
+                    {"index", std::format("0x{:x}", withdrawal.index)},
+                    {"validatorIndex",
+                     std::format("0x{:x}", withdrawal.validator_index)},
+                    {"amount", std::format("0x{:x}", withdrawal.amount)},
+                    {"recipient",
+                     std::format("0x{}", evmc::hex(withdrawal.recipient))},
+                });
+            }
+        }
+    }
+
+    void eth_simulate_validate_inputs(
+        size_t max_simulate_blocks, uint64_t default_timestamp_increment,
+        std::vector<std::vector<Transaction>> const &calls,
+        struct kinet_block_override_vec const &block_overrides,
+        struct kinet_state_override_vec const &state_overrides,
+        BlockHeader const &base_header, bool const instance_is_kinet)
+    {
+        KINET_ASSERT_THROW(calls.size() > 0, "empty input");
+        KINET_ASSERT_THROW(
+            calls.size() <= max_simulate_blocks, "too many blocks");
+        KINET_ASSERT_THROW(
+            block_overrides.overrides != nullptr,
+            "block overrides pointer is null");
+        KINET_ASSERT_THROW(
+            state_overrides.overrides != nullptr,
+            "state overrides pointer is null");
+        if (instance_is_kinet &&
+            block_overrides.overrides->withdrawals.has_value()) {
+            KINET_ASSERT_THROW(
+                block_overrides.overrides->withdrawals->size() == 0,
+                "Withdrawals are not supported on Kinet");
+        }
+
+        BlockHeader header = base_header;
+        for (size_t i = 0; i < block_overrides.size; ++i) {
+            auto const &bo = block_overrides.overrides[i];
+            // From the specification
+            // (https://geth.ethereum.org/docs/interacting-with-geth/rpc/ns-eth):
+            // > When overriding multiple blocks, block numbers must
+            // > increment. Skipping numbers is allowed and skipped
+            // > blocks are included in the response.
+            uint64_t const block_number = bo.number.value_or(header.number + 1);
+            KINET_ASSERT_THROW(
+                block_number > header.number,
+                "block numbers must be strictly increasing");
+            uint64_t const gap = block_number - header.number;
+            // Possible block number override has been validated; we can
+            // partially update our loop carried header.
+            header.number = block_number;
+
+            if (bo.time.has_value()) {
+                // > Time must either increase or remain constant
+                // > relative to the previous block. If time is not
+                // > specified, it's incremented by one for each block.
+
+                // If a gap is wide, then we need to count the synthetic
+                // timestamps before validating the possible block timestamp
+                // override.
+                if (gap > 1) {
+                    // There are `(gap - 1)` synthetic blocks between
+                    // the current block and the previous block.
+                    header.timestamp += (gap - 1) * default_timestamp_increment;
+                }
+
+                KINET_ASSERT_THROW(
+                    header.timestamp <= *bo.time,
+                    "block timestamps must be monotonically increasing");
+                header.timestamp = *bo.time;
+            }
+            else {
+                header.timestamp += gap * default_timestamp_increment;
+            }
+        }
+        KINET_ASSERT_THROW(
+            header.number > base_header.number,
+            "simulation header number must be greater than the base header "
+            "number");
+        size_t const num_blocks = header.number - base_header.number;
+        KINET_ASSERT_THROW(
+            num_blocks <= max_simulate_blocks, "too many blocks");
+    }
+
+    void save_eth_simulate_log_entry(
+        Block const &block, std::vector<Receipt> const &receipts,
+        std::vector<std::vector<CallFrame>> const &call_frames,
+        bytes32_t const &block_hash, std::vector<bytes32_t> const &txn_hashes,
+        nlohmann::json &result)
+    {
+        KINET_ASSERT_THROW(
+            call_frames.size() == block.transactions.size(),
+            "call frames size mismatch with transactions");
+        KINET_ASSERT_THROW(
+            receipts.size() == block.transactions.size(),
+            "receipts size mismatch with transactions");
+        KINET_ASSERT_THROW(
+            txn_hashes.size() == block.transactions.size(),
+            "transaction hashes size mismatch with transactions");
+
+        auto const format_hex = [](auto const &b) {
+            return std::format("0x{}", evmc::hex(b));
+        };
+
+        auto entry = nlohmann::json::object();
+
+        entry["calls"] = nlohmann::json::array();
+        auto &txns = entry["calls"];
+
+        for (size_t tx_idx = 0; tx_idx < block.transactions.size(); ++tx_idx) {
+            KINET_ASSERT_THROW(
+                call_frames[tx_idx].size() > 0,
+                "call frames size must be greater than 0");
+            auto call_result = nlohmann::json::object();
+
+            call_result["status"] = std::format(
+                "0x{:x}",
+                call_frames[tx_idx][0].status == KINET_STATUS_SUCCESS ? 1 : 0);
+            call_result["returnData"] =
+                format_hex(call_frames[tx_idx][0].output);
+            call_result["gasUsed"] =
+                std::format("0x{:x}", call_frames[tx_idx][0].gas_used);
+
+            size_t log_index = 0;
+            if (call_frames[tx_idx][0].status == KINET_STATUS_SUCCESS) {
+                call_result["logs"] = nlohmann::json::array();
+                for (auto const &log : receipts[tx_idx].logs) {
+                    call_result["logs"].emplace_back(nlohmann::json{
+                        {"address", format_hex(log.address)},
+                        {"topics", nlohmann::json::array()},
+                        {"data", format_hex(log.data)},
+                        {"blockNumber",
+                         std::format("0x{:x}", block.header.number)},
+                        {
+                            "transactionHash",
+                            format_hex(txn_hashes[tx_idx]),
+                        },
+                        {"transactionIndex", std::format("0x{:x}", tx_idx)},
+                        {"blockHash", format_hex(block_hash)},
+                        {"logIndex", std::format("0x{:x}", log_index++)},
+                        // NOTE(dhil): Geth always emits logs with "removed"
+                        // fixed to `false`.
+                        {"removed", false},
+                    });
+                    for (auto const &topic : log.topics) {
+                        call_result["logs"].back()["topics"].emplace_back(
+                            format_hex(topic));
+                    }
+                }
+            }
+            else {
+                call_result["error"] = {{"message", "execution reverted"}};
+            }
+
+            txns.emplace_back(std::move(call_result));
+        }
+        store_output_header(block, receipts, block_hash, txn_hashes, entry);
+        result.emplace_back(std::move(entry));
+    }
+
+    template <Traits traits>
+    Result<nlohmann::json> eth_simulate_impl(
+        Chain const &chain, std::vector<std::vector<Transaction>> calls,
+        BlockHeader const &base_header, uint64_t const base_block_number,
+        bytes32_t const &block_id, bytes32_t const &grandparent_id,
+        std::vector<std::vector<Address>> senders,
+        std::vector<std::vector<std::vector<std::optional<Address>>>>
+            authorities,
+        mpt::RODb &db, vm::VM &vm, fiber::FiberGroup &tx_exec_pool,
+        struct kinet_state_override_vec const &state_overrides,
+        struct kinet_block_override_vec const &block_overrides,
+        uint64_t const gas_limit, size_t const max_calls,
+        bool emit_native_transfer_logs)
+    {
+        // TODO(dhil): Decide on the default timestamp increment.
+        static constexpr uint64_t DEFAULT_TIMESTAMP_INCREMENT = 1;
+
+        KINET_ASSERT_THROW(
+            calls.size() == senders.size(), "calls and senders size mismatch");
+        KINET_ASSERT_THROW(
+            calls.size() == authorities.size(),
+            "calls and authorities size mismatch");
+        KINET_ASSERT_THROW(
+            calls.size() == state_overrides.size,
+            "calls and state_overrides size mismatch");
+        KINET_ASSERT_THROW(
+            calls.size() == block_overrides.size,
+            "calls and block_overrides size mismatch");
+
+        for (size_t i = 0; i < calls.size(); ++i) {
+            KINET_ASSERT_THROW(
+                calls[i].size() == senders[i].size(),
+                "transactions and senders size mismatch");
+            KINET_ASSERT_THROW(
+                calls[i].size() == authorities[i].size(),
+                "transactions and authorities size mismatch");
+        }
+
+        // Validate the inputs before constructing the simulation objects. This
+        // validation procedure throws on bad input.
+        eth_simulate_validate_inputs(
+            max_calls,
+            DEFAULT_TIMESTAMP_INCREMENT,
+            calls,
+            block_overrides,
+            state_overrides,
+            base_header,
+            is_kinet_trait_v<traits>);
+
+        TrieRODb tdb{db};
+        tdb.set_block_and_prefix(base_block_number, block_id);
+
+        // Initialize the chain context buffer.
+        auto context_buffer = ChainContextBuffer<traits>{};
+        // Load grandparent context if available.
+        if (KINET_LIKELY(base_block_number > 0)) {
+            auto const grandparent_transactions = kinet::get_transactions(
+                db, base_block_number - 1, grandparent_id);
+            KINET_ASSERT_THROW(
+                grandparent_transactions.has_value(),
+                GRANDPARENT_TRANSACTIONS_CONTEXT_ERR_MSG);
+            auto const &[grandparent_senders, grandparent_authorities] =
+                recover_senders_and_authorities(
+                    grandparent_transactions.assume_value());
+            context_buffer.advance(
+                grandparent_senders, grandparent_authorities);
+        }
+        // Load parent context.
+        std::optional<bytes32_t> base_block_hash = std::nullopt;
+        {
+            auto const parent_transactions =
+                kinet::get_transactions(db, base_block_number, block_id);
+            KINET_ASSERT_THROW(
+                parent_transactions.has_value(),
+                PARENT_TRANSACTIONS_CONTEXT_ERR_MSG);
+            auto const &[parent_senders, parent_authorities] =
+                recover_senders_and_authorities(
+                    parent_transactions.assume_value());
+            context_buffer.advance(parent_senders, parent_authorities);
+
+            // If the base block is in-flight then we compute a mock block hash
+            // using the header and the loaded transactions.
+            if (block_id != bytes32_t{}) {
+                Block const base_block{
+                    .header = base_header,
+                    .transactions = parent_transactions.assume_value(),
+                };
+                base_block_hash =
+                    to_bytes(keccak256(rlp::encode_block(base_block)));
+            }
+        }
+
+        // Instantiate the block hash buffer. We simulate on top of the base
+        // block, thus the head block is `base_block_number + 1`.
+        EthSimulateBlockHashBuffer block_hash_buffer{
+            db, base_block_number + 1, base_block_hash};
+
+        // Simulate blocks including possibly synthetic blocks.
+        auto result = nlohmann::json::array();
+        BlockHeader header = base_header;
+        std::vector<std::vector<CallFrame>> const empty_call_frames{};
+        uint64_t gas_consumed_so_far = 0;
+
+        auto block_state = BlockState{tdb, vm};
+        for (size_t block_idx = 0; block_idx < calls.size(); ++block_idx) {
+            auto const &bo = block_overrides.overrides[block_idx];
+
+            // First we have to check whether we need to insert synthetic blocks
+            // to fill in the gap between the previous block and block induced
+            // by `block_idx`.
+            size_t const gap =
+                bo.number.value_or(header.number + 1) - header.number;
+            // No-op for gap == 1.
+            for (size_t i = 1; i < gap; ++i) {
+                BlockHeader const synthetic_header{
+                    .parent_hash = block_hash_buffer.get(header.number),
+                    .number = header.number + 1,
+                    // NOTE(dhil): Synthetic blocks carry forward the previous
+                    // gas limit.
+                    .gas_limit = header.gas_limit,
+                    // TODO(dhil): Better Kinet timestamp simulation (e.g. pack
+                    // multiple blocks into the same timestamp).
+                    .timestamp = header.timestamp + DEFAULT_TIMESTAMP_INCREMENT,
+                    // NOTE(dhil): Synthetic blocks carry forward the block
+                    // beneficiary.
+                    .beneficiary = header.beneficiary,
+                    // TODO(dhil): The simulation does not compute roots at this
+                    // time.
+                    .parent_beacon_block_root = bytes32_t{},
+                };
+                Block const synthetic_block{
+                    .header = synthetic_header,
+                };
+
+                auto block_metrics = BlockMetrics{};
+                auto call_tracers =
+                    std::vector<std::unique_ptr<CallTracerBase>>{};
+                auto state_tracers =
+                    std::vector<std::unique_ptr<trace::StateTracer>>{};
+                trace::StateTracer system_call_state_tracer{std::monostate{}};
+
+                static std::vector<Address> empty_senders{};
+                static std::vector<std::vector<std::optional<Address>>>
+                    empty_authorities{};
+
+                auto const chain_context =
+                    context_buffer.advance(empty_senders, empty_authorities);
+
+                BOOST_OUTCOME_TRY(
+                    auto const receipts,
+                    execute_block<traits>(
+                        chain,
+                        synthetic_block,
+                        empty_senders,
+                        empty_authorities,
+                        block_state,
+                        block_hash_buffer,
+                        tx_exec_pool,
+                        block_metrics,
+                        call_tracers,
+                        state_tracers,
+                        system_call_state_tracer,
+                        chain_context,
+                        /*exec_recorder=*/nullptr,
+                        emit_native_transfer_logs));
+
+                // NOTE(dhil): Synthetic blocks are free, so we don't update
+                // `gas_consumed_so_far`.
+
+                bytes32_t const synthetic_block_hash = to_bytes(keccak256(
+                    rlp::encode_block_header(synthetic_block.header)));
+                block_hash_buffer.advance(synthetic_block_hash);
+
+                save_eth_simulate_log_entry(
+                    synthetic_block,
+                    receipts,
+                    empty_call_frames,
+                    synthetic_block_hash,
+                    {},
+                    result);
+
+                header = synthetic_block.header;
+            }
+            // By this point it must be the case that the distance between the
+            // previous block and the block we are about to construct is
+            // exactly 1.
+            KINET_ASSERT_THROW(
+                bo.number.value_or(header.number + 1) - header.number == 1,
+                "the block gap must be exactly 1 after filling in synthetic "
+                "blocks");
+
+            // Construct the block header.
+            BlockHeader const current_header{
+                .parent_hash = block_hash_buffer.get(header.number),
+                .prev_randao = bo.prev_randao.value_or(bytes32_t{}),
+                // NOTE(dhil): The possible increment by one is correct by
+                // construction of the synthetic blocks.
+                .number = bo.number.value_or(header.number + 1),
+                // NOTE(dhil): The default is to inherit the **previous**
+                // header's gas limit irrespective of whether it is a real
+                // block, a synthetic block, or a user-defined block.
+                .gas_limit = bo.gas_limit.value_or(header.gas_limit),
+                // TODO(dhil): Better Kinet timestamp simulation (e.g. pack
+                // multiple blocks into the same timestamp).
+                .timestamp = bo.time.value_or(
+                    header.timestamp + DEFAULT_TIMESTAMP_INCREMENT),
+                .beneficiary = bo.fee_recipient.value_or(header.beneficiary),
+                .base_fee_per_gas = bo.base_fee_per_gas,
+                // TODO(dhil): The simulation does not compute roots at this
+                // time.
+                .parent_beacon_block_root = bytes32_t{},
+            };
+
+            // Construct state
+            // State overrides are applied with an incarnation in the *previous*
+            // block, rather than with the current header's block number.
+            auto const override_incarnation = Incarnation{
+                base_block_number + block_idx, Incarnation::LAST_TX - 1u};
+            apply_state_overrides(
+                block_state,
+                override_incarnation,
+                state_overrides.overrides[block_idx]);
+
+            // Patch up transactions with valid chain_id, signature, and nonce
+            // so that they can pass validation in execute_block.
+            {
+                State state{block_state, override_incarnation};
+
+                for (size_t tx_idx = 0; tx_idx < calls[block_idx].size();
+                     ++tx_idx) {
+                    Transaction &tx = calls[block_idx][tx_idx];
+
+                    tx.sc.chain_id = chain.get_chain_id();
+                    tx.sc.signature.r = 1;
+                    tx.sc.signature.s = 1;
+
+                    // Update tx.nonce to match the expected nonce in the
+                    // current block state.
+                    tx.nonce = state.get_nonce(senders[block_idx][tx_idx]);
+                    state.set_nonce(senders[block_idx][tx_idx], tx.nonce + 1);
+                }
+            }
+
+            auto block_metrics = BlockMetrics{};
+            auto call_frames = std::vector<std::vector<CallFrame>>{};
+            call_frames.reserve(calls[block_idx].size());
+            auto call_tracers = std::vector<std::unique_ptr<CallTracerBase>>{};
+            call_tracers.reserve(calls[block_idx].size());
+            auto state_tracers =
+                std::vector<std::unique_ptr<trace::StateTracer>>{};
+            state_tracers.reserve(calls[block_idx].size());
+            trace::StateTracer system_call_state_tracer{std::monostate{}};
+
+            for (Transaction const &tx : calls[block_idx]) {
+                call_frames.emplace_back();
+                call_tracers.emplace_back(
+                    std::make_unique<CallTracer>(tx, call_frames.back()));
+                state_tracers.emplace_back(
+                    std::make_unique<trace::StateTracer>());
+            }
+
+            auto const chain_context = context_buffer.advance(
+                senders[block_idx], authorities[block_idx]);
+
+            auto block = Block{
+                .header = current_header,
+                .transactions = std::move(calls[block_idx]),
+                .withdrawals =
+                    is_kinet_trait_v<traits> ? std::nullopt : bo.withdrawals,
+            };
+
+            BOOST_OUTCOME_TRY(
+                auto const receipts,
+                execute_block<traits>(
+                    chain,
+                    block,
+                    senders[block_idx],
+                    authorities[block_idx],
+                    block_state,
+                    block_hash_buffer,
+                    tx_exec_pool,
+                    block_metrics,
+                    call_tracers,
+                    state_tracers,
+                    system_call_state_tracer,
+                    chain_context,
+                    /*exec_recorder=*/nullptr,
+                    emit_native_transfer_logs));
+
+            // Receipts have cumulative gas_used (YP eq. 22), so
+            // the last receipt's value is the total for the block.
+            uint64_t const gas_used = static_cast<uint64_t>(
+                receipts.empty() ? 0 : receipts.back().gas_used);
+
+            // Check whether the gas limit has been exceeded.
+            // Gas accumulator overflow check.
+            KINET_ASSERT_THROW(
+                !(gas_used > 0 &&
+                  gas_consumed_so_far >
+                      std::numeric_limits<uint64_t>::max() - gas_used),
+                "gas limit exceeded");
+            // No overflow. Add the consumed gas.
+            gas_consumed_so_far += gas_used;
+            // We may have exceeded the gas limit.
+            KINET_ASSERT_THROW(
+                gas_consumed_so_far <= gas_limit, "gas limit exceeded");
+
+            // Patch up the block header for results reporting.
+            block.header.gas_used = gas_used;
+            if constexpr (is_kinet_trait_v<traits>) {
+                block.header.withdrawals_root = NULL_HASH;
+                if (!bo.gas_limit.has_value() && header.gas_limit == 0) {
+                    block.header.gas_limit = gas_used;
+                }
+            }
+
+            bytes32_t const block_hash =
+                to_bytes(keccak256(rlp::encode_block_header(block.header)));
+            block_hash_buffer.advance(block_hash);
+
+            std::vector<bytes32_t> txn_hashes{};
+            txn_hashes.reserve(block.transactions.size());
+            for (Transaction const &txn : block.transactions) {
+                txn_hashes.emplace_back(
+                    to_bytes(keccak256(rlp::encode_transaction(txn))));
+            }
+
+            save_eth_simulate_log_entry(
+                block, receipts, call_frames, block_hash, txn_hashes, result);
+
+            header = current_header;
+        }
+
+        return result;
+    }
+}
+
+namespace kinet
+{
+    quill::Logger *tracer = nullptr;
+}
+
+void kinet_executor_result_release(kinet_executor_result *const result)
+{
+    KINET_ASSERT(result);
+    if (result->output_data) {
+        delete[] result->output_data;
+    }
+
+    if (result->message) {
+        free(result->message);
+    }
+
+    if (result->encoded_trace) {
+        delete[] result->encoded_trace;
+    }
+
+    delete result;
+}
+
+namespace
+{
+    struct Pool
+    {
+        enum class Type
+        {
+            low,
+            high
+        };
+
+        Pool(Type const type, kinet_executor_pool_config const &config)
+            : type(type)
+            , limit(config.queue_limit)
+            , timeout(std::chrono::seconds(config.timeout_sec))
+            , pool(config.num_threads, config.num_fibers, true)
+        {
+        }
+
+        kinet_executor_pool_state get_state() const
+        {
+            return kinet_executor_pool_state{
+                .num_fibers = pool.num_fibers(),
+                .executing_count =
+                    executing_count.load(std::memory_order_relaxed),
+                .queued_count = queued_count.load(std::memory_order_relaxed),
+                .queue_limit = limit,
+                .queue_full_count =
+                    queue_full_count.load(std::memory_order_relaxed),
+            };
+        }
+
+        bool try_enqueue()
+        {
+            auto const current = queued_count.load(std::memory_order_relaxed);
+            if (current >= limit) {
+                queue_full_count.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            queued_count.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+
+        Type type;
+
+        // Maximum number of requests in the queue.
+        unsigned limit;
+
+        // Timeout request if it failed to be scheduled in this time.
+        std::chrono::seconds timeout;
+
+        // Number of requests currently in the queue.
+        std::atomic<unsigned> queued_count{0};
+
+        // Number of requests currently being executed.
+        std::atomic<unsigned> executing_count{0};
+
+        // Number of queue full conditions.
+        std::atomic<uint64_t> queue_full_count{0};
+
+        // Underlying fiber pool.
+        fiber::PriorityPool pool;
+    };
+
+    // Group wraps a FiberGroup with additional tracking metadata.
+    // Unlike Pool which owns its threads, Group references a shared
+    // FiberThreadPool.
+    struct Group
+    {
+        Group(
+            unsigned const queue_limit, std::chrono::seconds const timeout,
+            std::unique_ptr<fiber::FiberGroup> group)
+            : limit(queue_limit)
+            , timeout(timeout)
+            , group(std::move(group))
+        {
+        }
+
+        kinet_executor_pool_state get_state() const
+        {
+            return kinet_executor_pool_state{
+                .num_fibers = group->num_fibers(),
+                .executing_count =
+                    executing_count.load(std::memory_order_relaxed),
+                .queued_count = queued_count.load(std::memory_order_relaxed),
+                .queue_limit = limit,
+                .queue_full_count =
+                    queue_full_count.load(std::memory_order_relaxed),
+            };
+        }
+
+        bool try_enqueue()
+        {
+            auto const current = queued_count.load(std::memory_order_relaxed);
+            if (current >= limit) {
+                queue_full_count.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            queued_count.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+
+        // Maximum number of requests in the queue.
+        unsigned limit;
+
+        // Timeout request if it failed to be scheduled in this time.
+        std::chrono::seconds timeout;
+
+        // Number of requests currently in the queue.
+        std::atomic<unsigned> queued_count{0};
+
+        // Number of requests currently being executed.
+        std::atomic<unsigned> executing_count{0};
+
+        // Number of queue full conditions.
+        std::atomic<uint64_t> queue_full_count{0};
+
+        // Underlying fiber group (references shared thread pool).
+        std::unique_ptr<fiber::FiberGroup> group;
+    };
+}
+
+struct kinet_executor
+{
+    Pool low_gas_pool_;
+    Pool high_gas_pool_;
+
+    // Shared thread pool for trace operations (reduces thread count)
+    fiber::FiberThreadPool trace_thread_pool_;
+
+    // Fiber groups sharing the trace thread pool
+    Group trace_block_group_; // Limits concurrent trace requests
+    Group trace_tx_exec_group_; // Executes transactions within trace blocks
+
+    // Sequence number for each call. This is used as a priority of the request,
+    // requests started earlier have higher priority.
+    std::atomic<uint64_t> call_seq_no_{0};
+
+    mpt::RODb db_;
+
+    // Secondary timeline, opened when active; shares db_'s service thread
+    // and node cache. On archive nodes after the offline promote this is the
+    // frozen slot-encoded history that serves pre-cutoff versions the
+    // page-encoded primary does not have.
+    std::unique_ptr<mpt::RODb> secondary_db_;
+
+    // The VM for executing eth calls needs to unconditionally use the
+    // interpreter rather than the compiler. If it uses the compiler, then
+    // out-of-gas errors can be misreported as generic failures.
+    vm::VM vm_{vm::VM::InterpreterOnly};
+
+    static mpt::ReadOnlyOnDiskDbConfig make_db_config(
+        std::string const &triedb_path, uint64_t const node_lru_max_mem)
+    {
+        std::vector<std::filesystem::path> paths;
+        if (std::filesystem::is_directory(triedb_path)) {
+            for (auto const &file :
+                 std::filesystem::directory_iterator(triedb_path)) {
+                paths.emplace_back(file.path());
+            }
+        }
+        else {
+            paths.emplace_back(triedb_path);
+        }
+        return mpt::ReadOnlyOnDiskDbConfig{
+            .dbname_paths = std::move(paths),
+            .node_lru_max_mem = node_lru_max_mem};
+    }
+
+    // The primary owns everything from its earliest version upward; only
+    // versions below that floor fall through to the secondary (the strictly
+    // older history). Availability is re-validated inside the read path, so
+    // a version trimmed between here and the read fails the same way it
+    // always has.
+    mpt::RODb &select_db(uint64_t const block_number)
+    {
+        if (block_number >= db_.get_earliest_version() ||
+            secondary_db_ == nullptr) {
+            return db_;
+        }
+        return *secondary_db_;
+    }
+
+    kinet_executor(
+        kinet_executor_pool_config const &low_pool_config,
+        kinet_executor_pool_config const &high_pool_config,
+        kinet_executor_pool_config const &block_pool_config,
+        unsigned const tx_exec_num_fibers,
+        uint64_t const node_lru_max_mem, std::string const &triedb_path)
+        : low_gas_pool_{Pool::Type::low, low_pool_config}
+        , high_gas_pool_{Pool::Type::high, high_pool_config}
+        , trace_thread_pool_{block_pool_config.num_threads, true}
+        , trace_block_group_{
+              block_pool_config.queue_limit,
+              std::chrono::seconds(block_pool_config.timeout_sec),
+              trace_thread_pool_.create_fiber_group(block_pool_config.num_fibers)}
+        , trace_tx_exec_group_{
+              block_pool_config.queue_limit,
+              std::chrono::seconds(block_pool_config.timeout_sec),
+              trace_thread_pool_.create_fiber_group(tx_exec_num_fibers)}
+        // create the db instances on the PriorityPool thread so all the
+        // thread local storage gets instantiated on the one thread its
+        // used
+        , db_{make_db_config(triedb_path, node_lru_max_mem)}
+        , secondary_db_{db_.open_secondary_timeline()}
+    {
+    }
+
+    kinet_executor(kinet_executor const &) = delete;
+    kinet_executor &operator=(kinet_executor const &) = delete;
+
+    void execute_eth_call(
+        kinet_chain_config const chain_config, Transaction const &txn,
+        BlockHeader const &block_header, Address const &sender,
+        uint64_t const block_number, bytes32_t const &block_id,
+        kinet_state_override const *const overrides,
+        void (*complete)(kinet_executor_result *, void *user), void *const user,
+        kinet_tracer_config const tracer_config, bool const gas_specified)
+    {
+        kinet_executor_result *const result = new kinet_executor_result();
+
+        Pool *pool =
+            gas_specified && txn.gas_limit > KINET_ETH_CALL_LOW_GAS_LIMIT
+                ? &high_gas_pool_
+                : &low_gas_pool_;
+
+        submit_eth_call_to_pool(
+            chain_config,
+            txn,
+            block_header,
+            sender,
+            block_number,
+            block_id,
+            overrides,
+            complete,
+            user,
+            tracer_config,
+            gas_specified,
+            std::chrono::steady_clock::now(),
+            call_seq_no_.fetch_add(1, std::memory_order_relaxed),
+            result,
+            *pool);
+    }
+
+    void submit_eth_call_to_pool(
+        kinet_chain_config const chain_config, Transaction const &txn,
+        BlockHeader const &block_header, Address const &sender,
+        uint64_t const block_number, bytes32_t const &block_id,
+        kinet_state_override const *const overrides,
+        void (*complete)(kinet_executor_result *, void *user), void *const user,
+        kinet_tracer_config const tracer_config, bool const gas_specified,
+        std::chrono::steady_clock::time_point const call_begin,
+        uint64_t const eth_call_seq_no, kinet_executor_result *const result,
+        Pool &active_pool)
+    {
+        if (!active_pool.try_enqueue()) {
+            result->status_code = EVMC_REJECTED;
+            result->message = strdup(EXCEED_QUEUE_SIZE_ERR_MSG);
+            KINET_ASSERT(result->message);
+            complete(result, user);
+            return;
+        }
+
+        active_pool.pool.submit(
+            eth_call_seq_no,
+            [this,
+             call_begin = call_begin,
+             eth_call_seq_no = eth_call_seq_no,
+             chain_config = chain_config,
+             orig_txn = txn,
+             block_header = block_header,
+             block_number = block_number,
+             block_id = block_id,
+             &db = select_db(block_number),
+             sender = sender,
+             result = result,
+             complete = complete,
+             user = user,
+             state_overrides = overrides,
+             tracer_config = tracer_config,
+             gas_specified = gas_specified,
+             active_pool = &active_pool] {
+                active_pool->queued_count.fetch_sub(
+                    1, std::memory_order_relaxed);
+                active_pool->executing_count.fetch_add(
+                    1, std::memory_order_relaxed);
+                BOOST_SCOPE_EXIT_ALL(&active_pool)
+                {
+                    active_pool->executing_count.fetch_sub(
+                        1, std::memory_order_relaxed);
+                };
+                try {
+                    // check for timeout
+                    if (std::chrono::steady_clock::now() - call_begin >
+                        active_pool->timeout) {
+                        result->status_code = EVMC_REJECTED;
+                        result->message = strdup(TIMEOUT_ERR_MSG);
+                        KINET_ASSERT(result->message);
+                        complete(result, user);
+                        return;
+                    }
+
+                    std::vector<std::optional<Address>> authorities(
+                        orig_txn.authorization_list.size());
+                    for (auto j = 0u; j < orig_txn.authorization_list.size();
+                         ++j) {
+                        authorities[j] =
+                            recover_authority(orig_txn.authorization_list[j]);
+                    }
+
+                    auto transaction = orig_txn;
+
+                    bool const override_with_low_gas_retry_if_oog =
+                        active_pool->type == Pool::Type::low &&
+                        !gas_specified &&
+                        orig_txn.gas_limit > KINET_ETH_CALL_LOW_GAS_LIMIT;
+
+                    if (override_with_low_gas_retry_if_oog) {
+                        // override with low gas limit
+                        transaction.gas_limit = KINET_ETH_CALL_LOW_GAS_LIMIT;
+                    }
+
+                    auto const chain = make_chain(chain_config);
+
+                    LazyBlockHash block_hash_buffer{db, block_number};
+                    TrieRODb tdb{db};
+                    std::vector<CallFrame> call_frames;
+                    nlohmann::json state_trace;
+                    std::unique_ptr<CallTracerBase> call_tracer =
+                        tracer_config == CALL_TRACER
+                            ? std::unique_ptr<CallTracerBase>{std::make_unique<
+                                  CallTracer>(transaction, call_frames)}
+                            : std::unique_ptr<CallTracerBase>{
+                                  std::make_unique<NoopCallTracer>()};
+                    auto state_tracer = [&]() -> trace::StateTracer {
+                        switch (tracer_config) {
+                        case NOOP_TRACER:
+                        case CALL_TRACER:
+                            return std::monostate{};
+                        case PRESTATE_TRACER:
+                            return trace::PrestateTracer{
+                                state_trace, block_header.beneficiary};
+                        case STATEDIFF_TRACER:
+                            return trace::StateDiffTracer{state_trace};
+                        case ACCESS_LIST_TRACER:
+                            return trace::AccessListTracer{
+                                state_trace,
+                                sender,
+                                block_header.beneficiary,
+                                transaction.to,
+                                authorities};
+                        }
+                        KINET_ASSERT(false);
+                    }();
+
+                    auto const res = [&]() -> Result<evmc::Result> {
+                        if (chain_config == CHAIN_CONFIG_ETHEREUM_MAINNET ||
+                            chain_config == CHAIN_CONFIG_HIVE_NET) {
+                            kinet_eth_revision const rev = chain->get_revision(
+                                block_header.number, block_header.timestamp);
+                            SWITCH_EVM_TRAITS(
+                                eth_call_impl,
+                                *chain,
+                                transaction,
+                                block_header,
+                                block_number,
+                                block_id,
+                                sender,
+                                authorities,
+                                tdb,
+                                vm_,
+                                block_hash_buffer,
+                                *state_overrides,
+                                *call_tracer,
+                                state_tracer);
+                            KINET_ASSERT(false);
+                        }
+                        else {
+                            auto const rev =
+                                dynamic_cast<KinetChain *>(chain.get())
+                                    ->get_kinet_revision(
+                                        block_header.timestamp);
+                            SWITCH_KINET_TRAITS(
+                                eth_call_impl,
+                                *chain,
+                                transaction,
+                                block_header,
+                                block_number,
+                                block_id,
+                                sender,
+                                authorities,
+                                tdb,
+                                vm_,
+                                block_hash_buffer,
+                                *state_overrides,
+                                *call_tracer,
+                                state_tracer);
+                            KINET_ASSERT(false);
+                        }
+                    }();
+
+                    if (override_with_low_gas_retry_if_oog &&
+                        ((res.has_value() &&
+                          (res.value().status_code == EVMC_OUT_OF_GAS ||
+                           res.value().status_code == EVMC_REVERT)) ||
+                         (res.has_error() &&
+                          res.error() == TransactionError::
+                                             IntrinsicGasGreaterThanLimit))) {
+                        retry_in_high_pool(
+                            chain_config,
+                            orig_txn,
+                            block_header,
+                            sender,
+                            block_number,
+                            block_id,
+                            state_overrides,
+                            complete,
+                            user,
+                            tracer_config,
+                            call_begin,
+                            eth_call_seq_no,
+                            result);
+                        return;
+                    }
+                    if (KINET_UNLIKELY(res.has_error())) {
+                        result->status_code = EVMC_REJECTED;
+                        result->message = strdup(res.error().message().c_str());
+                        KINET_ASSERT(result->message);
+                        complete(result, user);
+                        return;
+                    }
+                    call_complete(
+                        transaction,
+                        res.assume_value(),
+                        result,
+                        complete,
+                        user,
+                        call_frames,
+                        state_trace);
+                }
+                catch (KinetException const &e) {
+                    result->status_code = EVMC_INTERNAL_ERROR;
+                    result->message = strdup(e.message());
+                    KINET_ASSERT(result->message);
+                    complete(result, user);
+                }
+                catch (...) {
+                    result->status_code = EVMC_INTERNAL_ERROR;
+                    result->message = strdup(UNEXPECTED_EXCEPTION_ERR_MSG);
+                    KINET_ASSERT(result->message);
+                    complete(result, user);
+                }
+            });
+    }
+
+    void call_complete(
+        Transaction const &transaction, evmc::Result const &evmc_result,
+        kinet_executor_result *const result,
+        void (*complete)(kinet_executor_result *, void *user), void *const user,
+        std::vector<CallFrame> const &call_frames,
+        nlohmann::json const &state_trace)
+    {
+        result->status_code = evmc_result.status_code;
+        result->gas_used =
+            static_cast<int64_t>(transaction.gas_limit) - evmc_result.gas_left;
+        result->gas_refund = evmc_result.gas_refund;
+        if (evmc_result.output_size > 0) {
+            result->output_data = new uint8_t[evmc_result.output_size];
+            result->output_data_len = evmc_result.output_size;
+            memcpy(
+                (uint8_t *)result->output_data,
+                evmc_result.output_data,
+                evmc_result.output_size);
+        }
+        else {
+            result->output_data = nullptr;
+            result->output_data_len = 0;
+        }
+
+        if (!call_frames.empty()) {
+            byte_string const rlp_call_frames =
+                rlp::encode_call_frames(call_frames);
+            result->encoded_trace = new uint8_t[rlp_call_frames.size()];
+            result->encoded_trace_len = rlp_call_frames.size();
+            memcpy(
+                (uint8_t *)result->encoded_trace,
+                rlp_call_frames.data(),
+                rlp_call_frames.size());
+        }
+        else if (!state_trace.empty()) {
+            std::vector<uint8_t> cbor_state_trace =
+                nlohmann::json::to_cbor(state_trace);
+            result->encoded_trace = new uint8_t[cbor_state_trace.size()];
+            result->encoded_trace_len = cbor_state_trace.size();
+            memcpy(
+                (uint8_t *)result->encoded_trace,
+                cbor_state_trace.data(),
+                cbor_state_trace.size());
+        }
+        else {
+            result->encoded_trace = nullptr;
+            result->encoded_trace_len = 0;
+        }
+        complete(result, user);
+    }
+
+    void retry_in_high_pool(
+        kinet_chain_config const chain_config, Transaction const &orig_txn,
+        BlockHeader const &block_header, Address const &sender,
+        uint64_t const block_number, bytes32_t const &block_id,
+        kinet_state_override const *const overrides,
+        void (*complete)(kinet_executor_result *, void *user), void *const user,
+        kinet_tracer_config const tracer_config,
+        std::chrono::steady_clock::time_point const call_begin,
+        auto const eth_call_seq_no, kinet_executor_result *const result)
+    {
+        // retry in high gas limit pool
+        KINET_ASSERT_THROW(
+            orig_txn.gas_limit > KINET_ETH_CALL_LOW_GAS_LIMIT,
+            "retry_in_high_pool called with low gas limit");
+
+        submit_eth_call_to_pool(
+            chain_config,
+            orig_txn,
+            block_header,
+            sender,
+            block_number,
+            block_id,
+            overrides,
+            complete,
+            user,
+            tracer_config,
+            false /* gas_specified */,
+            call_begin,
+            eth_call_seq_no,
+            result,
+            high_gas_pool_);
+    }
+
+    void submit_eth_trace_block_or_transaction_to_pool(
+        kinet_chain_config const chain_config, BlockHeader const &block_header,
+        uint64_t const block_number, bytes32_t const &block_id,
+        bytes32_t const &parent_id, bytes32_t const &grandparent_id,
+        bool const trace_transaction, uint64_t const transaction_index,
+        void (*complete)(kinet_executor_result *, void *user), void *const user,
+        kinet_tracer_config const tracer_config)
+    {
+        kinet_executor_result *const result = new kinet_executor_result();
+
+        if (tracer_config != PRESTATE_TRACER &&
+            tracer_config != STATEDIFF_TRACER) {
+            result->status_code = EVMC_REJECTED;
+            result->message = strdup(PRESTATE_TRACER_SUPPORT_ERR_MSG);
+            KINET_ASSERT(result->message);
+            complete(result, user);
+            return;
+        }
+
+        if (block_number == 0) {
+            result->status_code = EVMC_REJECTED;
+            result->message = strdup(CANNOT_TRACE_GENESIS_ERR_MSG);
+            KINET_ASSERT(result->message);
+            complete(result, user);
+            return;
+        }
+
+        if (!trace_block_group_.try_enqueue()) {
+            result->status_code = EVMC_REJECTED;
+            result->message = strdup(EXCEED_QUEUE_SIZE_ERR_MSG);
+            KINET_ASSERT(result->message);
+            complete(result, user);
+            return;
+        }
+
+        auto const priority =
+            call_seq_no_.fetch_add(1, std::memory_order_relaxed);
+        trace_block_group_.group->submit(
+            priority,
+            [this,
+             block_id = block_id,
+             block_header = block_header,
+             block_number = block_number,
+             chain_config = chain_config,
+             complete = complete,
+             &db = select_db(block_number),
+             fiber_group = &trace_block_group_,
+             tx_exec_group = &trace_tx_exec_group_,
+             grandparent_id = grandparent_id,
+             parent_id = parent_id,
+             result = result,
+             tracer_config = tracer_config,
+             trace_transaction = trace_transaction,
+             transaction_index = transaction_index,
+             user = user]() {
+                fiber_group->queued_count.fetch_sub(
+                    1, std::memory_order_relaxed);
+                fiber_group->executing_count.fetch_add(
+                    1, std::memory_order_relaxed);
+                BOOST_SCOPE_EXIT_ALL(&fiber_group)
+                {
+                    fiber_group->executing_count.fetch_sub(
+                        1, std::memory_order_relaxed);
+                };
+                try {
+                    auto const chain = make_chain(chain_config);
+
+                    // Load transactions, senders, and authorities for
+                    // `block_number`.
+                    auto const maybe_transactions =
+                        kinet::get_transactions(db, block_number, block_id);
+                    KINET_ASSERT_THROW(
+                        maybe_transactions.has_value(),
+                        TRANSACTIONS_CONTEXT_ERR_MSG);
+
+                    auto const &transactions =
+                        maybe_transactions.assume_value();
+                    if (trace_transaction) {
+                        KINET_ASSERT_THROW(
+                            transaction_index < transactions.size(),
+                            TRANSACTION_OUT_OF_BOUNDS_ERR_MSG);
+                    }
+
+                    auto const &[senders, authorities] =
+                        recover_senders_and_authorities(transactions);
+
+                    auto const senders_and_authorities =
+                        combine_senders_and_authorities(senders, authorities);
+
+                    // Load parent and grandparent senders and authorities
+                    std::optional<
+                        ankerl::unordered_dense::segmented_set<Address>>
+                        parent_senders_and_authorities;
+                    std::optional<
+                        ankerl::unordered_dense::segmented_set<Address>>
+                        grandparent_senders_and_authorities;
+
+                    if (KINET_LIKELY(block_number > 1)) {
+                        auto const parent_transactions =
+                            kinet::get_transactions(
+                                db, block_number - 1, parent_id);
+                        KINET_ASSERT_THROW(
+                            parent_transactions.has_value(),
+                            PARENT_TRANSACTIONS_CONTEXT_ERR_MSG);
+                        auto const &[parent_senders, parent_authorities] =
+                            recover_senders_and_authorities(
+                                parent_transactions.assume_value());
+                        parent_senders_and_authorities =
+                            combine_senders_and_authorities(
+                                parent_senders, parent_authorities);
+                    }
+                    if (KINET_LIKELY(block_number > 2)) {
+                        auto const grandparent_transactions =
+                            kinet::get_transactions(
+                                db, block_number - 2, grandparent_id);
+                        KINET_ASSERT_THROW(
+                            grandparent_transactions.has_value(),
+                            GRANDPARENT_TRANSACTIONS_CONTEXT_ERR_MSG);
+                        auto const
+                            &[grandparent_senders, grandparent_authorities] =
+                                recover_senders_and_authorities(
+                                    grandparent_transactions.assume_value());
+                        grandparent_senders_and_authorities =
+                            combine_senders_and_authorities(
+                                grandparent_senders, grandparent_authorities);
+                    }
+
+                    // Set db to parent block state
+                    TrieRODb tdb{db};
+                    tdb.set_block_and_prefix(block_number - 1, parent_id);
+                    BlockState block_state{tdb, vm_};
+                    LazyBlockHash block_hash_buffer{db, block_number};
+
+                    auto const res = [&]() -> Result<nlohmann::json> {
+                        if (chain_config == CHAIN_CONFIG_ETHEREUM_MAINNET ||
+                            chain_config == CHAIN_CONFIG_HIVE_NET) {
+                            kinet_eth_revision const rev = chain->get_revision(
+                                block_header.number, block_header.timestamp);
+                            SWITCH_EVM_TRAITS(
+                                eth_trace_block_or_transaction_impl,
+                                *chain,
+                                grandparent_senders_and_authorities
+                                    ? *grandparent_senders_and_authorities
+                                    : empty_senders_and_authorities,
+                                parent_senders_and_authorities
+                                    ? *parent_senders_and_authorities
+                                    : empty_senders_and_authorities,
+                                senders_and_authorities,
+                                senders,
+                                authorities,
+                                block_header,
+                                transactions,
+                                trace_transaction,
+                                transaction_index,
+                                block_state,
+                                block_hash_buffer,
+                                *tx_exec_group->group,
+                                tracer_config);
+                            KINET_ASSERT(false);
+                        }
+                        else {
+                            auto const rev =
+                                dynamic_cast<KinetChain *>(chain.get())
+                                    ->get_kinet_revision(
+                                        block_header.timestamp);
+                            // NOLINTBEGIN(clang-analyzer-core.CallAndMessage)
+                            SWITCH_KINET_TRAITS(
+                                eth_trace_block_or_transaction_impl,
+                                *chain,
+                                grandparent_senders_and_authorities
+                                    ? *grandparent_senders_and_authorities
+                                    : empty_senders_and_authorities,
+                                parent_senders_and_authorities
+                                    ? *parent_senders_and_authorities
+                                    : empty_senders_and_authorities,
+                                senders_and_authorities,
+                                senders,
+                                authorities,
+                                block_header,
+                                transactions,
+                                trace_transaction,
+                                transaction_index,
+                                block_state,
+                                block_hash_buffer,
+                                *tx_exec_group->group,
+                                tracer_config);
+                            // NOLINTEND(clang-analyzer-core.CallAndMessage)
+                            KINET_ASSERT(false);
+                        }
+                    }();
+
+                    if (KINET_UNLIKELY(res.has_error())) {
+                        result->status_code = EVMC_REJECTED;
+                        result->message = strdup(res.error().message().c_str());
+                        KINET_ASSERT(result->message);
+                        complete(result, user);
+                        return;
+                    }
+
+                    nlohmann::json const &trace = res.assume_value();
+                    if (trace.empty()) {
+                        result->encoded_trace = nullptr;
+                        result->encoded_trace_len = 0;
+                    }
+                    else {
+                        std::vector<uint8_t> cbor_state_trace =
+                            nlohmann::json::to_cbor(trace);
+                        result->encoded_trace =
+                            new uint8_t[cbor_state_trace.size()];
+                        result->encoded_trace_len = cbor_state_trace.size();
+                        memcpy(
+                            (uint8_t *)result->encoded_trace,
+                            cbor_state_trace.data(),
+                            cbor_state_trace.size());
+                    }
+
+                    complete(result, user);
+                }
+                catch (KinetException const &e) {
+                    result->status_code = EVMC_INTERNAL_ERROR;
+                    result->message = strdup(e.message());
+                    KINET_ASSERT(result->message);
+                    complete(result, user);
+                }
+                catch (...) {
+                    result->status_code = EVMC_INTERNAL_ERROR;
+                    result->message = strdup(UNEXPECTED_EXCEPTION_ERR_MSG);
+                    KINET_ASSERT(result->message);
+                    complete(result, user);
+                }
+            });
+    }
+
+    void submit_eth_simulate_to_pool(
+        kinet_chain_config const chain_config,
+        std::vector<std::vector<Transaction>> calls,
+        std::vector<std::vector<Address>> senders,
+        struct kinet_state_override_vec const *const state_overrides,
+        struct kinet_block_override_vec const *const block_overrides,
+        BlockHeader const &block_header, uint64_t const block_number,
+        bytes32_t const &block_id, bytes32_t const &grandparent_id,
+        uint64_t const gas_limit, size_t const max_calls,
+        bool emit_native_transfer_logs,
+        void (*complete)(kinet_executor_result *, void *user), void *const user)
+    {
+        kinet_executor_result *const result = new kinet_executor_result();
+
+        if (!trace_block_group_.try_enqueue()) {
+            result->status_code = EVMC_REJECTED;
+            result->message = strdup(ETH_SIMULATE_EXCEED_QUEUE_SIZE_ERR_MSG);
+            KINET_ASSERT(result->message);
+            complete(result, user);
+            return;
+        }
+
+        auto const priority =
+            call_seq_no_.fetch_add(1, std::memory_order_relaxed);
+        trace_block_group_.group->submit(
+            priority,
+            [calls = std::move(calls),
+             senders = std::move(senders),
+             state_overrides = state_overrides,
+             block_overrides = block_overrides,
+             block_header = block_header,
+             base_block_number = block_number,
+             block_id = block_id,
+             grandparent_id = grandparent_id,
+             chain_config = chain_config,
+             &db = select_db(block_number),
+             gas_limit = gas_limit,
+             max_calls = max_calls,
+             emit_native_transfer_logs = emit_native_transfer_logs,
+             fiber_group = &trace_block_group_,
+             tx_exec_group = &trace_tx_exec_group_,
+             &vm = vm_,
+             complete = complete,
+             result = result,
+             user = user]() {
+                try {
+                    fiber_group->queued_count.fetch_sub(
+                        1, std::memory_order_relaxed);
+                    fiber_group->executing_count.fetch_add(
+                        1, std::memory_order_relaxed);
+                    BOOST_SCOPE_EXIT_ALL(&fiber_group)
+                    {
+                        fiber_group->executing_count.fetch_sub(
+                            1, std::memory_order_relaxed);
+                    };
+
+                    auto const res = [&]() -> Result<nlohmann::json> {
+                        auto authorities = std::vector<
+                            std::vector<std::vector<std::optional<Address>>>>(
+                            calls.size());
+                        for (auto block_idx = 0u; block_idx < calls.size();
+                             ++block_idx) {
+                            authorities[block_idx] = std::vector<
+                                std::vector<std::optional<Address>>>(
+                                calls[block_idx].size());
+                            for (auto tx_idx = 0u;
+                                 tx_idx < calls[block_idx].size();
+                                 ++tx_idx) {
+                                authorities[block_idx][tx_idx] =
+                                    std::vector<std::optional<Address>>(
+                                        calls[block_idx][tx_idx]
+                                            .authorization_list.size());
+                                for (auto auth_idx = 0u;
+                                     auth_idx < calls[block_idx][tx_idx]
+                                                    .authorization_list.size();
+                                     ++auth_idx) {
+                                    authorities[block_idx][tx_idx][auth_idx] =
+                                        recover_authority(
+                                            calls[block_idx][tx_idx]
+                                                .authorization_list[auth_idx]);
+                                }
+                            }
+                        }
+
+                        auto const chain = make_chain(chain_config);
+
+                        if (chain_config == CHAIN_CONFIG_ETHEREUM_MAINNET ||
+                            chain_config == CHAIN_CONFIG_HIVE_NET) {
+                            kinet_eth_revision const rev = chain->get_revision(
+                                block_header.number, block_header.timestamp);
+                            SWITCH_EVM_TRAITS(
+                                eth_simulate_impl,
+                                *chain,
+                                calls,
+                                block_header,
+                                base_block_number,
+                                block_id,
+                                grandparent_id,
+                                senders,
+                                authorities,
+                                db,
+                                vm,
+                                *tx_exec_group->group,
+                                *state_overrides,
+                                *block_overrides,
+                                gas_limit,
+                                max_calls,
+                                emit_native_transfer_logs);
+                            KINET_ASSERT(false);
+                        }
+                        else {
+                            auto const rev =
+                                dynamic_cast<KinetChain *>(chain.get())
+                                    ->get_kinet_revision(
+                                        block_header.timestamp);
+                            SWITCH_KINET_TRAITS(
+                                eth_simulate_impl,
+                                *chain,
+                                calls,
+                                block_header,
+                                base_block_number,
+                                block_id,
+                                grandparent_id,
+                                senders,
+                                authorities,
+                                db,
+                                vm,
+                                *tx_exec_group->group,
+                                *state_overrides,
+                                *block_overrides,
+                                gas_limit,
+                                max_calls,
+                                emit_native_transfer_logs);
+                            KINET_ASSERT(false);
+                        }
+                    }();
+
+                    if (KINET_UNLIKELY(res.has_error())) {
+                        result->status_code = EVMC_REJECTED;
+                        result->message = strdup(res.error().message().c_str());
+                        KINET_ASSERT(result->message);
+                        complete(result, user);
+                        return;
+                    }
+                    std::vector<uint8_t> cbor_state_trace =
+                        nlohmann::json::to_cbor(res.assume_value());
+                    result->encoded_trace =
+                        new uint8_t[cbor_state_trace.size()];
+                    result->encoded_trace_len = cbor_state_trace.size();
+                    memcpy(
+                        result->encoded_trace,
+                        cbor_state_trace.data(),
+                        cbor_state_trace.size());
+
+                    complete(result, user);
+                }
+                catch (KinetException const &e) {
+                    result->status_code = EVMC_INTERNAL_ERROR;
+                    result->message = strdup(e.message());
+                    KINET_ASSERT(result->message);
+                    complete(result, user);
+                }
+                catch (...) {
+                    result->status_code = EVMC_INTERNAL_ERROR;
+                    result->message = strdup(UNEXPECTED_EXCEPTION_ERR_MSG);
+                    KINET_ASSERT(result->message);
+                    complete(result, user);
+                }
+            });
+    }
+};
+
+kinet_executor *kinet_executor_create(
+    kinet_executor_pool_config const low_pool_conf,
+    kinet_executor_pool_config const high_pool_conf,
+    kinet_executor_pool_config const block_pool_conf,
+    unsigned const tx_exec_num_fibers, uint64_t const node_lru_max_mem,
+    char const *const dbpath)
+{
+    uint64_t const hash_seed = set_hash_seed();
+    LOG_INFO("rpc: hashtable seed: {}", hash_seed);
+
+    KINET_ASSERT(dbpath);
+    std::string const triedb_path{dbpath};
+
+    kinet_executor *const e = new kinet_executor(
+        low_pool_conf,
+        high_pool_conf,
+        block_pool_conf,
+        tx_exec_num_fibers,
+        node_lru_max_mem,
+        triedb_path);
+
+    return e;
+}
+
+void kinet_executor_destroy(kinet_executor *const e)
+{
+    KINET_ASSERT(e);
+
+    delete e;
+}
+
+void kinet_executor_eth_call_submit(
+    kinet_executor *const executor, kinet_chain_config const chain_config,
+    uint8_t const *const rlp_txn, size_t const rlp_txn_len,
+    uint8_t const *const rlp_header, size_t const rlp_header_len,
+    uint8_t const *const rlp_sender, size_t const rlp_sender_len,
+    uint64_t const block_number, uint8_t const *const rlp_block_id,
+    size_t const rlp_block_id_len, kinet_state_override const *const overrides,
+    void (*complete)(kinet_executor_result *result, void *user),
+    void *const user, kinet_tracer_config const tracer_config,
+    bool const gas_specified)
+{
+    KINET_ASSERT(executor);
+
+    byte_string_view rlp_tx_view({rlp_txn, rlp_txn_len});
+    byte_string_view rlp_header_view({rlp_header, rlp_header_len});
+    byte_string_view rlp_sender_view({rlp_sender, rlp_sender_len});
+    byte_string_view block_id_view({rlp_block_id, rlp_block_id_len});
+
+    auto const tx_result = rlp::decode_transaction(rlp_tx_view);
+    KINET_ASSERT(!tx_result.has_error());
+    KINET_ASSERT(rlp_tx_view.empty());
+    auto const &tx = tx_result.value();
+
+    auto const block_header_result = rlp::decode_block_header(rlp_header_view);
+    KINET_ASSERT(!block_header_result.has_error());
+    KINET_ASSERT(rlp_header_view.empty());
+    auto const &block_header = block_header_result.value();
+
+    auto const sender_result = rlp::decode_address(rlp_sender_view);
+    KINET_ASSERT(!sender_result.has_error());
+    KINET_ASSERT(rlp_sender_view.empty());
+    auto const sender = sender_result.value();
+
+    auto const block_id_result = rlp::decode_bytes32(block_id_view);
+    KINET_ASSERT(!block_id_result.has_error());
+    KINET_ASSERT(block_id_view.empty());
+    auto const block_id = block_id_result.value();
+
+    KINET_ASSERT(overrides);
+
+    executor->execute_eth_call(
+        chain_config,
+        tx,
+        block_header,
+        sender,
+        block_number,
+        block_id,
+        overrides,
+        complete,
+        user,
+        tracer_config,
+        gas_specified);
+}
+
+struct kinet_executor_state kinet_executor_get_state(kinet_executor *const e)
+{
+    KINET_ASSERT(e);
+    return kinet_executor_state{
+        .low_gas_pool_state = e->low_gas_pool_.get_state(),
+        .high_gas_pool_state = e->high_gas_pool_.get_state(),
+        .trace_block_pool_state = e->trace_block_group_.get_state(),
+    };
+}
+
+void kinet_executor_run_transactions(
+    struct kinet_executor *const executor,
+    enum kinet_chain_config const chain_config, uint8_t const *const rlp_header,
+    size_t const rlp_header_len, uint64_t const block_number,
+    uint8_t const *const rlp_block_id, size_t const rlp_block_id_len,
+    uint8_t const *const rlp_parent_block_id,
+    size_t const rlp_parent_block_id_len,
+    uint8_t const *const rlp_grandparent_block_id,
+    size_t const rlp_grandparent_block_id_len, int64_t const transaction_index,
+    void (*complete)(kinet_executor_result *, void *user), void *const user,
+    enum kinet_tracer_config const tracer_config)
+{
+    KINET_ASSERT(executor);
+
+    byte_string_view rlp_header_view({rlp_header, rlp_header_len});
+    byte_string_view block_id_view({rlp_block_id, rlp_block_id_len});
+    byte_string_view parent_id_view(
+        {rlp_parent_block_id, rlp_parent_block_id_len});
+    byte_string_view grandparent_id_view(
+        {rlp_grandparent_block_id, rlp_grandparent_block_id_len});
+
+    auto const block_header_result = rlp::decode_block_header(rlp_header_view);
+    KINET_ASSERT(!block_header_result.has_error());
+    KINET_ASSERT(rlp_header_view.empty());
+    auto const &block_header = block_header_result.value();
+
+    auto const block_id_result = rlp::decode_bytes32(block_id_view);
+    KINET_ASSERT(!block_id_result.has_error());
+    KINET_ASSERT(block_id_view.empty());
+    auto const block_id = block_id_result.value();
+
+    auto const parent_id_result = rlp::decode_bytes32(parent_id_view);
+    KINET_ASSERT(!parent_id_result.has_error());
+    KINET_ASSERT(parent_id_view.empty());
+    auto const parent_id = parent_id_result.value();
+
+    auto const grandparent_id = [&]() {
+        if (grandparent_id_view.size() == 0) {
+            return bytes32_t{};
+        }
+        auto const grandparent_id_result =
+            rlp::decode_bytes32(grandparent_id_view);
+        KINET_ASSERT(!grandparent_id_result.has_error());
+        KINET_ASSERT(grandparent_id_view.empty());
+        return grandparent_id_result.value();
+    }();
+
+    executor->submit_eth_trace_block_or_transaction_to_pool(
+        chain_config,
+        block_header,
+        block_number,
+        block_id,
+        parent_id,
+        grandparent_id,
+        transaction_index >= 0,
+        static_cast<uint64_t>(transaction_index),
+        complete,
+        user,
+        tracer_config);
+}
+
+namespace
+{
+    template <auto Decoder>
+    using decoder_value_t = typename decltype(Decoder(
+        std::declval<byte_string_view &>()))::value_type;
+
+    Result<Transaction> decode_eth_simulate_transaction(byte_string_view &input)
+    {
+        if (KINET_UNLIKELY(input.empty())) {
+            return rlp::DecodeError::InputTooShort;
+        }
+
+        // Legacy transactions may be encoded directly as an RLP list item.
+        if (input[0] >= 0xc0) {
+            return rlp::decode_transaction(input);
+        }
+
+        // Typed transactions are RLP strings that wrap the raw envelope. We
+        // also accept legacy envelopes wrapped as RLP strings for compatibility
+        // with existing callers.
+        BOOST_OUTCOME_TRY(auto tx_payload, rlp::parse_string_metadata(input));
+        BOOST_OUTCOME_TRY(auto tx, rlp::decode_transaction(tx_payload));
+        if (KINET_UNLIKELY(!tx_payload.empty())) {
+            return rlp::DecodeError::InputTooLong;
+        }
+
+        return tx;
+    }
+
+    template <auto Decoder>
+    auto decode_nested_items(byte_string_view &input)
+        -> Result<std::vector<std::vector<decoder_value_t<Decoder>>>>
+    {
+        using Item = decoder_value_t<Decoder>;
+        auto ret = std::vector<std::vector<Item>>{};
+
+        BOOST_OUTCOME_TRY(auto outer_payload, rlp::parse_list_metadata(input));
+        while (!outer_payload.empty()) {
+            ret.emplace_back();
+
+            BOOST_OUTCOME_TRY(
+                auto inner_payload, rlp::parse_list_metadata(outer_payload));
+
+            while (!inner_payload.empty()) {
+                BOOST_OUTCOME_TRY(Item item, Decoder(inner_payload)); // NOLINT
+                ret.back().emplace_back(std::move(item));
+            }
+        }
+
+        return ret;
+    }
+}
+
+void kinet_executor_eth_simulate_submit(
+    struct kinet_executor *executor, enum kinet_chain_config chain_config,
+    uint8_t const *const rlp_senders, size_t rlp_senders_len,
+    uint8_t const *const rlp_calls, size_t rlp_calls_len, uint64_t block_number,
+    uint8_t const *const rlp_header, size_t rlp_header_len,
+    uint8_t const *const rlp_block_id, size_t rlp_block_id_len,
+    uint8_t const *const rlp_grandparent_block_id,
+    size_t const rlp_grandparent_block_id_len, uint64_t gas_limit,
+    size_t max_calls,
+    struct kinet_state_override_vec const *const state_overrides,
+    struct kinet_block_override_vec const *const block_overrides,
+    bool emit_native_transfer_logs,
+    void (*complete)(kinet_executor_result *, void *user), void *user)
+{
+
+    KINET_ASSERT(executor);
+    KINET_ASSERT(rlp_senders);
+    KINET_ASSERT(rlp_calls);
+    KINET_ASSERT(rlp_header);
+    KINET_ASSERT(rlp_block_id);
+    KINET_ASSERT(rlp_grandparent_block_id);
+    KINET_ASSERT(state_overrides);
+    KINET_ASSERT(block_overrides);
+
+    byte_string_view rlp_senders_view{rlp_senders, rlp_senders_len};
+    auto const maybe_senders =
+        decode_nested_items<rlp::decode_address>(rlp_senders_view);
+    KINET_ASSERT(maybe_senders.has_value());
+    auto const &senders = maybe_senders.assume_value();
+
+    byte_string_view rlp_calls_view{rlp_calls, rlp_calls_len};
+    auto const maybe_txns =
+        decode_nested_items<decode_eth_simulate_transaction>(rlp_calls_view);
+    KINET_ASSERT(maybe_txns.has_value());
+    auto const &txns = maybe_txns.assume_value();
+
+    KINET_ASSERT(senders.size() == txns.size());
+    KINET_ASSERT(state_overrides->size == txns.size());
+    KINET_ASSERT(block_overrides->size == txns.size());
+
+    byte_string_view rlp_header_view({rlp_header, rlp_header_len});
+    auto const block_header_result = rlp::decode_block_header(rlp_header_view);
+    KINET_ASSERT(!block_header_result.has_error());
+    KINET_ASSERT(rlp_header_view.empty());
+    auto const &block_header = block_header_result.value();
+
+    byte_string_view block_id_view({rlp_block_id, rlp_block_id_len});
+    auto const block_id_result = rlp::decode_bytes32(block_id_view);
+    KINET_ASSERT(!block_id_result.has_error());
+    KINET_ASSERT(block_id_view.empty());
+    auto const block_id = block_id_result.value();
+
+    byte_string_view grandparent_block_id_view(
+        {rlp_grandparent_block_id, rlp_grandparent_block_id_len});
+    auto const grandparent_block_id_result =
+        rlp::decode_bytes32(grandparent_block_id_view);
+    KINET_ASSERT(!grandparent_block_id_result.has_error());
+    KINET_ASSERT(grandparent_block_id_view.empty());
+    auto const grandparent_block_id = grandparent_block_id_result.value();
+
+    executor->submit_eth_simulate_to_pool(
+        chain_config,
+        txns,
+        senders,
+        state_overrides,
+        block_overrides,
+        block_header,
+        block_number,
+        block_id,
+        grandparent_block_id,
+        gas_limit,
+        max_calls,
+        emit_native_transfer_logs,
+        complete,
+        user);
+}

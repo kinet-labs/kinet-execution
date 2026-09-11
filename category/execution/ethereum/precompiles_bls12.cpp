@@ -1,0 +1,465 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/assert.h>
+#include <category/core/byte_string.hpp>
+#include <category/core/config.hpp>
+#include <category/core/likely.h>
+#include <category/execution/ethereum/precompiles.hpp>
+#include <category/execution/ethereum/precompiles_bls12.hpp>
+
+#include <blst.h>
+
+#include <evmc/evmc.h>
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <optional>
+#include <vector>
+
+KINET_NAMESPACE_BEGIN
+
+namespace bls12
+{
+    template <>
+    uint16_t msm_discount<G1>(uint64_t const k)
+    {
+        KINET_ASSERT(k > 0);
+
+        static constexpr auto table = std::array<uint16_t, 128>{
+            1000, 949, 848, 797, 764, 750, 738, 728, 719, 712, 705, 698, 692,
+            687,  682, 677, 673, 669, 665, 661, 658, 654, 651, 648, 645, 642,
+            640,  637, 635, 632, 630, 627, 625, 623, 621, 619, 617, 615, 613,
+            611,  609, 608, 606, 604, 603, 601, 599, 598, 596, 595, 593, 592,
+            591,  589, 588, 586, 585, 584, 582, 581, 580, 579, 577, 576, 575,
+            574,  573, 572, 570, 569, 568, 567, 566, 565, 564, 563, 562, 561,
+            560,  559, 558, 557, 556, 555, 554, 553, 552, 551, 550, 549, 548,
+            547,  547, 546, 545, 544, 543, 542, 541, 540, 540, 539, 538, 537,
+            536,  536, 535, 534, 533, 532, 532, 531, 530, 529, 528, 528, 527,
+            526,  525, 525, 524, 523, 522, 522, 521, 520, 520, 519};
+
+        return table[std::min(k, 128ul) - 1];
+    }
+
+    template <>
+    uint16_t msm_discount<G2>(uint64_t const k)
+    {
+        KINET_ASSERT(k > 0);
+
+        static constexpr auto table = std::array<uint16_t, 128>{
+            1000, 1000, 923, 884, 855, 832, 812, 796, 782, 770, 759, 749, 740,
+            732,  724,  717, 711, 704, 699, 693, 688, 683, 679, 674, 670, 666,
+            663,  659,  655, 652, 649, 646, 643, 640, 637, 634, 632, 629, 627,
+            624,  622,  620, 618, 615, 613, 611, 609, 607, 606, 604, 602, 600,
+            598,  597,  595, 593, 592, 590, 589, 587, 586, 584, 583, 582, 580,
+            579,  578,  576, 575, 574, 573, 571, 570, 569, 568, 567, 566, 565,
+            563,  562,  561, 560, 559, 558, 557, 556, 555, 554, 553, 552, 552,
+            551,  550,  549, 548, 547, 546, 545, 545, 544, 543, 542, 541, 541,
+            540,  539,  538, 537, 537, 536, 535, 535, 534, 533, 532, 532, 531,
+            530,  530,  529, 528, 528, 527, 526, 526, 525, 524, 524};
+
+        return table[std::min(k, 128ul) - 1];
+    }
+
+    blst_scalar read_scalar(uint8_t const *const in)
+    {
+        blst_scalar result;
+        blst_scalar_from_bendian(&result, in);
+        return result;
+    }
+
+    std::optional<blst_fp> read_fp(uint8_t const *const in)
+    {
+        static_assert(sizeof(blst_fp) == 48);
+        static constexpr size_t fp_encoded_offset = 16;
+
+        // The field prime p is 384 bits, encoded in a 64-byte buffer with 16
+        // bytes of leading zero padding (fp_encoded_offset). memcmp over all
+        // 64 bytes performs a big-endian >= comparison: the padding zeros in
+        // both the input and BASE_FIELD_MODULUS_BYTES ensure the upper 16
+        // bytes never cause a false positive, so this rejects any input >= p.
+        if (KINET_UNLIKELY(
+                std::memcmp(in, BASE_FIELD_MODULUS_BYTES.data(), 64) >= 0)) {
+            return std::nullopt;
+        }
+
+        blst_fp element;
+        blst_fp_from_bendian(&element, in + fp_encoded_offset);
+
+        return element;
+    }
+
+    std::optional<blst_fp2> read_fp2(uint8_t const *const in)
+    {
+        auto const maybe_x = read_fp(in);
+        if (KINET_UNLIKELY(!maybe_x.has_value())) {
+            return std::nullopt;
+        }
+
+        auto const maybe_y = read_fp(in + G1::element_encoded_size);
+        if (KINET_UNLIKELY(!maybe_y.has_value())) {
+            return std::nullopt;
+        }
+
+        return blst_fp2{*maybe_x, *maybe_y};
+    }
+
+    std::optional<blst_p1_affine> read_g1(uint8_t const *const in)
+    {
+        auto const maybe_x = read_fp(in);
+        if (KINET_UNLIKELY(!maybe_x.has_value())) {
+            return std::nullopt;
+        }
+
+        auto const maybe_y = read_fp(in + G1::element_encoded_size);
+        if (KINET_UNLIKELY(!maybe_y.has_value())) {
+            return std::nullopt;
+        }
+
+        auto const point = blst_p1_affine{*maybe_x, *maybe_y};
+
+        auto const on_curve_or_inf = blst_p1_affine_on_curve(&point);
+        if (KINET_UNLIKELY(!on_curve_or_inf)) {
+            return std::nullopt;
+        }
+
+        return point;
+    }
+
+    std::optional<blst_p2_affine> read_g2(uint8_t const *const in)
+    {
+        auto const maybe_x = read_fp2(in);
+        if (KINET_UNLIKELY(!maybe_x.has_value())) {
+            return std::nullopt;
+        }
+
+        auto const maybe_y = read_fp2(in + G2::element_encoded_size);
+        if (KINET_UNLIKELY(!maybe_y.has_value())) {
+            return std::nullopt;
+        }
+
+        auto const point = blst_p2_affine{*maybe_x, *maybe_y};
+
+        auto const on_curve_or_inf = blst_p2_affine_on_curve(&point);
+        if (KINET_UNLIKELY(!on_curve_or_inf)) {
+            return std::nullopt;
+        }
+
+        return point;
+    }
+
+    void write_fp(blst_fp const &point, uint8_t *const buf)
+    {
+        static_assert(sizeof(blst_fp) == 48);
+        static constexpr size_t fp_encoded_offset = 16;
+
+        std::memset(buf, 0, fp_encoded_offset);
+        blst_bendian_from_fp(buf + fp_encoded_offset, &point);
+    }
+
+    void write_fp2(blst_fp2 const &point, uint8_t *const buf)
+    {
+        write_fp(point.fp[0], buf);
+        write_fp(point.fp[1], buf + G1::element_encoded_size);
+    }
+
+    void write_g1(blst_p1_affine const &point, uint8_t *const buf)
+    {
+        write_fp(point.x, buf);
+        write_fp(point.y, buf + G1::element_encoded_size);
+    }
+
+    void write_g2(blst_p2_affine const &point, uint8_t *const buf)
+    {
+        write_fp2(point.x, buf);
+        write_fp2(point.y, buf + G2::element_encoded_size);
+    }
+
+    template <typename Group>
+    PrecompileImplResult
+    add(byte_string_view const input,
+        std::span<uint8_t, Group::encoded_size> const out)
+    {
+        if (KINET_UNLIKELY(input.size() != 2 * Group::encoded_size)) {
+            return {nullptr, 0};
+        }
+
+        auto const a = Group::read(input.data());
+        if (KINET_UNLIKELY(!a.has_value())) {
+            return {nullptr, 0};
+        }
+
+        auto const b = Group::read(input.data() + Group::encoded_size);
+        if (KINET_UNLIKELY(!b.has_value())) {
+            return {nullptr, 0};
+        }
+
+        typename Group::Point a_non_affine;
+        Group::from_affine(&a_non_affine, &*a);
+
+        typename Group::Point result_non_affine;
+        Group::add(&result_non_affine, &a_non_affine, &*b);
+
+        typename Group::AffinePoint result;
+        Group::to_affine(&result, &result_non_affine);
+
+        Group::write(result, out.data());
+
+        return {out.data(), Group::encoded_size};
+    }
+
+    template PrecompileImplResult
+        add<G1>(byte_string_view, std::span<uint8_t, G1::encoded_size>);
+    template PrecompileImplResult
+        add<G2>(byte_string_view, std::span<uint8_t, G2::encoded_size>);
+
+    template <typename Group>
+    PrecompileImplResult
+    msm(byte_string_view const input,
+        std::span<uint8_t, Group::encoded_size> const out)
+    {
+        static constexpr auto pair_size = Group::encoded_size + 32;
+
+        if (KINET_UNLIKELY(input.size() % pair_size != 0)) {
+            return {nullptr, 0};
+        }
+
+        auto const k = input.size() / pair_size;
+
+        if (KINET_UNLIKELY(k == 0)) {
+            return {nullptr, 0};
+        }
+        else if (k == 1) {
+            return mul<Group>(input, out);
+        }
+        else {
+            return msm_pippenger<Group>(input, k, out);
+        }
+    }
+
+    template PrecompileImplResult
+        msm<G1>(byte_string_view, std::span<uint8_t, G1::encoded_size>);
+    template PrecompileImplResult
+        msm<G2>(byte_string_view, std::span<uint8_t, G2::encoded_size>);
+
+    template <typename Group>
+    PrecompileImplResult
+    mul(byte_string_view const input,
+        std::span<uint8_t, Group::encoded_size> const out)
+    {
+        auto const affine_point = Group::read(input.data());
+        if (KINET_UNLIKELY(!affine_point.has_value())) {
+            return {nullptr, 0};
+        }
+
+        auto const scalar = read_scalar(input.data() + Group::encoded_size);
+
+        typename Group::Point point;
+        Group::from_affine(&point, &*affine_point);
+
+        if (KINET_UNLIKELY(!Group::point_in_group(&point))) {
+            return {nullptr, 0};
+        }
+
+        typename Group::Point result;
+        Group::mul(&result, &point, scalar.b, 256u);
+
+        typename Group::AffinePoint affine_result;
+        Group::to_affine(&affine_result, &result);
+
+        Group::write(affine_result, out.data());
+
+        return {out.data(), Group::encoded_size};
+    }
+
+    template PrecompileImplResult
+        mul<G1>(byte_string_view, std::span<uint8_t, G1::encoded_size>);
+    template PrecompileImplResult
+        mul<G2>(byte_string_view, std::span<uint8_t, G2::encoded_size>);
+
+    template <typename Group>
+    PrecompileImplResult msm_pippenger(
+        byte_string_view const input, uint64_t const k,
+        std::span<uint8_t, Group::encoded_size> const out)
+    {
+        auto affine_points = std::vector<typename Group::AffinePoint>{};
+        affine_points.reserve(k);
+
+        auto affine_point_ptrs =
+            std::vector<typename Group::AffinePoint const *>{};
+        affine_point_ptrs.reserve(k);
+
+        auto scalars = std::vector<blst_scalar>{};
+        scalars.reserve(k);
+
+        auto scalar_ptrs = std::vector<uint8_t const *>{};
+        scalar_ptrs.reserve(k);
+
+        static constexpr auto pair_size = Group::encoded_size + 32;
+        auto const *const end_ptr = input.data() + (k * pair_size);
+
+        for (auto const *ptr = input.data(); ptr != end_ptr; ptr += pair_size) {
+            auto const affine_point = Group::read(ptr);
+            if (KINET_UNLIKELY(!affine_point.has_value())) {
+                return {nullptr, 0};
+            }
+
+            if (KINET_UNLIKELY(!Group::affine_point_in_group(&*affine_point))) {
+                return {nullptr, 0};
+            }
+
+            if (Group::affine_point_is_inf(&*affine_point)) {
+                continue;
+            }
+
+            auto const &p = affine_points.emplace_back(*affine_point);
+            affine_point_ptrs.emplace_back(&p);
+
+            auto const scalar = read_scalar(ptr + Group::encoded_size);
+
+            auto const &s = scalars.emplace_back(scalar);
+            scalar_ptrs.emplace_back(s.b);
+        }
+
+        if (affine_point_ptrs.empty()) {
+            std::memset(out.data(), 0, Group::encoded_size);
+        }
+        else {
+            auto const n_points = affine_point_ptrs.size();
+
+            auto const scratch_size = Group::msm_scratch_size(n_points);
+            auto const scratch =
+                std::make_unique_for_overwrite<uint8_t[]>(scratch_size);
+
+            typename Group::Point result;
+            Group::msm(
+                &result,
+                affine_point_ptrs.data(),
+                n_points,
+                scalar_ptrs.data(),
+                256u,
+                reinterpret_cast<limb_t *>(scratch.get()));
+
+            typename Group::AffinePoint affine_result;
+            Group::to_affine(&affine_result, &result);
+
+            Group::write(affine_result, out.data());
+        }
+
+        return {out.data(), Group::encoded_size};
+    }
+
+    template PrecompileImplResult msm_pippenger<G1>(
+        byte_string_view, uint64_t, std::span<uint8_t, G1::encoded_size>);
+    template PrecompileImplResult msm_pippenger<G2>(
+        byte_string_view, uint64_t, std::span<uint8_t, G2::encoded_size>);
+
+    PrecompileImplResult pairing_check(
+        byte_string_view const input, std::span<uint8_t, 32> const out)
+    {
+        static constexpr auto pair_size = G1::encoded_size + G2::encoded_size;
+
+        if (KINET_UNLIKELY(input.size() % pair_size != 0)) {
+            return {nullptr, 0};
+        }
+
+        auto const k = input.size() / pair_size;
+
+        if (KINET_UNLIKELY(k == 0)) {
+            return {nullptr, 0};
+        }
+
+        auto result = *blst_fp12_one();
+        auto const *const end_ptr = input.data() + input.size();
+
+        for (auto const *ptr = input.data(); ptr != end_ptr; ptr += pair_size) {
+            auto const maybe_g1 = G1::read(ptr);
+            if (KINET_UNLIKELY(!maybe_g1.has_value())) {
+                return {nullptr, 0};
+            }
+
+            auto const maybe_g2 = G2::read(ptr + G1::encoded_size);
+            if (KINET_UNLIKELY(!maybe_g2.has_value())) {
+                return {nullptr, 0};
+            }
+
+            if (KINET_UNLIKELY(!G1::affine_point_in_group(&*maybe_g1))) {
+                return {nullptr, 0};
+            }
+
+            if (KINET_UNLIKELY(!G2::affine_point_in_group(&*maybe_g2))) {
+                return {nullptr, 0};
+            }
+
+            if (G1::affine_point_is_inf(&*maybe_g1)) {
+                continue;
+            }
+
+            if (G2::affine_point_is_inf(&*maybe_g2)) {
+                continue;
+            }
+
+            blst_fp12 paired;
+            blst_miller_loop(&paired, &*maybe_g2, &*maybe_g1);
+            blst_fp12_mul(&result, &result, &paired);
+        }
+
+        blst_final_exp(&result, &result);
+
+        std::memset(out.data(), 0, 32);
+
+        if (blst_fp12_is_one(&result)) {
+            out.data()[31] = 1;
+        }
+
+        return {out.data(), 32};
+    }
+
+    template <typename Group>
+    PrecompileImplResult map_fp_to_g(
+        byte_string_view const input,
+        std::span<uint8_t, Group::encoded_size> const out)
+    {
+        if (KINET_UNLIKELY(input.size() != Group::element_encoded_size)) {
+            return {nullptr, 0};
+        }
+
+        auto const maybe_fp = Group::read_element(input.data());
+        if (KINET_UNLIKELY(!maybe_fp.has_value())) {
+            return {nullptr, 0};
+        }
+
+        typename Group::Point point;
+        Group::map_to_group(&point, &*maybe_fp, nullptr);
+
+        typename Group::AffinePoint result;
+        Group::to_affine(&result, &point);
+
+        Group::write(result, out.data());
+
+        return {out.data(), Group::encoded_size};
+    }
+
+    template PrecompileImplResult
+        map_fp_to_g<G1>(byte_string_view, std::span<uint8_t, G1::encoded_size>);
+    template PrecompileImplResult
+        map_fp_to_g<G2>(byte_string_view, std::span<uint8_t, G2::encoded_size>);
+} // namespace bls12
+
+KINET_NAMESPACE_END

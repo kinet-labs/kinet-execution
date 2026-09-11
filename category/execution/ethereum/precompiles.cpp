@@ -1,0 +1,441 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/address.hpp>
+#include <category/core/assert.h>
+#include <category/core/byte_string.hpp>
+#include <category/core/config.hpp>
+#include <category/core/int.hpp>
+#include <category/core/likely.h>
+#include <category/execution/ethereum/core/ecrecover/impl.hpp>
+#include <category/execution/ethereum/core/signature.hpp>
+#include <category/execution/ethereum/precompiles.hpp>
+#include <category/execution/ethereum/precompiles_impl.hpp>
+#include <category/vm/evm/explicit_traits.hpp>
+#include <category/vm/evm/status_code.h>
+
+#include <evmc/evmc.h>
+#include <evmc/evmc.hpp>
+#include <evmc/helpers.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <optional>
+#include <utility>
+
+KINET_NAMESPACE_BEGIN
+
+struct PrecompiledContract
+{
+    precompiled_gas_cost_fn *gas_cost_func;
+    precompiled_execute_fn *execute_func;
+};
+
+// TODO(Bruce): when we enable feature flags in traits rather than raw use of
+// the EVM version, refactor this code and the general precompile setup to use
+// it.
+template <kinet_eth_revision First, kinet_eth_revision Rev>
+static consteval std::optional<PrecompiledContract>
+since(PrecompiledContract impl)
+{
+    if constexpr (Rev >= First) {
+        return impl;
+    }
+
+    return std::nullopt;
+}
+
+// Convert return value to std::optional if needed
+template <auto f>
+static std::optional<uint64_t> fmap_optional(byte_string_view const a)
+{
+    return f(a);
+}
+
+template <Traits traits>
+std::optional<PrecompiledContract> resolve_precompile(Address const &address)
+{
+    static_assert(traits::evm_rev() >= KINET_ETH_ISTANBUL);
+
+#define CASE(addr, gas_cost, execute)                                          \
+    do {                                                                       \
+        if (KINET_UNLIKELY(Address{(addr)} == address)) {                      \
+            return PrecompiledContract{fmap_optional<(gas_cost)>, (execute)};  \
+        }                                                                      \
+    }                                                                          \
+    while (false)
+
+    // Ethereum precompiles
+    CASE(0x01, ecrecover_gas_cost<traits>, ecrecover_execute);
+    CASE(0x02, sha256_gas_cost, sha256_execute);
+    CASE(0x03, ripemd160_gas_cost, ripemd160_execute);
+    CASE(0x04, identity_gas_cost, identity_execute);
+
+    CASE(0x05, expmod_gas_cost<traits>, expmod_execute);
+    CASE(0x06, ecadd_gas_cost<traits>, ecadd_execute);
+    CASE(0x07, ecmul_gas_cost<traits>, ecmul_execute);
+    CASE(0x08, snarkv_gas_cost<traits>, snarkv_execute);
+
+    CASE(0x09, blake2bf_gas_cost<traits>, blake2bf_execute);
+
+    if constexpr (traits::evm_rev() >= KINET_ETH_CANCUN) {
+        CASE(0x0A, point_evaluation_gas_cost<traits>, point_evaluation_execute);
+    }
+
+    if constexpr (traits::evm_rev() >= KINET_ETH_PRAGUE) {
+        CASE(0x0B, bls12_g1_add_gas_cost, bls12_g1_add_execute);
+        CASE(0x0C, bls12_g1_msm_gas_cost, bls12_g1_msm_execute);
+        CASE(0x0D, bls12_g2_add_gas_cost, bls12_g2_add_execute);
+        CASE(0x0E, bls12_g2_msm_gas_cost, bls12_g2_msm_execute);
+        CASE(0x0F, bls12_pairing_check_gas_cost, bls12_pairing_check_execute);
+        CASE(0x10, bls12_map_fp_to_g1_gas_cost, bls12_map_fp_to_g1_execute);
+        CASE(0x11, bls12_map_fp2_to_g2_gas_cost, bls12_map_fp2_to_g2_execute);
+    }
+
+    // Rollup precompiles
+    if constexpr (traits::eip_7951_active()) {
+        CASE(0x0100, p256_verify_gas_cost, p256_verify_execute);
+    }
+
+#undef CASE
+
+    return std::nullopt;
+}
+
+EXPLICIT_TRAITS(resolve_precompile);
+
+template <Traits traits>
+bool is_eth_precompile(Address const &address)
+{
+    return resolve_precompile<traits>(address).has_value();
+}
+
+EXPLICIT_TRAITS(is_eth_precompile);
+
+template <Traits traits>
+bool is_precompile(Address const &address)
+{
+    return is_eth_precompile<traits>(address);
+}
+
+EXPLICIT_EVM_TRAITS(is_precompile);
+
+template <Traits traits>
+std::optional<evmc::Result> check_call_eth_precompile(evmc_message const &msg)
+{
+    auto const &address = msg.code_address;
+    auto const maybe_precompile = resolve_precompile<traits>(address);
+
+    if (!maybe_precompile) {
+        return std::nullopt;
+    }
+
+    if constexpr (traits::evm_rev() >= KINET_ETH_PRAGUE) {
+        // EIP-7702 specifies that precompiles don't actually get called when
+        // they're the target of a delegation.
+        auto const delegated = (msg.flags & EVMC_DELEGATED) != 0;
+        if (delegated) {
+            return evmc::Result{evmc_status_code::EVMC_SUCCESS, msg.gas};
+        }
+    }
+
+    auto const [gas_cost_func, execute_func] = *maybe_precompile;
+
+    byte_string_view const input{msg.input_data, msg.input_size};
+    std::optional<uint64_t> const cost = gas_cost_func(input);
+
+    // If cost is std::nullopt, the gas function got an invalid input.
+    if (!cost.has_value()) {
+        return evmc::Result{evmc_status_code::EVMC_PRECOMPILE_FAILURE};
+    }
+
+    if (KINET_UNLIKELY(std::cmp_less(msg.gas, cost.value()))) {
+        return evmc::Result{evmc_status_code::EVMC_OUT_OF_GAS};
+    }
+
+    auto const [status_code, output_buffer, output_size] = execute_func(input);
+    return evmc::Result{evmc_result{
+        .status_code = to_evmc_status_code(status_code),
+        .gas_left = (status_code == KINET_STATUS_SUCCESS)
+                        ? msg.gas - static_cast<int64_t>(cost.value())
+                        : 0,
+        .gas_refund = 0,
+        .output_data = output_buffer,
+        .output_size = output_size,
+        .release = evmc_free_result_memory,
+        .create_address = {},
+        .padding = {},
+    }};
+}
+
+EXPLICIT_TRAITS(check_call_eth_precompile);
+
+template <Traits traits>
+std::optional<evmc::Result>
+check_call_precompile(State &, CallTracerBase &, evmc_message const &msg)
+{
+    return check_call_eth_precompile<traits>(msg);
+}
+
+EXPLICIT_EVM_TRAITS(check_call_precompile);
+
+static PrecompileResult
+from_impl_result(PrecompileImplResult result, uint8_t *out)
+{
+    auto const [data, size] = result;
+    if (data == nullptr) {
+        KINET_DEBUG_ASSERT(size == 0);
+        std::free(out);
+        return PrecompileResult::failure();
+    }
+    if (size == 0) {
+        std::free(out);
+        return {KINET_STATUS_SUCCESS, nullptr, size};
+    }
+    return {KINET_STATUS_SUCCESS, data, size};
+}
+
+PrecompileResult ecrecover_execute(byte_string_view const input)
+{
+    std::basic_string<uint8_t> d(128, '\0');
+    if (!input.empty()) {
+        std::memcpy(d.data(), input.data(), std::min(input.size(), 128uz));
+    }
+
+    auto const v{load_be_unsafe<uint256_t>(&d[32])};
+    auto const r{load_be_unsafe<uint256_t>(&d[64])};
+    auto const s{load_be_unsafe<uint256_t>(&d[96])};
+
+    if (!Secp256k1Signature{r, s}.has_valid_range()) {
+        return {KINET_STATUS_SUCCESS, nullptr, 0};
+    }
+
+    if (v != 27 && v != 28) {
+        return {KINET_STATUS_SUCCESS, nullptr, 0};
+    }
+
+    uint8_t *out{static_cast<uint8_t *>(std::aligned_alloc(8, 32))};
+    KINET_ASSERT(out != nullptr);
+
+    std::memset(out, 0, 12);
+    if (!recover_address(
+            std::span<uint8_t, 20>{&out[12], 20},
+            std::span<uint8_t const, 32>{&d[0], 32},
+            std::span<uint8_t const, 64>{&d[64], 64},
+            v != 27)) {
+        std::free(out);
+        return {KINET_STATUS_SUCCESS, nullptr, 0};
+    }
+    else {
+        return {KINET_STATUS_SUCCESS, out, 32};
+    }
+}
+
+PrecompileResult sha256_execute(byte_string_view const input)
+{
+    auto *const out = static_cast<uint8_t *>(std::aligned_alloc(8, 32));
+    KINET_ASSERT(out != nullptr);
+    return from_impl_result(
+        sha256_impl(input, std::span<uint8_t, 32>{out, 32}), out);
+}
+
+PrecompileResult ripemd160_execute(byte_string_view const input)
+{
+    auto *const out = static_cast<uint8_t *>(std::aligned_alloc(8, 32));
+    KINET_ASSERT(out != nullptr);
+    return from_impl_result(
+        ripemd160_impl(input, std::span<uint8_t, 32>{out, 32}), out);
+}
+
+[[gnu::always_inline]] inline uint64_t saturating_add64(uint64_t a, uint64_t b)
+{
+    uint64_t c = a + b;
+    if (c < a) {
+        c = std::numeric_limits<uint64_t>::max();
+    }
+    return c;
+}
+
+PrecompileResult expmod_execute(byte_string_view const input)
+{
+    std::basic_string<uint8_t> header(96, '\0');
+    if (input.size() != 0) {
+        std::memcpy(header.data(), input.data(), std::min(input.size(), 96ul));
+    }
+
+    uint64_t const mod_len = load_be_unsafe<uint64_t>(&header[88]);
+
+    if (mod_len == 0) {
+        return {KINET_STATUS_SUCCESS, nullptr, 0};
+    }
+
+    uint64_t const base_len = load_be_unsafe<uint64_t>(&header[24]);
+    uint64_t const exp_len = load_be_unsafe<uint64_t>(&header[56]);
+
+    uint64_t const padded_size_64 =
+        saturating_add64(base_len, saturating_add64(exp_len, mod_len));
+    size_t const padded_size =
+        padded_size_64 > std::numeric_limits<size_t>::max()
+            ? std::numeric_limits<size_t>::max()
+            : static_cast<size_t>(padded_size_64);
+    std::basic_string<uint8_t> padded_input(padded_size, '\0');
+    size_t terms_size = input.size() < 96 ? 0 : input.size() - 96;
+    if (terms_size != 0) {
+        std::memcpy(
+            padded_input.data(),
+            &input[96],
+            std::min(terms_size, padded_input.size()));
+    }
+
+    auto *const out = static_cast<uint8_t *>(std::calloc(mod_len, 1));
+    KINET_ASSERT(out != nullptr);
+    return from_impl_result(
+        expmod_impl(
+            std::span<uint8_t>{padded_input.data(), base_len},
+            std::span<uint8_t>{&padded_input[base_len], exp_len},
+            std::span<uint8_t>{&padded_input[base_len + exp_len], mod_len},
+            std::span<uint8_t>{out, mod_len}),
+        out);
+}
+
+PrecompileResult ecadd_execute(byte_string_view const input)
+{
+    auto *const out = static_cast<uint8_t *>(std::aligned_alloc(8, 64));
+    KINET_ASSERT(out != nullptr);
+    auto const clamped_input = input.substr(0, 128);
+    return from_impl_result(
+        ecadd_impl(clamped_input, std::span<uint8_t, 64>{out, 64}), out);
+}
+
+PrecompileResult ecmul_execute(byte_string_view const input)
+{
+    auto *const out = static_cast<uint8_t *>(std::aligned_alloc(8, 64));
+    KINET_ASSERT(out != nullptr);
+    auto const clamped_input = input.substr(0, 96);
+    return from_impl_result(
+        ecmul_impl(clamped_input, std::span<uint8_t, 64>{out, 64}), out);
+}
+
+PrecompileResult snarkv_execute(byte_string_view const input)
+{
+    if (input.size() % 192 != 0) {
+        return PrecompileResult::failure();
+    }
+
+    auto *const out = static_cast<uint8_t *>(std::malloc(32));
+    KINET_ASSERT(out != nullptr);
+    return from_impl_result(
+        snarkv_impl(input, std::span<uint8_t, 32>{out, 32}), out);
+}
+
+PrecompileResult blake2bf_execute(byte_string_view const input)
+{
+    auto *const out = static_cast<uint8_t *>(std::aligned_alloc(8, 64));
+    KINET_ASSERT(out != nullptr);
+    return from_impl_result(
+        blake2bf_impl(input, std::span<uint8_t, 64>{out, 64}), out);
+}
+
+PrecompileResult point_evaluation_execute(byte_string_view const input)
+{
+    auto *const out = static_cast<uint8_t *>(std::malloc(64));
+    KINET_ASSERT(out != nullptr);
+    return from_impl_result(
+        point_evaluation_impl(input, std::span<uint8_t, 64>{out, 64}), out);
+}
+
+PrecompileResult bls12_g1_add_execute(byte_string_view const input)
+{
+    auto *const out = static_cast<uint8_t *>(std::malloc(128));
+    KINET_ASSERT(out != nullptr);
+    return from_impl_result(
+        bls12_g1_add_impl(input, std::span<uint8_t, 128>{out, 128}), out);
+}
+
+PrecompileResult bls12_g1_msm_execute(byte_string_view const input)
+{
+    auto *const out = static_cast<uint8_t *>(std::malloc(128));
+    KINET_ASSERT(out != nullptr);
+    return from_impl_result(
+        bls12_g1_msm_impl(input, std::span<uint8_t, 128>{out, 128}), out);
+}
+
+PrecompileResult bls12_g2_add_execute(byte_string_view const input)
+{
+    auto *const out = static_cast<uint8_t *>(std::malloc(256));
+    KINET_ASSERT(out != nullptr);
+    return from_impl_result(
+        bls12_g2_add_impl(input, std::span<uint8_t, 256>{out, 256}), out);
+}
+
+PrecompileResult bls12_g2_msm_execute(byte_string_view const input)
+{
+    auto *const out = static_cast<uint8_t *>(std::malloc(256));
+    KINET_ASSERT(out != nullptr);
+    return from_impl_result(
+        bls12_g2_msm_impl(input, std::span<uint8_t, 256>{out, 256}), out);
+}
+
+PrecompileResult bls12_pairing_check_execute(byte_string_view const input)
+{
+    auto *const out = static_cast<uint8_t *>(std::malloc(32));
+    KINET_ASSERT(out != nullptr);
+    return from_impl_result(
+        bls12_pairing_check_impl(input, std::span<uint8_t, 32>{out, 32}), out);
+}
+
+PrecompileResult bls12_map_fp_to_g1_execute(byte_string_view const input)
+{
+    auto *const out = static_cast<uint8_t *>(std::malloc(128));
+    KINET_ASSERT(out != nullptr);
+    return from_impl_result(
+        bls12_map_fp_to_g1_impl(input, std::span<uint8_t, 128>{out, 128}), out);
+}
+
+PrecompileResult bls12_map_fp2_to_g2_execute(byte_string_view const input)
+{
+    auto *const out = static_cast<uint8_t *>(std::malloc(256));
+    KINET_ASSERT(out != nullptr);
+    return from_impl_result(
+        bls12_map_fp2_to_g2_impl(input, std::span<uint8_t, 256>{out, 256}),
+        out);
+}
+
+PrecompileResult p256_verify_execute(byte_string_view const input)
+{
+    auto *const out = static_cast<uint8_t *>(std::malloc(32));
+    KINET_ASSERT(out != nullptr);
+    auto const result =
+        p256_verify_impl(input, std::span<uint8_t, 32>{out, 32});
+    if (result.data == nullptr) {
+        std::free(out);
+        return {KINET_STATUS_SUCCESS, nullptr, 0};
+    }
+    return {KINET_STATUS_SUCCESS, result.data, result.size};
+}
+
+PrecompileResult identity_execute(byte_string_view const input)
+{
+    if (input.empty()) {
+        return {KINET_STATUS_SUCCESS, nullptr, 0};
+    }
+    auto *const out = static_cast<uint8_t *>(std::malloc(input.size()));
+    KINET_ASSERT(out != nullptr);
+    auto const result =
+        identity_impl(input, std::span<uint8_t>{out, input.size()});
+    return {KINET_STATUS_SUCCESS, result.data, result.size};
+}
+
+KINET_NAMESPACE_END

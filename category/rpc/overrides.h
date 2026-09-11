@@ -1,0 +1,147 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+struct kinet_state_override;
+
+struct kinet_state_override *kinet_state_override_create();
+
+void kinet_state_override_destroy(struct kinet_state_override *);
+
+void add_override_address(
+    struct kinet_state_override *, uint8_t const *addr, size_t addr_len);
+
+void set_override_balance(
+    struct kinet_state_override *, uint8_t const *addr, size_t addr_len,
+    uint8_t const *balance, size_t balance_len);
+
+void set_override_nonce(
+    struct kinet_state_override *, uint8_t const *addr, size_t addr_len,
+    uint64_t nonce);
+
+void set_override_code(
+    struct kinet_state_override *, uint8_t const *addr, size_t addr_len,
+    uint8_t const *code, size_t code_len);
+
+void set_override_state_diff(
+    struct kinet_state_override *, uint8_t const *addr, size_t addr_len,
+    uint8_t const *key, size_t key_len, uint8_t const *value, size_t value_len);
+
+void set_override_state(
+    struct kinet_state_override *, uint8_t const *addr, size_t addr_len,
+    uint8_t const *key, size_t key_len, uint8_t const *value, size_t value_len);
+
+struct kinet_state_override_vec;
+
+struct kinet_state_override_vec *kinet_state_override_vec_create(size_t size);
+
+void kinet_state_override_vec_destroy(struct kinet_state_override_vec *);
+
+void add_override_address_at(
+    struct kinet_state_override_vec *, size_t index, uint8_t const *addr,
+    size_t addr_len);
+
+void set_override_balance_at(
+    struct kinet_state_override_vec *, size_t index, uint8_t const *addr,
+    size_t addr_len, uint8_t const *balance, size_t balance_len);
+
+void set_override_nonce_at(
+    struct kinet_state_override_vec *, size_t index, uint8_t const *addr,
+    size_t addr_len, uint64_t nonce);
+
+void set_override_code_at(
+    struct kinet_state_override_vec *, size_t index, uint8_t const *addr,
+    size_t addr_len, uint8_t const *code, size_t code_len);
+
+void set_override_state_diff_at(
+    struct kinet_state_override_vec *, size_t index, uint8_t const *addr,
+    size_t addr_len, uint8_t const *key, size_t key_len, uint8_t const *value,
+    size_t value_len);
+
+void set_override_state_at(
+    struct kinet_state_override_vec *, size_t index, uint8_t const *addr,
+    size_t addr_len, uint8_t const *key, size_t key_len, uint8_t const *value,
+    size_t value_len);
+
+struct kinet_block_override;
+
+struct kinet_block_override *kinet_block_override_create();
+
+void kinet_block_override_destroy(struct kinet_block_override *);
+
+void set_block_override_number(struct kinet_block_override *, uint64_t number);
+
+void set_block_override_time(struct kinet_block_override *, uint64_t time);
+
+void set_block_override_gas_limit(
+    struct kinet_block_override *, uint64_t gas_limit);
+
+void set_block_override_fee_recipient(
+    struct kinet_block_override *, uint8_t const *addr, size_t addr_len);
+
+void set_block_override_prev_randao(
+    struct kinet_block_override *, uint8_t const *randao, size_t randao_len);
+
+void set_block_override_base_fee_per_gas(
+    struct kinet_block_override *, uint8_t const *fee, size_t fee_len);
+
+void add_block_override_withdrawal(
+    struct kinet_block_override *, uint64_t index, uint64_t validator_index,
+    uint64_t amount, uint8_t const *recipient_addr, size_t recipient_addr_len);
+
+struct kinet_block_override_vec;
+
+struct kinet_block_override_vec *kinet_block_override_vec_create(size_t size);
+
+void kinet_block_override_vec_destroy(struct kinet_block_override_vec *);
+
+void set_block_override_number_at(
+    struct kinet_block_override_vec *, size_t index, uint64_t number);
+
+void set_block_override_time_at(
+    struct kinet_block_override_vec *, size_t index, uint64_t time);
+
+void set_block_override_gas_limit_at(
+    struct kinet_block_override_vec *, size_t index, uint64_t gas_limit);
+
+void set_block_override_fee_recipient_at(
+    struct kinet_block_override_vec *, size_t index, uint8_t const *addr,
+    size_t addr_len);
+
+void set_block_override_prev_randao_at(
+    struct kinet_block_override_vec *, size_t index, uint8_t const *randao,
+    size_t randao_len);
+
+void set_block_override_base_fee_per_gas_at(
+    struct kinet_block_override_vec *, size_t index, uint8_t const *fee,
+    size_t fee_len);
+
+void add_block_override_withdrawal_at(
+    struct kinet_block_override_vec *, size_t index, uint64_t withdrawal_index,
+    uint64_t validator_index, uint64_t amount, uint8_t const *recipient_addr,
+    size_t recipient_addr_len);
+
+#ifdef __cplusplus
+}
+#endif

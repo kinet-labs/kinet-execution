@@ -1,0 +1,397 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/execution/ethereum/db/trie_db.hpp>
+#include <category/execution/kinet/db/page_commit_builder.hpp>
+#include <category/execution/kinet/db/storage_page.hpp>
+
+#include <gtest/gtest.h>
+
+#include <test_resource_data.h>
+
+#include <algorithm>
+#include <cstring>
+
+using namespace kinet;
+using namespace kinet::mpt;
+using namespace kinet::test;
+
+TEST(KinetDb, key_grouping)
+{
+    // Keys 0x00..0x7F should all map to the same page (page_key = 0)
+    bytes32_t const page_key_0 = compute_page_key(bytes32_t{uint64_t{0}});
+
+    for (uint64_t i = 0; i < 128; ++i) {
+        bytes32_t const slot_key{i};
+        EXPECT_EQ(compute_page_key(slot_key), page_key_0)
+            << "slot " << i << " should map to same page as slot 0";
+        EXPECT_EQ(compute_slot_offset(slot_key), i)
+            << "slot " << i << " should have offset equal to its low bits";
+    }
+
+    // Key 0x80 should map to a different page
+    bytes32_t const slot_128{uint64_t{0x80}};
+    EXPECT_NE(compute_page_key(slot_128), page_key_0);
+    EXPECT_EQ(compute_slot_offset(slot_128), 0);
+
+    // Keys 0x80..0xFF should share a second page
+    bytes32_t const page_key_1 = compute_page_key(bytes32_t{uint64_t{0x80}});
+    for (uint64_t i = 0x80; i < 0x100; ++i) {
+        bytes32_t const slot_key{i};
+        EXPECT_EQ(compute_page_key(slot_key), page_key_1);
+        EXPECT_EQ(
+            compute_slot_offset(slot_key),
+            static_cast<uint8_t>(i & storage_page_t::SLOT_OFFSET_MASK));
+    }
+
+    // Round-trip for all keys 0..0xFF
+    for (uint64_t i = 0; i < 256; ++i) {
+        bytes32_t const slot_key{i};
+        bytes32_t const pk = compute_page_key(slot_key);
+        uint8_t const off = compute_slot_offset(slot_key);
+        EXPECT_EQ(compute_slot_key(pk, off), slot_key);
+    }
+}
+
+TEST(KinetDb, page_commit_deterministic)
+{
+    storage_page_t page{};
+    auto const c1 = page_commit(page);
+    auto const c2 = page_commit(page);
+    EXPECT_EQ(c1, c2);
+    EXPECT_NE(c1, bytes32_t{});
+}
+
+TEST(KinetDb, page_commit_differs_for_different_pages)
+{
+    storage_page_t page_a{};
+    storage_page_t page_b{};
+    page_b.set(0, bytes32_t{0x01});
+
+    EXPECT_NE(page_commit(page_a), page_commit(page_b));
+}
+
+TEST(KinetDb, page_commit_sensitive_to_slot_position)
+{
+    storage_page_t page_a{};
+    page_a.set(0, bytes32_t{0x01});
+
+    storage_page_t page_b{};
+    page_b.set(1, bytes32_t{0x01});
+
+    EXPECT_NE(page_commit(page_a), page_commit(page_b));
+}
+
+TEST(KinetDb, page_commit_sensitive_to_distant_slots)
+{
+    storage_page_t page_a{};
+    page_a.set(0, bytes32_t{0x01});
+
+    storage_page_t page_b{};
+    page_b.set(127, bytes32_t{0x01});
+
+    EXPECT_NE(page_commit(page_a), page_commit(page_b));
+}
+
+TEST(KinetDb, page_commit_sparse_nonzero)
+{
+    auto const filled = [](uint8_t const v) {
+        bytes32_t b{};
+        std::ranges::fill(b.bytes, v);
+        return b;
+    };
+    storage_page_t page{};
+    page.set(0, filled(0x11));
+    page.set(2, filled(0x22));
+    page.set(4, filled(0x33));
+
+    storage_page_t zero_page{};
+    EXPECT_NE(page_commit(page), page_commit(zero_page));
+    EXPECT_EQ(page_commit(page), page_commit(page));
+}
+
+TEST(KinetDb, page_commit_uniform_fill_differs)
+{
+    auto const filled = [](uint8_t const v) {
+        bytes32_t b{};
+        std::ranges::fill(b.bytes, v);
+        return b;
+    };
+    storage_page_t page_a{};
+    storage_page_t page_b{};
+    for (uint8_t i = 0; i < storage_page_t::SLOTS; ++i) {
+        page_a.set(i, filled(0x11));
+        page_b.set(i, filled(0x22));
+    }
+
+    EXPECT_NE(page_commit(page_a), page_commit(page_b));
+}
+
+TEST(KinetDb, page_commit_cross_check_with_reference)
+{
+    constexpr auto ZERO_PAGE_COMMIT =
+        0xe572dff82304700b856a555ac3a4558d0df3646a3727816500270a93c66aac1e_bytes32;
+    constexpr auto SLOT0_ONE_COMMIT =
+        0x80218c63919cd8c68aa9a5c0117bb8b46eb02099a7ce0b47a36e7b21658cc9f9_bytes32;
+    constexpr auto SLOT127_ONE_COMMIT =
+        0x39a2175f8fac8fbf447383b46ff40e03673b388c05c87e50ed7b3f1a810c98d8_bytes32;
+    constexpr auto FULL_PAGE_COMMIT =
+        0xe5a642261a2c2dedebd68ebd42237f2210d1eee94553d677d425dc3a46c7a687_bytes32;
+
+    storage_page_t zero_page{};
+    EXPECT_EQ(page_commit(zero_page), ZERO_PAGE_COMMIT);
+
+    storage_page_t page_slot0{};
+    page_slot0.set(0, bytes32_t{0x01});
+    EXPECT_EQ(page_commit(page_slot0), SLOT0_ONE_COMMIT);
+
+    storage_page_t page_slot127{};
+    page_slot127.set(127, bytes32_t{0x01});
+    EXPECT_EQ(page_commit(page_slot127), SLOT127_ONE_COMMIT);
+
+    storage_page_t full_page{};
+    for (uint8_t i = 0; i < 128; ++i) {
+        full_page.set(i, bytes32_t{static_cast<uint64_t>(i + 1)});
+    }
+    EXPECT_EQ(page_commit(full_page), FULL_PAGE_COMMIT);
+}
+
+// Sweep across pair-population densities. For each k, fill the first k pairs
+// (left slot only). Verifies: (a) the algorithm runs without error at each
+// density, (b) commits are deterministic, (c) every density produces a
+// distinct hash. Catches regressions in the merge tree at densities that the
+// fixed-input cross-check above doesn't exercise.
+TEST(KinetDb, page_commit_density_sweep)
+{
+    constexpr size_t densities[] = {1, 2, 4, 8, 16, 32, 40, 48, 56, 60, 63, 64};
+    constexpr size_t N = sizeof(densities) / sizeof(densities[0]);
+
+    bytes32_t hashes[N];
+
+    for (size_t i = 0; i < N; ++i) {
+        size_t const k = densities[i];
+        storage_page_t page{};
+        for (size_t j = 0; j < k; ++j) {
+            page.set(
+                static_cast<uint8_t>(j * 2),
+                bytes32_t{static_cast<uint64_t>(j + 1)});
+        }
+
+        auto const c1 = page_commit(page);
+        auto const c2 = page_commit(page);
+        EXPECT_EQ(c1, c2) << "non-deterministic at k=" << k;
+        EXPECT_NE(c1, bytes32_t{}) << "all-zero commit at k=" << k;
+
+        hashes[i] = c1;
+    }
+
+    for (size_t i = 0; i < N; ++i) {
+        for (size_t j = i + 1; j < N; ++j) {
+            EXPECT_NE(hashes[i], hashes[j])
+                << "density " << densities[i] << " collides with density "
+                << densities[j];
+        }
+    }
+}
+
+// Within a single pair (slots 2k and 2k+1 form pair k), data placed in the
+// left slot vs the right slot must produce distinct commitments. The seal's
+// slot_bitmap differs (bit 2k vs bit 2k+1) and the leaf hash input differs
+// in byte order (data||zeros vs zeros||data). Tested on a non-trivial pair
+// index to exercise mid-page indexing.
+TEST(KinetDb, page_commit_asymmetric_pair)
+{
+    constexpr uint8_t pair_idx = 5;
+    constexpr uint8_t left_slot = pair_idx * 2;
+    constexpr uint8_t right_slot = pair_idx * 2 + 1;
+
+    bytes32_t pattern_aa{};
+    std::ranges::fill(pattern_aa.bytes, static_cast<uint8_t>(0xAA));
+
+    storage_page_t left_only{};
+    left_only.set(left_slot, pattern_aa);
+
+    storage_page_t right_only{};
+    right_only.set(right_slot, pattern_aa);
+
+    auto const c_left = page_commit(left_only);
+    auto const c_right = page_commit(right_only);
+
+    EXPECT_NE(c_left, c_right);
+    EXPECT_NE(c_left, bytes32_t{});
+    EXPECT_NE(c_right, bytes32_t{});
+}
+
+// Slots on the same page are merged into a single page on commit.
+// Block 0 writes slots 0 and 1. Block 1 updates slot 0 only.
+// After block 1 commit, both the updated slot 0 and the untouched slot 1
+// must be present in the same page.
+TEST(KinetDb, page_write_merges_slots)
+{
+    constexpr auto slot_key_0 = bytes32_t{uint64_t{0x00}};
+    constexpr auto slot_key_1 = bytes32_t{uint64_t{0x01}};
+    constexpr auto val_0 =
+        0x000000000000000000000000000000000000000000000000000000000000aaaa_bytes32;
+    constexpr auto val_1 =
+        0x000000000000000000000000000000000000000000000000000000000000bbbb_bytes32;
+    constexpr auto val_0_updated =
+        0x000000000000000000000000000000000000000000000000000000000000dddd_bytes32;
+
+    Account const acct{.nonce = 1};
+    mpt::Db mpt_db{std::make_unique<KinetInMemoryMachine>()};
+    TrieDb tdb{mpt_db};
+    ASSERT_TRUE(tdb.is_page_encoded()) << "test requires page-encoded storage";
+
+    // Block 0: seed two slots on the same page.
+    {
+        PageCommitBuilder builder(0, tdb);
+        builder.add_state_deltas(StateDeltas{
+            {ADDR_A,
+             StateDelta{
+                 .account = {std::nullopt, acct},
+                 .storage = {
+                     {slot_key_0, {bytes32_t{}, val_0}},
+                     {slot_key_1, {bytes32_t{}, val_1}}}}}});
+        auto root = mpt_db.upsert(nullptr, builder.build(finalized_nibbles), 0);
+        tdb.reset_root(std::move(root), 0);
+    }
+
+    // Block 1: update slot 0, leave slot 1 untouched.
+    {
+        ASSERT_EQ(
+            tdb.read_storage(ADDR_A, Incarnation{0, 0}, slot_key_0), val_0);
+        ASSERT_EQ(
+            tdb.read_storage(ADDR_A, Incarnation{0, 0}, slot_key_1), val_1);
+
+        PageCommitBuilder builder(1, tdb);
+        builder.add_state_deltas(StateDeltas{
+            {ADDR_A,
+             StateDelta{
+                 .account = {acct, acct},
+                 .storage = {{slot_key_0, {val_0, val_0_updated}}}}}});
+        auto root =
+            mpt_db.upsert(tdb.get_root(), builder.build(finalized_nibbles), 1);
+        tdb.reset_root(std::move(root), 1);
+    }
+
+    // Verify: db reads back both values from the committed page.
+    EXPECT_EQ(
+        tdb.read_storage(ADDR_A, Incarnation{0, 0}, slot_key_0), val_0_updated);
+    EXPECT_EQ(tdb.read_storage(ADDR_A, Incarnation{0, 0}, slot_key_1), val_1);
+}
+
+TEST(KinetDb, byte_size_inline)
+{
+    constexpr bytes32_t val{uint64_t{0xabcd}};
+
+    storage_page_t page;
+    EXPECT_EQ(page.byte_size(), sizeof(storage_page_t));
+
+    // Up to the inline capacity (4 values) nothing is heap-allocated, so the
+    // footprint stays at the base object size.
+    for (uint8_t i = 0; i < 4; ++i) {
+        page.set(i, val);
+        EXPECT_EQ(page.byte_size(), sizeof(storage_page_t));
+    }
+}
+
+TEST(KinetDb, byte_size_spill)
+{
+    constexpr bytes32_t val{uint64_t{0xabcd}};
+
+    storage_page_t page;
+    for (uint8_t i = 0; i < 5; ++i) {
+        page.set(i, val);
+    }
+
+    // The 5th value spills values_ to a heap buffer. Growth is
+    // implementation-defined, so the footprint is at least the base object
+    // plus the live elements.
+    EXPECT_GE(page.byte_size(), sizeof(storage_page_t) + 5 * sizeof(bytes32_t));
+}
+
+TEST(KinetDb, storage_page_slots_iterates_populated_in_ascending_order)
+{
+    // Offsets 63 and 64 straddle the two 64-bit halves of the 128-bit bitmap,
+    // exercising the lowest_offset() split and the dense-index lockstep across
+    // the boundary.
+    constexpr bytes32_t page_key{uint64_t{0x1234}};
+    constexpr uint8_t offsets[] = {0, 1, 63, 64, 126, 127};
+    constexpr size_t num_offsets = sizeof(offsets) / sizeof(offsets[0]);
+
+    storage_page_t page{};
+    for (uint8_t const off : offsets) {
+        page.set(off, bytes32_t{static_cast<uint64_t>(off + 1)});
+    }
+    DecodedStoragePage const decoded{page_key, page};
+
+    size_t i = 0;
+    for (auto const [slot_key, val] : decoded.slots()) {
+        ASSERT_LT(i, num_offsets);
+        uint8_t const off = offsets[i];
+        EXPECT_EQ(slot_key, compute_slot_key(page_key, off));
+        EXPECT_EQ(val, bytes32_t{static_cast<uint64_t>(off + 1)});
+        ++i;
+    }
+    EXPECT_EQ(i, num_offsets);
+}
+
+TEST(KinetDb, storage_page_slots_empty_page_yields_nothing)
+{
+    DecodedStoragePage const decoded{
+        bytes32_t{uint64_t{0xab}}, storage_page_t{}};
+    size_t count = 0;
+    for (auto const [slot_key, val] : decoded.slots()) {
+        (void)slot_key;
+        (void)val;
+        ++count;
+    }
+    EXPECT_EQ(count, 0u);
+}
+
+TEST(KinetDb, storage_page_slots_full_page)
+{
+    constexpr bytes32_t page_key{uint64_t{0x9999}};
+    storage_page_t page{};
+    for (uint8_t i = 0; i < storage_page_t::SLOTS; ++i) {
+        page.set(i, bytes32_t{static_cast<uint64_t>(i + 1)});
+    }
+    DecodedStoragePage const decoded{page_key, page};
+
+    size_t expected_off = 0;
+    for (auto const [slot_key, val] : decoded.slots()) {
+        EXPECT_EQ(
+            slot_key,
+            compute_slot_key(page_key, static_cast<uint8_t>(expected_off)));
+        EXPECT_EQ(val, bytes32_t{static_cast<uint64_t>(expected_off + 1)});
+        ++expected_off;
+    }
+    EXPECT_EQ(expected_off, storage_page_t::SLOTS);
+}
+
+TEST(KinetDb, lowest_offset_across_bitmap_halves)
+{
+    using bitmap_t = storage_page_t::bitmap_t;
+    EXPECT_EQ(lowest_offset(bitmap_t{1}), 0);
+    EXPECT_EQ(lowest_offset(bitmap_t{1} << 63), 63);
+    EXPECT_EQ(lowest_offset(bitmap_t{1} << 64), 64);
+    EXPECT_EQ(lowest_offset(bitmap_t{1} << 127), 127);
+    // With multiple bits set it returns the lowest; the 63/64 pair straddles
+    // the two 64-bit halves the split walks.
+    EXPECT_EQ(lowest_offset((bitmap_t{1} << 64) | (bitmap_t{1} << 63)), 63);
+    // Multiple bits, all in the high half: exercises the else-branch returning
+    // the lowest high-half bit rather than the highest.
+    EXPECT_EQ(lowest_offset((bitmap_t{1} << 100) | (bitmap_t{1} << 70)), 70);
+}

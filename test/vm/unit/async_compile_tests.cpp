@@ -1,0 +1,199 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/int.hpp>
+#include <category/vm/code.hpp>
+#include <category/vm/compiler.hpp>
+#include <category/vm/compiler/types.hpp>
+#include <category/vm/evm/opcodes.hpp>
+#include <category/vm/evm/traits.hpp>
+#include <category/vm/runtime/types.hpp>
+
+#include <test/vm/utils/test_context.hpp>
+
+#include <evmc/evmc.h>
+#include <evmc/evmc.hpp>
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <thread>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+using namespace kinet;
+using namespace kinet::vm;
+using namespace kinet::vm::compiler;
+
+namespace
+{
+    std::vector<uint8_t> test_code(uint64_t const index)
+    {
+        std::vector<uint8_t> code = {PUSH1, 1, PUSH8};
+        for (uint64_t i = 0; i < 8; ++i) {
+            code.push_back(static_cast<uint8_t>(index >> 8 * (7 - i)));
+        }
+        code.push_back(RETURN);
+        return code;
+    }
+
+    bytes32_t test_hash(uint64_t const index)
+    {
+        bytes32_t h{};
+        for (uint64_t i = 0; i < 8; ++i) {
+            h.bytes[31 - i] = static_cast<uint8_t>(index >> 8 * (7 - i));
+        }
+        return h;
+    }
+}
+
+TEST(async_compile_test, stress)
+{
+    using traits = EvmTraits<KINET_ETH_CANCUN>;
+
+    constexpr size_t P = 10;
+    constexpr size_t L = 120;
+    constexpr size_t N = L * 12;
+
+    Compiler compiler{true, L};
+
+    auto first_start_time = std::chrono::steady_clock::now();
+    compiler.compile<traits>(make_shared_intercode(test_code(2 * N)));
+    auto first_end_time = std::chrono::steady_clock::now();
+    auto compile_time_estimate = first_end_time - first_start_time;
+
+    auto producer = [&](uint64_t start_index) {
+        std::unordered_set<uint64_t> producer_set;
+        // Spam async compiler with `L` async compilation requests followed
+        // by a sleep period to let the compiler partially empty the queue.
+        for (uint64_t i = 0; i < N;) {
+            uint64_t const c = std::min(i + L, N);
+            for (; i < c; ++i) {
+                uint64_t const index = start_index + i;
+                auto code = test_code(index);
+                auto hash = test_hash(index);
+                auto icode = make_shared_intercode(std::move(code));
+                if (compiler.async_compile<traits>(hash, icode)) {
+                    auto [_, inserted] = producer_set.insert(index);
+                    ASSERT_TRUE(inserted);
+                }
+            }
+            std::this_thread::sleep_for(compile_time_estimate * L / 4);
+        }
+
+        compiler.debug_wait_for_empty_queue();
+
+        for (uint64_t const index : producer_set) {
+            auto vcode = compiler.find_varcode(test_hash(index));
+            ASSERT_TRUE(vcode.has_value());
+            auto ncode = (*vcode)->nativecode();
+            ASSERT_TRUE(!!ncode);
+
+            auto entry = ncode->entrypoint();
+            ASSERT_TRUE(entry != nullptr);
+
+            test::TestContext ctx;
+            ctx->gas_remaining = 100;
+            entry(&*ctx, nullptr);
+
+            auto const &ret = ctx->result;
+            ASSERT_EQ(ret.status, runtime::StatusCode::Success);
+            ASSERT_EQ(load_le<uint256_t>(ret.offset), index);
+            ASSERT_EQ(load_le<uint256_t>(ret.size), 1);
+        }
+    };
+
+    std::vector<std::thread> producers;
+    for (size_t i = 0; i < P; ++i) {
+        producers.emplace_back(producer, (i * N) / 2);
+    }
+    for (size_t i = 0; i < P; ++i) {
+        producers[i].join();
+    }
+}
+
+TEST(async_compile_test, disable)
+{
+    Compiler compiler{false};
+
+    for (auto i = 0u; i < 32; ++i) {
+        auto const code = test_code(i);
+        auto const hash = test_hash(i);
+        auto const icode = make_shared_intercode(std::move(code));
+
+        ASSERT_TRUE(
+            compiler.async_compile<EvmTraits<KINET_ETH_PRAGUE>>(hash, icode));
+    }
+
+    compiler.debug_wait_for_empty_queue();
+
+    for (auto i = 0u; i < 32; ++i) {
+        auto const vcode = compiler.find_varcode(test_hash(i));
+        ASSERT_TRUE(vcode.has_value());
+        auto const ncode = (*vcode)->nativecode();
+        ASSERT_TRUE(!!ncode);
+
+        auto const entry = ncode->entrypoint();
+        ASSERT_TRUE(entry == nullptr);
+    }
+}
+
+// id() is the sole key distinguishing cached native code between revisions, so
+// the two trait families must never produce a colliding value across their
+// independent enums.
+TEST(async_compile_test, trait_ids_distinct)
+{
+    // One revision per line so the roster stays readable and diffs cleanly.
+    // clang-format off
+    std::array<uint64_t, 20> const ids{
+        EvmTraits<KINET_ETH_BERLIN>::id(),
+        EvmTraits<KINET_ETH_LONDON>::id(),
+        EvmTraits<KINET_ETH_PARIS>::id(),
+        EvmTraits<KINET_ETH_SHANGHAI>::id(),
+        EvmTraits<KINET_ETH_CANCUN>::id(),
+        EvmTraits<KINET_ETH_PRAGUE>::id(),
+        EvmTraits<KINET_ETH_OSAKA>::id(),
+        EvmTraits<KINET_ETH_AMSTERDAM>::id(),
+        KinetTraits<KINET_ZERO>::id(),
+        KinetTraits<KINET_ONE>::id(),
+        KinetTraits<KINET_TWO>::id(),
+        KinetTraits<KINET_THREE>::id(),
+        KinetTraits<KINET_FOUR>::id(),
+        KinetTraits<KINET_FIVE>::id(),
+        KinetTraits<KINET_SIX>::id(),
+        KinetTraits<KINET_SEVEN>::id(),
+        KinetTraits<KINET_EIGHT>::id(),
+        KinetTraits<KINET_NINE>::id(),
+        KinetTraits<KINET_TEN>::id(),
+        KinetTraits<KINET_NEXT>::id()};
+    // clang-format on
+
+    // Trip-wire: adding a revision to either family shifts these sentinels,
+    // forcing the id list above to be extended so coverage stays exhaustive.
+    static_assert(
+        KINET_NEXT == 11, "a kinet_revision was added; extend the list above");
+    static_assert(
+        KINET_ETH_EXPERIMENTAL == 16,
+        "a kinet_eth_revision was added; extend the list above");
+
+    std::unordered_set<uint64_t> const unique(ids.begin(), ids.end());
+    EXPECT_EQ(unique.size(), ids.size());
+}

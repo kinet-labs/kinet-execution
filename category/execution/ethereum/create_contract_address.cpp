@@ -1,0 +1,58 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/address.hpp>
+#include <category/core/byte_string.hpp>
+#include <category/core/bytes.hpp>
+#include <category/core/config.hpp>
+#include <category/core/keccak.hpp>
+#include <category/execution/ethereum/core/rlp/address_rlp.hpp>
+#include <category/execution/ethereum/core/rlp/int_rlp.hpp>
+#include <category/execution/ethereum/rlp/encode2.hpp>
+
+#include <cstdint>
+#include <cstring>
+
+KINET_NAMESPACE_BEGIN
+
+// YP Sec 7: Eq 85 and 86
+Address hash_and_clip(byte_string const &b)
+{
+    auto const h = keccak256(b);
+    Address result{};
+    std::memcpy(result.bytes, &h.bytes[12], sizeof(Address));
+    return result;
+}
+
+// YP Sec 7: Eq 87, top
+Address create_contract_address(Address const &from, uint64_t const nonce)
+{
+    byte_string const b = rlp::encode_list2(
+        rlp::encode_address(from) + rlp::encode_unsigned(nonce));
+    return hash_and_clip(b);
+}
+
+// EIP-1014 YP Sec 7: Eq 87, bottom
+Address create2_contract_address(
+    Address const &from, bytes32_t const &zeta, kinet_hash256 const &code_hash)
+{
+    byte_string const b = byte_string{0xff} +
+                          byte_string{from.bytes, sizeof(Address)} +
+                          byte_string{zeta.bytes, sizeof(bytes32_t)} +
+                          byte_string{code_hash.bytes, sizeof(kinet_hash256)};
+    return hash_and_clip(b);
+}
+
+KINET_NAMESPACE_END

@@ -1,0 +1,1364 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include "test_fixtures_base.hpp"
+#include "test_fixtures_gtest.hpp"
+
+#include <category/async/concepts.hpp>
+#include <category/async/connected_operation.hpp>
+#include <category/async/erased_connected_operation.hpp>
+#include <category/core/assert.h>
+#include <category/core/byte_string.hpp>
+#include <category/core/hex.hpp>
+#include <category/core/result.hpp>
+#include <category/mpt/db.hpp>
+#include <category/mpt/db_error.hpp>
+#include <category/mpt/detail/timeline.hpp>
+#include <category/mpt/node.hpp>
+#include <category/mpt/node_cursor.hpp>
+#include <category/mpt/traverse.hpp>
+#include <category/mpt/update.hpp>
+
+#include <gtest/gtest.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <set>
+#include <utility>
+
+using namespace kinet::mpt;
+using namespace kinet::test;
+using namespace kinet::literals;
+
+namespace
+{
+
+    // Helper: create an update inserting key=value
+    Update make_kv(kinet::byte_string_view key, kinet::byte_string_view value)
+    {
+        return make_update(key, value);
+    }
+
+    // Helper: look up a key from a root on the given Db and return the value
+    kinet::Result<kinet::byte_string>
+    db_get(Db &db, NodeCursor const &root, NibblesView key, uint64_t version)
+    {
+        auto const res = db.find(root, key, version);
+        if (res.has_value()) {
+            return kinet::byte_string{res.value().node->value()};
+        }
+        return kinet::mpt::DbError(res.error().value());
+    }
+
+    // Collects the value of every leaf visited during a traverse. Clones
+    // share the same `values` set so a parallel traverse aggregates into one
+    // place.
+    struct CollectLeavesMachine final : public TraverseMachine
+    {
+        std::set<kinet::byte_string> &values;
+
+        explicit CollectLeavesMachine(std::set<kinet::byte_string> &values)
+            : values(values)
+        {
+        }
+
+        virtual bool down(unsigned char, Node const &node) override
+        {
+            if (node.has_value()) {
+                values.emplace(node.value());
+            }
+            return true;
+        }
+
+        virtual void up(unsigned char, Node const &) override {}
+
+        virtual std::unique_ptr<TraverseMachine> clone() const override
+        {
+            return std::make_unique<CollectLeavesMachine>(*this);
+        }
+    };
+
+    struct DualTimelineFixture : public ::testing::Test
+    {
+        std::filesystem::path const dbname{create_temp_file(8)};
+        OnDiskDbConfig config{
+            .compaction = true,
+            .sq_thread_cpu = std::nullopt,
+            .dbname_paths = {dbname},
+            .fixed_history_length = MPT_TEST_HISTORY_LENGTH,
+            .chunk_capacity = 24};
+        Db db{std::make_unique<StateMachineAlwaysMerkle>(), config};
+        std::optional<Db> secondary_db;
+
+        Node::SharedPtr primary_root;
+        Node::SharedPtr secondary_root;
+
+        ~DualTimelineFixture()
+        {
+            std::filesystem::remove(dbname);
+        }
+
+        Db &db_for(timeline_id tid)
+        {
+            if (tid == timeline_id::secondary) {
+                KINET_ASSERT(secondary_db.has_value());
+                return *secondary_db;
+            }
+            return db;
+        }
+
+        void activate_secondary()
+        {
+            // The fork_version arg is preserved for test readability — it
+            // tags the version that callers will subsequently upsert to.
+            // It is no longer pre-seeded into the secondary's version
+            // fields; fast_forward_next_version on the first secondary
+            // upsert seeds them.
+            secondary_db.emplace(db.activate_secondary_timeline(
+                std::make_unique<StateMachineAlwaysMerkle>()));
+        }
+
+        void deactivate_secondary()
+        {
+            secondary_db.reset();
+            db.deactivate_secondary_timeline();
+        }
+
+        void promote_secondary()
+        {
+            secondary_db.reset();
+            db.promote_secondary_to_primary();
+        }
+
+        // Close and reopen the primary Db against the same file, as
+        // production would after promote.
+        void reopen_primary_with(std::unique_ptr<StateMachine> machine)
+        {
+            {
+                Db const expired = std::move(db);
+            }
+            OnDiskDbConfig reopen_config = config;
+            reopen_config.append = true;
+            db = Db{std::move(machine), reopen_config};
+        }
+
+        Node::SharedPtr upsert_kv(
+            Node::SharedPtr root, kinet::byte_string_view key,
+            kinet::byte_string_view value, uint64_t version,
+            timeline_id tid = timeline_id::primary)
+        {
+            auto u = make_kv(key, value);
+            UpdateList ul;
+            ul.push_front(u);
+            return db_for(tid).upsert(std::move(root), std::move(ul), version);
+        }
+
+        // Seeds primary-only keys, activates secondary, inserts distinct
+        // secondary keys, then traverses both roots via `traverse_fn` and
+        // asserts each traverse visits exactly its own timeline's leaves.
+        template <class TraverseFn>
+        void check_traverse_isolation(TraverseFn traverse_fn)
+        {
+            // Seed primary with versions 0-2 using primary-only keys.
+            auto const pk1 = 0x1111111111111111_bytes;
+            auto const pk2 = 0x2222222222222222_bytes;
+            primary_root = upsert_kv(primary_root, pk1, pk1, 0);
+            primary_root = upsert_kv(primary_root, pk2, pk2, 1);
+            primary_root = upsert_kv(primary_root, pk1, pk1, 2);
+
+            // Activate secondary, insert distinct secondary keys.
+            activate_secondary();
+            auto const sk1 = 0xAAAAAAAAAAAAAAAA_bytes;
+            auto const sk2 = 0xBBBBBBBBBBBBBBBB_bytes;
+            auto const sk3 = 0xCCCCCCCCCCCCCCCC_bytes;
+            secondary_root =
+                upsert_kv(secondary_root, sk1, sk1, 3, timeline_id::secondary);
+            secondary_root =
+                upsert_kv(secondary_root, sk2, sk2, 4, timeline_id::secondary);
+            secondary_root =
+                upsert_kv(secondary_root, sk3, sk3, 5, timeline_id::secondary);
+            ASSERT_NE(secondary_root, nullptr);
+
+            // Traverse the secondary root on the secondary Db. Version 5 is
+            // valid in the secondary ring; the traversal must validate against
+            // timeline_id::secondary, not the primary.
+            std::set<kinet::byte_string> secondary_values;
+            CollectLeavesMachine secondary_machine{secondary_values};
+            ASSERT_TRUE(traverse_fn(
+                *secondary_db, secondary_root, secondary_machine, 5));
+
+            // The traverse visits every secondary leaf and none of the
+            // primary-only keys — the timelines are isolated.
+            EXPECT_TRUE(secondary_values.contains(kinet::byte_string{sk1}));
+            EXPECT_TRUE(secondary_values.contains(kinet::byte_string{sk2}));
+            EXPECT_TRUE(secondary_values.contains(kinet::byte_string{sk3}));
+            EXPECT_FALSE(secondary_values.contains(kinet::byte_string{pk1}));
+            EXPECT_FALSE(secondary_values.contains(kinet::byte_string{pk2}));
+
+            // Traversing the primary root on the primary Db visits only
+            // primary keys.
+            std::set<kinet::byte_string> primary_values;
+            CollectLeavesMachine primary_machine{primary_values};
+            ASSERT_TRUE(traverse_fn(db, primary_root, primary_machine, 2));
+            EXPECT_TRUE(primary_values.contains(kinet::byte_string{pk1}));
+            EXPECT_TRUE(primary_values.contains(kinet::byte_string{pk2}));
+            EXPECT_FALSE(primary_values.contains(kinet::byte_string{sk1}));
+        }
+    };
+
+    // -------------------------------------------------------------------
+    // Test: Activate and deactivate without any upserts on secondary
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, activate_deactivate_empty)
+    {
+        // Seed primary with a few versions
+        auto const k1 = 0x11111111_bytes;
+        auto const k2 = 0x22222222_bytes;
+        primary_root = upsert_kv(primary_root, k1, k1, 0);
+        primary_root = upsert_kv(primary_root, k2, k2, 1);
+        ASSERT_NE(primary_root, nullptr);
+
+        EXPECT_FALSE(db.timeline_active(timeline_id::secondary));
+        activate_secondary();
+        EXPECT_TRUE(db.timeline_active(timeline_id::secondary));
+
+        // Deactivate without doing anything on secondary
+        deactivate_secondary();
+        EXPECT_FALSE(db.timeline_active(timeline_id::secondary));
+
+        // Primary should be unaffected
+        auto const res = db_get(db, primary_root, NibblesView{k1}, 1);
+        ASSERT_TRUE(res.has_value());
+        EXPECT_EQ(res.value(), k1);
+    }
+
+    // -------------------------------------------------------------------
+    // Test: open_secondary_timeline attaches to an active secondary
+    // without modifying metadata; returns nullopt when inactive.
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, open_secondary_timeline_factory)
+    {
+        // No secondary yet
+        EXPECT_FALSE(db.open_secondary_timeline(
+                           std::make_unique<StateMachineAlwaysMerkle>())
+                         .has_value());
+
+        activate_secondary();
+
+        // Drop the Db returned by activate_secondary_timeline — mimicking
+        // a process restart where the secondary metadata persists on disk
+        // but the secondary Db instance is gone.
+        secondary_db.reset();
+        EXPECT_TRUE(db.timeline_active(timeline_id::secondary));
+
+        // Reattach via open_secondary_timeline
+        auto reopened = db.open_secondary_timeline(
+            std::make_unique<StateMachineAlwaysMerkle>());
+        ASSERT_TRUE(reopened.has_value());
+
+        // The reattached Db can upsert and read secondary data
+        auto const k = 0xAAAAAAAA_bytes;
+        auto u = make_update(k, k);
+        UpdateList ul;
+        ul.push_front(u);
+        auto const sroot = reopened->upsert(nullptr, std::move(ul), 0);
+        ASSERT_NE(sroot, nullptr);
+        auto const res = db_get(*reopened, sroot, NibblesView{k}, 0);
+        ASSERT_TRUE(res.has_value());
+        EXPECT_EQ(res.value(), k);
+
+        // Destroy the reopened Db, then deactivate via primary
+        reopened.reset();
+        db.deactivate_secondary_timeline();
+
+        // After deactivate, open returns nullopt again
+        EXPECT_FALSE(db.open_secondary_timeline(
+                           std::make_unique<StateMachineAlwaysMerkle>())
+                         .has_value());
+    }
+
+    // -------------------------------------------------------------------
+    // Test: Seed primary, activate secondary, replay same updates on both
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, replay_identical_updates)
+    {
+        // Seed primary with versions 0-4
+        auto const keys = std::array{
+            0x11111111_bytes,
+            0x22222222_bytes,
+            0x33333333_bytes,
+            0x44444444_bytes,
+            0x55555555_bytes};
+
+        for (uint64_t v = 0; v < keys.size(); v++) {
+            primary_root = upsert_kv(primary_root, keys[v], keys[v], v);
+            ASSERT_NE(primary_root, nullptr);
+        }
+
+        activate_secondary();
+
+        // Replay same updates on secondary timeline
+        for (uint64_t v = 0; v < keys.size(); v++) {
+            secondary_root = upsert_kv(
+                secondary_root, keys[v], keys[v], v, timeline_id::secondary);
+            ASSERT_NE(secondary_root, nullptr);
+        }
+
+        // Both timelines should have all 5 keys at their latest root
+        for (auto const &key : keys) {
+            auto const pres = db_get(db, primary_root, NibblesView{key}, 4);
+            ASSERT_TRUE(pres.has_value()) << "primary missing key";
+            EXPECT_EQ(pres.value(), key);
+
+            auto const sres = db_get(
+                db_for(timeline_id::secondary),
+                secondary_root,
+                NibblesView{key},
+                4);
+            ASSERT_TRUE(sres.has_value()) << "secondary missing key";
+            EXPECT_EQ(sres.value(), key);
+        }
+
+        deactivate_secondary();
+    }
+
+    // -------------------------------------------------------------------
+    // Test: Concurrent updates — both timelines advance with different data
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, concurrent_updates_different_data)
+    {
+        // Seed primary with versions 0-2
+        auto const seed_key = 0xAAAAAAAA_bytes;
+        primary_root = upsert_kv(primary_root, seed_key, seed_key, 0);
+        primary_root = upsert_kv(primary_root, seed_key, seed_key, 1);
+        primary_root = upsert_kv(primary_root, seed_key, seed_key, 2);
+
+        activate_secondary();
+        // Give secondary the same seed
+        secondary_root = upsert_kv(
+            secondary_root, seed_key, seed_key, 3, timeline_id::secondary);
+
+        // Now advance both timelines with DIFFERENT keys at version 4+
+        auto const primary_key = 0xBBBBBBBB_bytes;
+        auto const secondary_key = 0xCCCCCCCC_bytes;
+
+        for (uint64_t v = 3; v <= 5; v++) {
+            primary_root = upsert_kv(primary_root, primary_key, primary_key, v);
+            secondary_root = upsert_kv(
+                secondary_root,
+                secondary_key,
+                secondary_key,
+                v,
+                timeline_id::secondary);
+        }
+
+        // Primary should have primary_key but NOT secondary_key
+        auto const pres = db_get(db, primary_root, NibblesView{primary_key}, 5);
+        ASSERT_TRUE(pres.has_value());
+        EXPECT_EQ(pres.value(), primary_key);
+        auto const pres2 =
+            db_get(db, primary_root, NibblesView{secondary_key}, 5);
+        EXPECT_FALSE(pres2.has_value());
+
+        // Secondary should have secondary_key but NOT primary_key
+        auto const sres = db_get(
+            db_for(timeline_id::secondary),
+            secondary_root,
+            NibblesView{secondary_key},
+            5);
+        ASSERT_TRUE(sres.has_value());
+        EXPECT_EQ(sres.value(), secondary_key);
+        auto const sres2 = db_get(
+            db_for(timeline_id::secondary),
+            secondary_root,
+            NibblesView{primary_key},
+            5);
+        EXPECT_FALSE(sres2.has_value());
+
+        // Both should have the seed key
+        auto const pseed = db_get(db, primary_root, NibblesView{seed_key}, 5);
+        ASSERT_TRUE(pseed.has_value());
+        auto const sseed = db_get(
+            db_for(timeline_id::secondary),
+            secondary_root,
+            NibblesView{seed_key},
+            5);
+        ASSERT_TRUE(sseed.has_value());
+
+        deactivate_secondary();
+    }
+
+    TEST_F(DualTimelineFixture, traverse_blocking_on_secondary)
+    {
+        check_traverse_isolation([](Db &db,
+                                    NodeCursor const &root,
+                                    TraverseMachine &machine,
+                                    uint64_t const version) {
+            return db.traverse_blocking(root, machine, version);
+        });
+    }
+
+    TEST_F(DualTimelineFixture, traverse_on_secondary)
+    {
+        check_traverse_isolation([](Db &db,
+                                    NodeCursor const &root,
+                                    TraverseMachine &machine,
+                                    uint64_t const version) {
+            return db.traverse(root, machine, version);
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // Test: reopening with rewind_to_latest_finalized after the offline
+    // promote, when the old slot primary is a frozen secondary behind the
+    // page primary (the archive shape past the mip-8 cutoff). The rewind
+    // must trim the primary's unfinalized tail and leave the frozen
+    // secondary untouched.
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, rewind_to_finalized_with_frozen_secondary)
+    {
+        auto const pk = 0x1111111111111111_bytes;
+        for (uint64_t v = 0; v <= 4; v++) {
+            primary_root = upsert_kv(primary_root, pk, pk, v);
+        }
+
+        // The secondary advances to 7 while the old primary stays at 4; 6
+        // is the last finalized version. Promote swaps the roles, so the
+        // frozen timeline becomes the secondary.
+        activate_secondary();
+        auto const sk = 0xAAAAAAAAAAAAAAAA_bytes;
+        for (uint64_t v = 5; v <= 7; v++) {
+            secondary_root =
+                upsert_kv(secondary_root, sk, sk, v, timeline_id::secondary);
+        }
+        db.update_finalized_version(6);
+        promote_secondary();
+
+        // Reopen the primary with rewind_to_latest_finalized, as production
+        // does on restart.
+        {
+            Db const expired = std::move(db);
+        }
+        OnDiskDbConfig reopen_config = config;
+        reopen_config.append = true;
+        reopen_config.rewind_to_latest_finalized = true;
+        db = Db{std::make_unique<StateMachineAlwaysMerkle>(), reopen_config};
+        secondary_db.emplace(*db.open_secondary_timeline(
+            std::make_unique<StateMachineAlwaysMerkle>()));
+
+        EXPECT_EQ(db.get_latest_finalized_version(), 6);
+        // The primary's unfinalized version 7 is rewound away; the frozen
+        // secondary keeps its tip.
+        EXPECT_EQ(db.get_latest_version(), 6);
+        EXPECT_EQ(secondary_db->get_latest_version(), 4);
+
+        // Data on both timelines stays readable at their tips.
+        auto root = db.load_root_for_version(6);
+        ASSERT_NE(root, nullptr);
+        auto const pres = db_get(db, root, NibblesView{sk}, 6);
+        ASSERT_TRUE(pres.has_value());
+        EXPECT_EQ(pres.value(), kinet::byte_string{sk});
+
+        root = secondary_db->load_root_for_version(4);
+        ASSERT_NE(root, nullptr);
+        auto const sres = db_get(*secondary_db, root, NibblesView{pk}, 4);
+        ASSERT_TRUE(sres.has_value());
+        EXPECT_EQ(sres.value(), kinet::byte_string{pk});
+
+        deactivate_secondary();
+    }
+
+    // -------------------------------------------------------------------
+    // Test: async senders route root lookups and version checks by the
+    // timeline their AsyncContext's Db is bound to
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, async_context_reads_secondary_timeline)
+    {
+        auto const pk = 0x1111111111111111_bytes;
+        for (uint64_t v = 0; v <= 4; v++) {
+            primary_root = upsert_kv(primary_root, pk, pk, v);
+        }
+
+        // The secondary diverges with its own key at versions 5-6 while the
+        // primary stays frozen at 4.
+        activate_secondary();
+        auto const sk = 0xAAAAAAAAAAAAAAAA_bytes;
+        for (uint64_t v = 5; v <= 6; v++) {
+            secondary_root =
+                upsert_kv(secondary_root, sk, sk, v, timeline_id::secondary);
+        }
+
+        // One AsyncIOContext for both timelines: an AsyncIO is
+        // one-per-thread, and two RO-blocking Dbs can share one.
+        AsyncIOContext io_ctx{ReadOnlyOnDiskDbConfig{.dbname_paths = {dbname}}};
+        Db ro_primary{io_ctx};
+        Db ro_secondary{io_ctx, timeline_id::secondary};
+        auto const primary_ctx = async_context_create(ro_primary);
+        auto const secondary_ctx = async_context_create(ro_secondary);
+
+        // Async completions run on the polling thread (this one).
+        size_t callbacks = 0;
+        std::optional<kinet::byte_string> last_value;
+
+        struct GetReceiver
+        {
+            size_t *callbacks;
+            std::optional<kinet::byte_string> *last_value;
+
+            void set_value(
+                kinet::async::erased_connected_operation *const state,
+                kinet::async::result<kinet::byte_string> res)
+            {
+                if (res.has_value()) {
+                    *last_value = std::move(res).assume_value();
+                }
+                else {
+                    last_value->reset();
+                }
+                ++*callbacks;
+                delete state;
+            }
+        };
+
+        // The expected-failure lookups need no IO and complete synchronously
+        // inside initiate(), so the target must be computed before it.
+        auto const async_get = [&](AsyncContext *const ctx,
+                                   Db &ro,
+                                   kinet::byte_string const &key,
+                                   uint64_t const version) {
+            size_t const target = callbacks + 1;
+            auto *state = new auto(kinet::async::connect(
+                make_get_sender(ctx, NibblesView{key}, version),
+                GetReceiver{&callbacks, &last_value}));
+            state->initiate();
+            while (callbacks < target) {
+                ro.poll(false);
+            }
+        };
+
+        // A version only the secondary has resolves through the
+        // secondary-bound context and fails through the primary-bound one.
+        async_get(secondary_ctx.get(), ro_secondary, sk, 6);
+        ASSERT_TRUE(last_value.has_value());
+        EXPECT_EQ(*last_value, kinet::byte_string{sk});
+        async_get(primary_ctx.get(), ro_primary, sk, 6);
+        EXPECT_FALSE(last_value.has_value());
+
+        // And symmetrically for a version only the primary has.
+        async_get(primary_ctx.get(), ro_primary, pk, 4);
+        ASSERT_TRUE(last_value.has_value());
+        EXPECT_EQ(*last_value, kinet::byte_string{pk});
+        async_get(secondary_ctx.get(), ro_secondary, pk, 4);
+        EXPECT_FALSE(last_value.has_value());
+
+        deactivate_secondary();
+    }
+
+    // -------------------------------------------------------------------
+    // Test: RODb bound to the secondary timeline serves versions the
+    // primary does not have (the archive shape where the primary stops
+    // committing at the mip-8 cutoff)
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, rodb_reads_secondary_timeline)
+    {
+        auto const pk = 0x1111111111111111_bytes;
+        for (uint64_t v = 0; v <= 4; v++) {
+            primary_root = upsert_kv(primary_root, pk, pk, v);
+        }
+
+        // The secondary diverges with its own key at versions 5-6 while the
+        // primary stays frozen at 4.
+        activate_secondary();
+        auto const sk = 0xAAAAAAAAAAAAAAAA_bytes;
+        for (uint64_t v = 5; v <= 6; v++) {
+            secondary_root =
+                upsert_kv(secondary_root, sk, sk, v, timeline_id::secondary);
+        }
+
+        {
+            ReadOnlyOnDiskDbConfig const ro_config{.dbname_paths = {dbname}};
+            RODb const ro_primary{ro_config};
+            EXPECT_TRUE(ro_primary.timeline_active(timeline_id::secondary));
+            auto const ro_secondary = ro_primary.open_secondary_timeline();
+            ASSERT_NE(ro_secondary, nullptr);
+
+            // Each handle reports its own timeline's version range.
+            EXPECT_EQ(ro_primary.get_latest_version(), 4);
+            EXPECT_EQ(ro_secondary->get_latest_version(), 6);
+            EXPECT_TRUE(ro_primary.version_is_valid_ondisk(4));
+            EXPECT_FALSE(ro_primary.version_is_valid_ondisk(6));
+            EXPECT_TRUE(ro_secondary->version_is_valid_ondisk(6));
+
+            // A version only the secondary has is readable through the
+            // secondary-bound handle and rejected by the primary-bound one.
+            auto const sres = ro_secondary->find(NibblesView{sk}, 6);
+            ASSERT_TRUE(sres.has_value());
+            EXPECT_EQ(
+                kinet::byte_string{sres.value().node->value()},
+                kinet::byte_string{sk});
+            EXPECT_FALSE(ro_primary.find(NibblesView{sk}, 6).has_value());
+
+            // The primary keys stay readable at the primary's frozen tip
+            // and are absent from the secondary's trie.
+            auto const pres = ro_primary.find(NibblesView{pk}, 4);
+            ASSERT_TRUE(pres.has_value());
+            EXPECT_EQ(
+                kinet::byte_string{pres.value().node->value()},
+                kinet::byte_string{pk});
+            EXPECT_FALSE(ro_secondary->find(NibblesView{pk}, 6).has_value());
+        }
+
+        deactivate_secondary();
+    }
+
+    // -------------------------------------------------------------------
+    // Test: Primary ahead of secondary by several versions
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, primary_ahead_of_secondary)
+    {
+        // Seed primary with versions 0-9
+        auto const k1 = 0x11111111_bytes;
+        for (uint64_t v = 0; v < 10; v++) {
+            auto const val = kinet::byte_string(4, static_cast<uint8_t>(v));
+            primary_root = upsert_kv(primary_root, k1, val, v);
+        }
+
+        activate_secondary();
+
+        // Secondary catches up from version 5 to 7 (still behind primary at 9)
+        for (uint64_t v = 5; v <= 7; v++) {
+            auto const val = kinet::byte_string(4, static_cast<uint8_t>(v));
+            secondary_root =
+                upsert_kv(secondary_root, k1, val, v, timeline_id::secondary);
+        }
+
+        // Primary is at version 9, secondary is at version 7
+        auto const pres = db_get(db, primary_root, NibblesView{k1}, 9);
+        ASSERT_TRUE(pres.has_value());
+        EXPECT_EQ(pres.value()[0], 9);
+
+        auto const sres = db_get(
+            db_for(timeline_id::secondary), secondary_root, NibblesView{k1}, 7);
+        ASSERT_TRUE(sres.has_value());
+        EXPECT_EQ(sres.value()[0], 7);
+
+        // Continue: primary advances to 12, secondary catches up to 12
+        for (uint64_t v = 10; v <= 12; v++) {
+            auto const val = kinet::byte_string(4, static_cast<uint8_t>(v));
+            primary_root = upsert_kv(primary_root, k1, val, v);
+        }
+        for (uint64_t v = 8; v <= 12; v++) {
+            auto const val = kinet::byte_string(4, static_cast<uint8_t>(v));
+            secondary_root =
+                upsert_kv(secondary_root, k1, val, v, timeline_id::secondary);
+        }
+
+        // Both at version 12 with same value
+        auto const pres12 = db_get(db, primary_root, NibblesView{k1}, 12);
+        ASSERT_TRUE(pres12.has_value());
+        EXPECT_EQ(pres12.value()[0], 12);
+        auto const sres12 = db_get(
+            db_for(timeline_id::secondary),
+            secondary_root,
+            NibblesView{k1},
+            12);
+        ASSERT_TRUE(sres12.has_value());
+        EXPECT_EQ(sres12.value()[0], 12);
+
+        deactivate_secondary();
+    }
+
+    // -------------------------------------------------------------------
+    // Test: Promote secondary to primary
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, promote_secondary)
+    {
+        // Seed primary with versions 0-3
+        auto const k1 = 0x11111111_bytes;
+        auto const v1 = 0xAA_bytes;
+        auto const k2 = 0x22222222_bytes;
+        auto const v2 = 0xBB_bytes;
+
+        primary_root = upsert_kv(primary_root, k1, v1, 0);
+        primary_root = upsert_kv(primary_root, k2, v2, 1);
+        primary_root = upsert_kv(primary_root, k1, v1, 2);
+        primary_root = upsert_kv(primary_root, k2, v2, 3);
+
+        // Activate secondary, replay
+        activate_secondary();
+        secondary_root =
+            upsert_kv(secondary_root, k1, v1, 2, timeline_id::secondary);
+        secondary_root =
+            upsert_kv(secondary_root, k2, v2, 3, timeline_id::secondary);
+
+        // Now advance both with version 4
+        auto const k3 = 0x33333333_bytes;
+        auto const v3_primary = 0xCC_bytes;
+        auto const v3_secondary = 0xDD_bytes;
+        primary_root = upsert_kv(primary_root, k3, v3_primary, 4);
+        secondary_root = upsert_kv(
+            secondary_root, k3, v3_secondary, 4, timeline_id::secondary);
+
+        // Promote secondary to primary. This clears the primary Db's
+        // StateMachine binding; callers must close and reopen with the
+        // correct machine before further writes.
+        promote_secondary();
+
+        // Simulate production close+reopen: drop the current (now
+        // machine-less) Db and reopen bound to secondary_machine, which
+        // is the authoritative machine for what is now the primary trie.
+        reopen_primary_with(std::make_unique<StateMachineAlwaysMerkle>());
+
+        // After promotion:
+        // - What was secondary is now primary (has v3_secondary for k3)
+        // - What was primary is now secondary (has v3_primary for k3)
+        // The in-memory root variables don't change — they're node
+        // pointers into an on-disk trie whose metadata slot has swapped.
+        EXPECT_TRUE(db.timeline_active(timeline_id::primary));
+        EXPECT_TRUE(db.timeline_active(timeline_id::secondary));
+
+        // The secondary root's data is accessible
+        auto const sres = db_get(db, secondary_root, NibblesView{k3}, 4);
+        ASSERT_TRUE(sres.has_value());
+        EXPECT_EQ(sres.value(), v3_secondary);
+
+        // The primary root's data is also accessible
+        auto const pres = db_get(db, primary_root, NibblesView{k3}, 4);
+        ASSERT_TRUE(pres.has_value());
+        EXPECT_EQ(pres.value(), v3_primary);
+
+        // After promotion+reopen, we can continue upserts on the new
+        // primary (which was the secondary timeline).
+        auto const k4 = 0x44444444_bytes;
+        auto const v4 = 0xEE_bytes;
+        secondary_root = upsert_kv(secondary_root, k4, v4, 5);
+        ASSERT_NE(secondary_root, nullptr);
+
+        auto const res4 = db_get(db, secondary_root, NibblesView{k4}, 5);
+        ASSERT_TRUE(res4.has_value());
+        EXPECT_EQ(res4.value(), v4);
+
+        // Deactivate the old primary (now secondary)
+        deactivate_secondary();
+        EXPECT_FALSE(db.timeline_active(timeline_id::secondary));
+    }
+
+    // -------------------------------------------------------------------
+    // Test: Multiple keys across many versions with concurrent timelines
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, many_versions_concurrent)
+    {
+        constexpr uint64_t N_VERSIONS = 20;
+
+        // Build primary with N versions, each inserting a new key
+        for (uint64_t v = 0; v < N_VERSIONS; v++) {
+            kinet::byte_string key(4, 0);
+            key[0] = static_cast<uint8_t>(v >> 8);
+            key[1] = static_cast<uint8_t>(v & 0xff);
+            key[2] = 0x01; // primary marker
+            primary_root = upsert_kv(primary_root, key, key, v);
+            ASSERT_NE(primary_root, nullptr);
+        }
+
+        activate_secondary();
+
+        uint64_t const fork_version = N_VERSIONS;
+        // Advance both timelines from fork_version to N_VERSIONS + 5
+        for (uint64_t v = fork_version; v < N_VERSIONS + 5; v++) {
+            kinet::byte_string pkey(4, 0);
+            pkey[0] = static_cast<uint8_t>(v >> 8);
+            pkey[1] = static_cast<uint8_t>(v & 0xff);
+            pkey[2] = 0x01; // primary
+            primary_root = upsert_kv(primary_root, pkey, pkey, v);
+
+            kinet::byte_string skey(4, 0);
+            skey[0] = static_cast<uint8_t>(v >> 8);
+            skey[1] = static_cast<uint8_t>(v & 0xff);
+            skey[2] = 0x02; // secondary
+            secondary_root = upsert_kv(
+                secondary_root, skey, skey, v, timeline_id::secondary);
+        }
+
+        uint64_t const final_version = N_VERSIONS + 4;
+
+        // Verify primary has all primary keys
+        for (uint64_t v = fork_version; v < N_VERSIONS + 5; v++) {
+            kinet::byte_string pkey(4, 0);
+            pkey[0] = static_cast<uint8_t>(v >> 8);
+            pkey[1] = static_cast<uint8_t>(v & 0xff);
+            pkey[2] = 0x01;
+            auto const res =
+                db_get(db, primary_root, NibblesView{pkey}, final_version);
+            ASSERT_TRUE(res.has_value()) << "primary missing key at v=" << v;
+        }
+
+        // Verify secondary has all secondary keys
+        for (uint64_t v = fork_version; v < N_VERSIONS + 5; v++) {
+            kinet::byte_string skey(4, 0);
+            skey[0] = static_cast<uint8_t>(v >> 8);
+            skey[1] = static_cast<uint8_t>(v & 0xff);
+            skey[2] = 0x02;
+            auto const res = db_get(
+                db_for(timeline_id::secondary),
+                secondary_root,
+                NibblesView{skey},
+                final_version);
+            ASSERT_TRUE(res.has_value()) << "secondary missing key at v=" << v;
+        }
+
+        // Primary should NOT have secondary-only keys
+        {
+            kinet::byte_string skey(4, 0);
+            skey[0] = 0;
+            skey[1] = static_cast<uint8_t>(fork_version);
+            skey[2] = 0x02;
+            auto const res =
+                db_get(db, primary_root, NibblesView{skey}, final_version);
+            EXPECT_FALSE(res.has_value());
+        }
+
+        deactivate_secondary();
+    }
+
+    // -------------------------------------------------------------------
+    // Test: Activate secondary on an empty db (edge case for the active_ flag)
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, activate_at_version_zero)
+    {
+        activate_secondary();
+        EXPECT_TRUE(db.timeline_active(timeline_id::secondary));
+
+        // Upsert on both
+        auto const key = 0x12345678_bytes;
+        primary_root = upsert_kv(primary_root, key, key, 0);
+        secondary_root =
+            upsert_kv(secondary_root, key, key, 0, timeline_id::secondary);
+
+        ASSERT_NE(primary_root, nullptr);
+        ASSERT_NE(secondary_root, nullptr);
+
+        auto const pres = db_get(db, primary_root, NibblesView{key}, 0);
+        ASSERT_TRUE(pres.has_value());
+        auto const sres = db_get(
+            db_for(timeline_id::secondary),
+            secondary_root,
+            NibblesView{key},
+            0);
+        ASSERT_TRUE(sres.has_value());
+
+        deactivate_secondary();
+    }
+
+    // -------------------------------------------------------------------
+    // Test: Full lifecycle — activate, concurrent, promote, cleanup
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, full_lifecycle)
+    {
+        // Phase 1: Seed primary with versions 0-2
+        auto const k1 = 0x11111111_bytes;
+        primary_root = upsert_kv(primary_root, k1, k1, 0);
+        primary_root = upsert_kv(primary_root, k1, 0xAA_bytes, 1);
+        primary_root = upsert_kv(primary_root, k1, k1, 2);
+
+        // Phase 2: Activate secondary
+        activate_secondary();
+        secondary_root =
+            upsert_kv(secondary_root, k1, k1, 3, timeline_id::secondary);
+
+        // Phase 3: Concurrent operation — both advance versions 4-6
+        auto const k2 = 0x22222222_bytes;
+        for (uint64_t v = 3; v <= 6; v++) {
+            primary_root = upsert_kv(primary_root, k2, k2, v);
+        }
+        for (uint64_t v = 4; v <= 6; v++) {
+            secondary_root =
+                upsert_kv(secondary_root, k2, k2, v, timeline_id::secondary);
+        }
+
+        // Phase 4: Promote secondary, then reopen RWDb bound to the
+        // secondary_machine (authoritative for the now-primary trie).
+        promote_secondary();
+        reopen_primary_with(std::make_unique<StateMachineAlwaysMerkle>());
+        EXPECT_TRUE(db.timeline_active(timeline_id::primary));
+        EXPECT_TRUE(db.timeline_active(timeline_id::secondary));
+
+        // Phase 5: Continue operating on the new primary (was secondary)
+        auto const k3 = 0x33333333_bytes;
+        secondary_root = upsert_kv(secondary_root, k3, k3, 7);
+        ASSERT_NE(secondary_root, nullptr);
+        auto const res = db_get(db, secondary_root, NibblesView{k3}, 7);
+        ASSERT_TRUE(res.has_value());
+        EXPECT_EQ(res.value(), k3);
+
+        // Phase 6: Deactivate old primary (now secondary)
+        deactivate_secondary();
+        EXPECT_FALSE(db.timeline_active(timeline_id::secondary));
+
+        // New primary still works
+        secondary_root = upsert_kv(secondary_root, k3, 0xFF_bytes, 8);
+        ASSERT_NE(secondary_root, nullptr);
+    }
+
+    // -------------------------------------------------------------------
+    // Test: load_root_for_version with timeline_id
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, load_root_for_version_by_timeline)
+    {
+        // Seed primary with versions 0-3
+        auto const k1 = 0x11111111_bytes;
+        for (uint64_t v = 0; v <= 3; v++) {
+            auto const val = kinet::byte_string(4, static_cast<uint8_t>(v));
+            primary_root = upsert_kv(primary_root, k1, val, v);
+        }
+
+        // Activate secondary, upsert versions 2-3
+        activate_secondary();
+        auto const k2 = 0x22222222_bytes;
+        for (uint64_t v = 2; v <= 3; v++) {
+            auto const val =
+                kinet::byte_string(4, static_cast<uint8_t>(v + 10));
+            secondary_root =
+                upsert_kv(secondary_root, k2, val, v, timeline_id::secondary);
+        }
+
+        // load_root_for_version on primary returns the primary root
+        auto const loaded_primary = db.load_root_for_version(3);
+        ASSERT_NE(loaded_primary, nullptr);
+        auto const res = db_get(db, loaded_primary, NibblesView{k1}, 3);
+        ASSERT_TRUE(res.has_value());
+        EXPECT_EQ(res.value()[0], 3);
+
+        // load_root_for_version on secondary returns the secondary root
+        auto const loaded_secondary = secondary_db->load_root_for_version(3);
+        ASSERT_NE(loaded_secondary, nullptr);
+        auto const res2 =
+            db_get(*secondary_db, loaded_secondary, NibblesView{k2}, 3);
+        ASSERT_TRUE(res2.has_value());
+        EXPECT_EQ(res2.value()[0], 13);
+
+        // Primary root should NOT have k2 (secondary-only key)
+        auto const res3 = db_get(db, loaded_primary, NibblesView{k2}, 3);
+        EXPECT_FALSE(res3.has_value());
+
+        // Secondary root should NOT have k1 (primary-only key)
+        auto const res4 =
+            db_get(*secondary_db, loaded_secondary, NibblesView{k1}, 3);
+        EXPECT_FALSE(res4.has_value());
+
+        deactivate_secondary();
+    }
+
+    // -------------------------------------------------------------------
+    // Test: Two TrieDb-like instances sharing one mpt::Db
+    // Demonstrates the pattern for execution-layer dual-timeline
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, two_independent_root_trees)
+    {
+        // Build a shared key set on primary: versions 0-4
+        auto const shared_key = 0xAAAAAAAA_bytes;
+        for (uint64_t v = 0; v <= 4; v++) {
+            primary_root = upsert_kv(primary_root, shared_key, shared_key, v);
+        }
+
+        activate_secondary();
+
+        // Each "TrieDb" instance holds its own root and advances independently
+        // Primary TrieDb: inserts primary-only data at versions 5-7
+        auto const pk = 0xBBBBBBBB_bytes;
+        for (uint64_t v = 5; v <= 7; v++) {
+            primary_root = upsert_kv(primary_root, pk, pk, v);
+        }
+
+        // Secondary TrieDb: inserts secondary-only data at versions 5-7
+        auto const sk = 0xCCCCCCCC_bytes;
+        for (uint64_t v = 5; v <= 7; v++) {
+            secondary_root =
+                upsert_kv(secondary_root, sk, sk, v, timeline_id::secondary);
+        }
+
+        // Load roots from the ring at version 7 — each gets its own root
+        auto const p7 = db.load_root_for_version(7);
+        auto const s7 = secondary_db->load_root_for_version(7);
+        ASSERT_NE(p7, nullptr);
+        ASSERT_NE(s7, nullptr);
+        EXPECT_NE(p7.get(), s7.get());
+
+        // Primary root at v7 has pk, not sk
+        EXPECT_TRUE(db_get(db, p7, NibblesView{pk}, 7).has_value());
+        EXPECT_FALSE(db_get(db, p7, NibblesView{sk}, 7).has_value());
+
+        // Secondary root at v7 has sk, not pk
+        EXPECT_TRUE(db_get(db, s7, NibblesView{sk}, 7).has_value());
+        EXPECT_FALSE(db_get(db, s7, NibblesView{pk}, 7).has_value());
+
+        // Both have the shared key from pre-fork (since both were built on
+        // top of the primary's pre-fork state... but here secondary started
+        // from nullptr, so it only has sk)
+        EXPECT_TRUE(db_get(db, p7, NibblesView{shared_key}, 7).has_value());
+
+        deactivate_secondary();
+    }
+
+    // -------------------------------------------------------------------
+    // Fixture with short history length for GC/compaction tests
+    // -------------------------------------------------------------------
+    struct DualTimelineShortHistoryFixture : public ::testing::Test
+    {
+        static constexpr uint64_t SHORT_HISTORY = 20;
+
+        std::filesystem::path const dbname{create_temp_file(8)};
+        OnDiskDbConfig config{
+            .compaction = true,
+            .sq_thread_cpu = std::nullopt,
+            .dbname_paths = {dbname},
+            .fixed_history_length = SHORT_HISTORY,
+            .chunk_capacity = 24};
+        Db db{std::make_unique<StateMachineAlwaysMerkle>(), config};
+        std::optional<Db> secondary_db;
+
+        Node::SharedPtr primary_root;
+        Node::SharedPtr secondary_root;
+
+        ~DualTimelineShortHistoryFixture()
+        {
+            std::filesystem::remove(dbname);
+        }
+
+        Db &db_for(timeline_id tid)
+        {
+            if (tid == timeline_id::secondary) {
+                KINET_ASSERT(secondary_db.has_value());
+                return *secondary_db;
+            }
+            return db;
+        }
+
+        void activate_secondary()
+        {
+            // The fork_version arg is preserved for test readability — it
+            // tags the version that callers will subsequently upsert to.
+            // It is no longer pre-seeded into the secondary's version
+            // fields; fast_forward_next_version on the first secondary
+            // upsert seeds them.
+            secondary_db.emplace(db.activate_secondary_timeline(
+                std::make_unique<StateMachineAlwaysMerkle>()));
+        }
+
+        void deactivate_secondary()
+        {
+            secondary_db.reset();
+            db.deactivate_secondary_timeline();
+        }
+
+        Node::SharedPtr upsert_kv(
+            Node::SharedPtr root, kinet::byte_string_view key,
+            kinet::byte_string_view value, uint64_t version,
+            timeline_id tid = timeline_id::primary)
+        {
+            auto u = make_kv(key, value);
+            UpdateList ul;
+            ul.push_front(u);
+            return db_for(tid).upsert(std::move(root), std::move(ul), version);
+        }
+    };
+
+    // -------------------------------------------------------------------
+    // Test: GC protects secondary's chunks during primary history expiration
+    // -------------------------------------------------------------------
+    TEST_F(
+        DualTimelineShortHistoryFixture,
+        gc_protects_secondary_during_primary_history_expiration)
+    {
+        // Phase 1: Build primary up to SHORT_HISTORY.
+        auto const shared_key = 0xAAAAAAAA_bytes;
+        for (uint64_t v = 0; v <= SHORT_HISTORY; v++) {
+            auto const val = kinet::byte_string(4, static_cast<uint8_t>(v));
+            primary_root = upsert_kv(primary_root, shared_key, val, v);
+        }
+
+        // Phase 2: Activate secondary. Both timelines advance together,
+        // exercising the combined GC boundary from the first block onward.
+        activate_secondary();
+
+        uint64_t const fork_version = SHORT_HISTORY + 1;
+        auto const secondary_key = 0xBBBBBBBB_bytes;
+
+        // Phase 3: Drive both timelines well past the history window.
+        // Primary's erase_versions_up_to_and_including fires each block,
+        // release_unreferenced_chunks must compute the combined-min across
+        // both timelines and protect secondary's chunks.
+        auto const final_version = fork_version + SHORT_HISTORY * 3;
+        for (uint64_t v = fork_version; v <= final_version; v++) {
+            auto const pval =
+                kinet::byte_string(4, static_cast<uint8_t>(v & 0xFF));
+            primary_root = upsert_kv(primary_root, shared_key, pval, v);
+
+            auto const sval =
+                kinet::byte_string(4, static_cast<uint8_t>(v & 0xFF));
+            secondary_root = upsert_kv(
+                secondary_root, secondary_key, sval, v, timeline_id::secondary);
+        }
+
+        // Phase 4: Verify secondary's data survived GC.
+        // Use final_version which is within primary's history window.
+        auto const sres = db_get(
+            db, secondary_root, NibblesView{secondary_key}, final_version);
+        ASSERT_TRUE(sres.has_value())
+            << "Secondary data lost after primary history expiration";
+
+        // Also verify via load_root_for_version
+        auto const loaded_secondary =
+            secondary_db->load_root_for_version(final_version);
+        ASSERT_NE(loaded_secondary, nullptr)
+            << "Secondary root lost after primary history expiration";
+        auto const sres2 = db_get(
+            db, loaded_secondary, NibblesView{secondary_key}, final_version);
+        ASSERT_TRUE(sres2.has_value());
+
+        // Primary's latest data should also be intact
+        auto const pres =
+            db_get(db, primary_root, NibblesView{shared_key}, final_version);
+        ASSERT_TRUE(pres.has_value());
+
+        // Verify timeline isolation: keys are independent
+        auto const cross =
+            db_get(db, primary_root, NibblesView{secondary_key}, final_version);
+        EXPECT_FALSE(cross.has_value());
+
+        deactivate_secondary();
+    }
+
+    // -------------------------------------------------------------------
+    // Test: Reactivate secondary after deactivation
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, reactivate_after_deactivate)
+    {
+        // Round 1: activate, upsert, deactivate
+        auto const k1 = 0x11111111_bytes;
+        primary_root = upsert_kv(primary_root, k1, k1, 0);
+        primary_root = upsert_kv(primary_root, k1, k1, 1);
+
+        activate_secondary();
+        auto const round1_key = 0xAAAAAAAA_bytes;
+        secondary_root = upsert_kv(
+            secondary_root, round1_key, round1_key, 0, timeline_id::secondary);
+        secondary_root = upsert_kv(
+            secondary_root, round1_key, round1_key, 1, timeline_id::secondary);
+
+        // Verify round 1 data
+        auto const res1 = db_get(
+            db_for(timeline_id::secondary),
+            secondary_root,
+            NibblesView{round1_key},
+            1);
+        ASSERT_TRUE(res1.has_value());
+
+        deactivate_secondary();
+        EXPECT_FALSE(db.timeline_active(timeline_id::secondary));
+
+        // Round 2: reactivate at a later version, upsert new data
+        primary_root = upsert_kv(primary_root, k1, k1, 2);
+        primary_root = upsert_kv(primary_root, k1, k1, 3);
+
+        activate_secondary();
+        EXPECT_TRUE(db.timeline_active(timeline_id::secondary));
+
+        auto const round2_key = 0xBBBBBBBB_bytes;
+        secondary_root = nullptr; // fresh secondary
+        secondary_root = upsert_kv(
+            secondary_root, round2_key, round2_key, 2, timeline_id::secondary);
+        secondary_root = upsert_kv(
+            secondary_root, round2_key, round2_key, 3, timeline_id::secondary);
+
+        // Verify round 2 data
+        auto const res2 = db_get(
+            db_for(timeline_id::secondary),
+            secondary_root,
+            NibblesView{round2_key},
+            3);
+        ASSERT_TRUE(res2.has_value());
+        EXPECT_EQ(res2.value(), round2_key);
+
+        // Round 1 key should NOT be in round 2 secondary (fresh start)
+        auto const res1_in_r2 = db_get(
+            db_for(timeline_id::secondary),
+            secondary_root,
+            NibblesView{round1_key},
+            3);
+        EXPECT_FALSE(res1_in_r2.has_value());
+
+        // Primary unaffected throughout
+        auto const pres = db_get(db, primary_root, NibblesView{k1}, 3);
+        ASSERT_TRUE(pres.has_value());
+
+        // Full lifecycle: promote round 2 secondary, then deactivate old
+        promote_secondary();
+        deactivate_secondary();
+        EXPECT_FALSE(db.timeline_active(timeline_id::secondary));
+    }
+
+    // -------------------------------------------------------------------
+    // Test: load_root_for_version boundary conditions on secondary
+    // -------------------------------------------------------------------
+    TEST_F(DualTimelineFixture, load_root_boundary_conditions)
+    {
+        // Seed primary with versions 0-5
+        auto const k1 = 0x11111111_bytes;
+        for (uint64_t v = 0; v <= 5; v++) {
+            primary_root = upsert_kv(primary_root, k1, k1, v);
+        }
+
+        // Activate secondary, upsert versions 3-5
+        activate_secondary();
+        auto const k2 = 0x22222222_bytes;
+        for (uint64_t v = 3; v <= 5; v++) {
+            secondary_root =
+                upsert_kv(secondary_root, k2, k2, v, timeline_id::secondary);
+        }
+
+        // Valid: load secondary at version within range
+        auto const loaded = secondary_db->load_root_for_version(4);
+        ASSERT_NE(loaded, nullptr);
+        auto const res = db_get(*secondary_db, loaded, NibblesView{k2}, 4);
+        ASSERT_TRUE(res.has_value());
+
+        // Below fork_version: secondary should return nullptr
+        auto const below_fork = secondary_db->load_root_for_version(2);
+        EXPECT_EQ(below_fork, nullptr)
+            << "load_root_for_version below fork_version should return nullptr";
+
+        // Above max_version: secondary should return nullptr
+        auto const above_max = secondary_db->load_root_for_version(6);
+        EXPECT_EQ(above_max, nullptr)
+            << "load_root_for_version above max_version should return nullptr";
+
+        // After deactivation the secondary Db is gone; verify via
+        // timeline_active that the secondary slot is inactive.
+        deactivate_secondary();
+        EXPECT_FALSE(db.timeline_active(timeline_id::secondary));
+    }
+
+    // -------------------------------------------------------------------
+    // Test: find on secondary root after its version expires from primary
+    // -------------------------------------------------------------------
+    TEST_F(
+        DualTimelineShortHistoryFixture,
+        find_on_secondary_after_version_expires_from_primary)
+    {
+        // Phase 1: Build primary up to the history window.
+        auto const shared_key = 0xAAAAAAAA_bytes;
+        for (uint64_t v = 0; v <= SHORT_HISTORY; v++) {
+            primary_root = upsert_kv(primary_root, shared_key, shared_key, v);
+        }
+
+        // Phase 2: Activate secondary and insert secondary-only data.
+        activate_secondary();
+
+        uint64_t const fork_version = SHORT_HISTORY + 1;
+
+        auto const secondary_key = 0xBBBBBBBB_bytes;
+        secondary_root = upsert_kv(
+            secondary_root,
+            secondary_key,
+            secondary_key,
+            fork_version,
+            timeline_id::secondary);
+        // Advance primary at fork_version too
+        primary_root =
+            upsert_kv(primary_root, shared_key, shared_key, fork_version);
+
+        // Phase 3: Drive primary past the history window so fork_version
+        // is erased from the primary ring.
+        for (uint64_t v = fork_version + 1;
+             v <= fork_version + SHORT_HISTORY + 5;
+             v++) {
+            primary_root = upsert_kv(primary_root, shared_key, shared_key, v);
+        }
+
+        // Sanity: fork_version is no longer in primary's history window
+        auto const primary_load = db.load_root_for_version(fork_version);
+        EXPECT_EQ(primary_load, nullptr)
+            << "fork_version should have been expired from primary";
+
+        // Phase 4: find on the secondary root MUST still work.
+        // The secondary root's version (fork_version) is expired from
+        // primary but valid in the secondary ring.
+        auto const sres = db_get(
+            *secondary_db,
+            secondary_root,
+            NibblesView{secondary_key},
+            fork_version);
+        ASSERT_TRUE(sres.has_value())
+            << "find on secondary root failed after its version expired "
+               "from primary";
+        EXPECT_EQ(sres.value(), secondary_key);
+
+        // Also verify load_root_for_version still works for secondary
+        auto const loaded = secondary_db->load_root_for_version(fork_version);
+        ASSERT_NE(loaded, nullptr);
+        auto const sres2 = db_get(
+            *secondary_db, loaded, NibblesView{secondary_key}, fork_version);
+        ASSERT_TRUE(sres2.has_value());
+        EXPECT_EQ(sres2.value(), secondary_key);
+
+        deactivate_secondary();
+    }
+
+    // -------------------------------------------------------------------
+    // Test: the secondary trims its OWN history window per-block, exactly
+    // like the primary (it no longer retains everything since the fork).
+    // -------------------------------------------------------------------
+    TEST_F(
+        DualTimelineShortHistoryFixture, secondary_trims_its_own_history_window)
+    {
+        auto const key = 0xAAAAAAAA_bytes;
+        for (uint64_t v = 0; v <= SHORT_HISTORY; v++) {
+            primary_root = upsert_kv(primary_root, key, key, v);
+        }
+        activate_secondary();
+
+        uint64_t const fork_version = SHORT_HISTORY + 1;
+        // Advance both timelines together well past SHORT_HISTORY.
+        auto const skey = 0xBBBBBBBB_bytes;
+        uint64_t const last = fork_version + 2 * SHORT_HISTORY;
+        for (uint64_t v = fork_version; v <= last; v++) {
+            primary_root = upsert_kv(primary_root, key, key, v);
+            secondary_root = upsert_kv(
+                secondary_root, skey, skey, v, timeline_id::secondary);
+        }
+
+        // A version older than the secondary's own window is gone from the
+        // secondary (it trimmed), just like the primary.
+        uint64_t const expired = last - SHORT_HISTORY - 1;
+        EXPECT_EQ(secondary_db->load_root_for_version(expired), nullptr)
+            << "secondary did not trim its own history window";
+        EXPECT_EQ(db.load_root_for_version(expired), nullptr);
+
+        // A version inside the window is still served by the secondary.
+        uint64_t const live = last - 1;
+        auto const loaded = secondary_db->load_root_for_version(live);
+        ASSERT_NE(loaded, nullptr);
+        auto const r = db_get(*secondary_db, loaded, NibblesView{skey}, live);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r.value(), skey);
+
+        deactivate_secondary();
+    }
+
+} // namespace

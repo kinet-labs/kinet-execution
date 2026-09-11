@@ -1,0 +1,11 @@
+[package]
+name = "kinet-cxx"
+version = "0.1.0"
+edition = "2021"
+links = "kinet_execution"
+
+[dependencies]
+tracing = { workspace = true, features = ["log"] }
+
+[build-dependencies]
+kinet-build = { workspace = true, features = ["bindgen", "cmake", "metadata"] }

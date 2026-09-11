@@ -1,0 +1,443 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include "fixture.hpp"
+
+#include <category/vm/runtime/call.hpp>
+#include <category/vm/runtime/keccak.hpp>
+#include <category/vm/runtime/transmute.hpp>
+
+#include <evmc/evmc.h>
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <limits>
+
+using namespace kinet;
+using namespace kinet::vm;
+using namespace kinet::vm::runtime;
+using namespace kinet::vm::compiler::test;
+
+TYPED_TEST(RuntimeTraitsTest, CallBasic)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_SPURIOUS_DRAGON);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::call<typename TestFixture::Trait>);
+
+    this->ctx_.gas_remaining = 100000;
+    this->host_.call_result = TestFixture::success_result(2000);
+    this->host_.access_account(address_from_uint256(0));
+
+    auto res = do_call(10000, 0, 0, 0, 0, 0, 32);
+
+    ASSERT_EQ(res, 1);
+    ASSERT_EQ(this->ctx_.result.status, StatusCode::Success);
+    ASSERT_EQ(this->ctx_.memory.size, 32);
+    for (auto i = 0u; i < 32; ++i) {
+        ASSERT_EQ(this->ctx_.memory.data[i], i);
+    }
+
+    constexpr auto gas_remaining = [] {
+        if constexpr (is_kinet_trait_v<typename TestFixture::Trait>) {
+            if constexpr (TestFixture::Trait::kinet_rev() >= KINET_NINE) {
+                return 92000;
+            }
+        }
+        return 91997;
+    }();
+
+    ASSERT_EQ(this->ctx_.gas_remaining, gas_remaining);
+}
+
+TYPED_TEST(RuntimeTraitsTest, CallWithValueCold)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_BERLIN);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::call<typename TestFixture::Trait>);
+
+    this->ctx_.gas_remaining = 100000;
+    this->host_.call_result = TestFixture::success_result(2000);
+
+    auto res = do_call(10000, 0, 1, 0, 0, 0, 0);
+
+    ASSERT_EQ(res, 1);
+    ASSERT_EQ(this->ctx_.result.status, StatusCode::Success);
+    ASSERT_EQ(this->ctx_.memory.size, 0);
+    constexpr auto gas_remaining = [] {
+        if constexpr (is_kinet_trait_v<typename TestFixture::Trait>) {
+            if constexpr (TestFixture::Trait::kinet_rev() >= KINET_SEVEN) {
+                return 48'000;
+            }
+        }
+        return 55'500;
+    }();
+    ASSERT_EQ(this->ctx_.gas_remaining, gas_remaining);
+}
+
+TYPED_TEST(RuntimeTraitsTest, CallGasLimit)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_BERLIN);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::call<typename TestFixture::Trait>);
+
+    this->ctx_.gas_remaining = 66500;
+    this->host_.call_result = TestFixture::success_result(2000);
+
+    auto res =
+        do_call(std::numeric_limits<std::int64_t>::max(), 0, 0, 0, 0, 0, 0);
+
+    ASSERT_EQ(res, 1);
+    ASSERT_EQ(this->ctx_.result.status, StatusCode::Success);
+    ASSERT_EQ(this->ctx_.memory.size, 0);
+
+    constexpr auto gas_remaining = [] {
+        if constexpr (is_kinet_trait_v<typename TestFixture::Trait>) {
+            if constexpr (TestFixture::Trait::kinet_rev() >= KINET_SEVEN) {
+                return 2882;
+            }
+        }
+        return 3000;
+    }();
+
+    ASSERT_EQ(this->ctx_.gas_remaining, gas_remaining);
+}
+
+TYPED_TEST(RuntimeTraitsTest, CallFailure)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_BERLIN);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::call<typename TestFixture::Trait>);
+
+    this->ctx_.gas_remaining = 100000;
+    this->host_.call_result = TestFixture::failure_result();
+
+    auto res = do_call(10000, 0, 0, 0, 0, 0, 0);
+    ASSERT_EQ(res, 0);
+    ASSERT_EQ(this->ctx_.result.status, StatusCode::Success);
+    ASSERT_EQ(this->ctx_.memory.size, 0);
+
+    constexpr auto gas_remaining = [] {
+        if constexpr (is_kinet_trait_v<typename TestFixture::Trait>) {
+            if constexpr (TestFixture::Trait::kinet_rev() >= KINET_SEVEN) {
+                return 80'000;
+            }
+        }
+        return 87'500;
+    }();
+    ASSERT_EQ(this->ctx_.gas_remaining, gas_remaining);
+}
+
+TYPED_TEST(RuntimeTraitsTest, DelegateCall)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_BERLIN);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::delegatecall<typename TestFixture::Trait>);
+
+    this->ctx_.gas_remaining = 100000;
+    this->host_.call_result = TestFixture::success_result(2000);
+
+    auto res = do_call(10000, 0, 0, 0, 0, 0);
+    ASSERT_EQ(res, 1);
+    ASSERT_EQ(this->ctx_.result.status, StatusCode::Success);
+    ASSERT_EQ(this->ctx_.memory.size, 0);
+    constexpr auto gas_remaining = [] {
+        if constexpr (is_kinet_trait_v<typename TestFixture::Trait>) {
+            if constexpr (TestFixture::Trait::kinet_rev() >= KINET_SEVEN) {
+                return 82'000;
+            }
+        }
+        return 89'500;
+    }();
+    ASSERT_EQ(this->ctx_.gas_remaining, gas_remaining);
+}
+
+TYPED_TEST(RuntimeTraitsTest, CallCode)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_BERLIN);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::callcode<typename TestFixture::Trait>);
+
+    this->ctx_.gas_remaining = 100000;
+    this->host_.call_result = TestFixture::success_result(2000);
+
+    auto res = do_call(10000, 0, 34, 120, 2, 3, 54);
+    ASSERT_EQ(res, 1);
+    ASSERT_EQ(this->ctx_.result.status, StatusCode::Success);
+    ASSERT_EQ(this->ctx_.memory.size, 128);
+    constexpr auto gas_remaining = [] {
+        if constexpr (is_kinet_trait_v<typename TestFixture::Trait>) {
+            if constexpr (TestFixture::Trait::kinet_rev() >= KINET_NINE) {
+                return 72'998;
+            }
+            if constexpr (TestFixture::Trait::kinet_rev() >= KINET_SEVEN) {
+                return 72'988;
+            }
+        }
+        return 80'488;
+    }();
+    ASSERT_EQ(this->ctx_.gas_remaining, gas_remaining);
+}
+
+TYPED_TEST(RuntimeTraitsTest, StaticCall)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_BERLIN);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::staticcall<typename TestFixture::Trait>);
+
+    this->ctx_.gas_remaining = 100000;
+    this->host_.call_result = TestFixture::success_result(2000);
+
+    auto res = do_call(10000, 0, 23, 238, 890, 67);
+    ASSERT_EQ(res, 1);
+    ASSERT_EQ(this->ctx_.result.status, StatusCode::Success);
+    ASSERT_EQ(this->ctx_.memory.size, 960);
+    constexpr auto gas_remaining = [] {
+        if constexpr (is_kinet_trait_v<typename TestFixture::Trait>) {
+            if constexpr (TestFixture::Trait::kinet_rev() >= KINET_NINE) {
+                return 81'985;
+            }
+            if constexpr (TestFixture::Trait::kinet_rev() >= KINET_SEVEN) {
+                return 81'909;
+            }
+        }
+        return 89'409;
+    }();
+    ASSERT_EQ(this->ctx_.gas_remaining, gas_remaining);
+}
+
+TYPED_TEST(RuntimeTraitsTest, CallTooDeep)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_BERLIN);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::call<typename TestFixture::Trait>);
+
+    this->ctx_.env.depth = 1024;
+    this->ctx_.gas_remaining = 100000;
+
+    auto res = do_call(10000, 0, 1, 0, 0, 0, 0);
+
+    ASSERT_EQ(res, 0);
+    ASSERT_EQ(this->ctx_.result.status, StatusCode::Success);
+    ASSERT_EQ(this->ctx_.memory.size, 0);
+    constexpr auto gas_remaining = [] {
+        if constexpr (is_kinet_trait_v<typename TestFixture::Trait>) {
+            if constexpr (TestFixture::Trait::kinet_rev() >= KINET_SEVEN) {
+                return 58'300;
+            }
+        }
+        return 65'800;
+    }();
+    ASSERT_EQ(this->ctx_.gas_remaining, gas_remaining);
+}
+
+TYPED_TEST(RuntimeTraitsTest, DelegatedCall)
+{
+    auto const delegate_addr = address_from_uint256(0xBEEF);
+    std::vector<uint8_t> coffee_code = {0xef, 0x01, 0x00};
+    coffee_code.append_range(delegate_addr.bytes);
+    ASSERT_EQ(coffee_code.size(), 23);
+    TestFixture::add_account_at(0xC0FFEE, coffee_code);
+
+    std::vector<uint8_t> beef_code = {0x00};
+    TestFixture::add_account_at(0xBEEF, beef_code);
+
+    ASSERT_EQ(this->host_.recorded_account_accesses.size(), 0);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::call<typename TestFixture::Trait>);
+    this->ctx_.gas_remaining = 100000;
+
+    auto res = do_call(10000, 0xC0FFEE, 1, 0, 0, 0, 0);
+
+    ASSERT_EQ(res, 1);
+    ASSERT_EQ(
+        this->host_.access_account(address_from_uint256(0xC0FFEE)),
+        EVMC_ACCESS_WARM);
+    TestFixture::assert_delegated(delegate_addr);
+}
+
+TYPED_TEST(RuntimeTraitsTest, DelegatedStaticCall)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_BYZANTIUM);
+
+    auto const delegate_addr = address_from_uint256(0xBEEF);
+    std::vector<uint8_t> coffee_code = {0xef, 0x01, 0x00};
+    coffee_code.append_range(delegate_addr.bytes);
+    ASSERT_EQ(coffee_code.size(), 23);
+    TestFixture::add_account_at(0xC0FFEE, coffee_code);
+
+    std::vector<uint8_t> beef_code = {0x00};
+    TestFixture::add_account_at(0xBEEF, beef_code);
+
+    ASSERT_EQ(this->host_.recorded_account_accesses.size(), 0);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::staticcall<typename TestFixture::Trait>);
+    this->ctx_.gas_remaining = 100000;
+
+    auto res = do_call(10000, 0xC0FFEE, 1, 0, 0, 0);
+
+    ASSERT_EQ(res, 1);
+    ASSERT_EQ(
+        this->host_.access_account(address_from_uint256(0xC0FFEE)),
+        EVMC_ACCESS_WARM);
+    TestFixture::assert_delegated(delegate_addr);
+}
+
+TYPED_TEST(RuntimeTraitsTest, DelegatedDelegateCall)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_BERLIN);
+
+    auto const delegate_addr = address_from_uint256(0xBEEF);
+    std::vector<uint8_t> coffee_code = {0xef, 0x01, 0x00};
+    coffee_code.append_range(delegate_addr.bytes);
+    ASSERT_EQ(coffee_code.size(), 23);
+    TestFixture::add_account_at(0xC0FFEE, coffee_code);
+
+    std::vector<uint8_t> beef_code = {0x00};
+    TestFixture::add_account_at(0xBEEF, beef_code);
+
+    ASSERT_EQ(this->host_.recorded_account_accesses.size(), 0);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::delegatecall<typename TestFixture::Trait>);
+    this->ctx_.gas_remaining = 100000;
+
+    auto res = do_call(10000, 0xC0FFEE, 1, 0, 0, 0);
+
+    ASSERT_EQ(res, 1);
+    ASSERT_EQ(
+        this->host_.access_account(address_from_uint256(0xC0FFEE)),
+        EVMC_ACCESS_WARM);
+    TestFixture::assert_delegated(delegate_addr);
+}
+
+TYPED_TEST(RuntimeTraitsTest, DelegatedCallcode)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_BERLIN);
+
+    auto const delegate_addr = address_from_uint256(0xBEEF);
+    std::vector<uint8_t> coffee_code = {0xef, 0x01, 0x00};
+    coffee_code.append_range(delegate_addr.bytes);
+    ASSERT_EQ(coffee_code.size(), 23);
+    TestFixture::add_account_at(0xC0FFEE, coffee_code);
+
+    std::vector<uint8_t> beef_code = {0x00};
+    TestFixture::add_account_at(0xBEEF, beef_code);
+
+    ASSERT_EQ(this->host_.recorded_account_accesses.size(), 0);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::callcode<typename TestFixture::Trait>);
+    this->ctx_.gas_remaining = 100000;
+
+    auto res = do_call(10000, 0xC0FFEE, 1, 0, 0, 0, 0);
+
+    ASSERT_EQ(res, 1);
+    ASSERT_EQ(
+        this->host_.access_account(address_from_uint256(0xC0FFEE)),
+        EVMC_ACCESS_WARM);
+    TestFixture::assert_delegated(delegate_addr);
+}
+
+TYPED_TEST(RuntimeTraitsTest, DelegatedCallPrecompile)
+{
+    auto const delegate_addr = address_from_uint256(0x01);
+    std::vector<uint8_t> coffee_code = {0xef, 0x01, 0x00};
+    coffee_code.append_range(delegate_addr.bytes);
+    ASSERT_EQ(coffee_code.size(), 23);
+    TestFixture::add_account_at(0xC0FFEE, coffee_code);
+
+    ASSERT_EQ(this->host_.recorded_account_accesses.size(), 0);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::call<typename TestFixture::Trait>);
+    this->ctx_.gas_remaining = 100000;
+
+    auto res = do_call(10000, 0xC0FFEE, 1, 0, 0, 0, 0);
+
+    ASSERT_EQ(res, 1);
+    ASSERT_EQ(this->ctx_.result.status, StatusCode::Success);
+    ASSERT_EQ(
+        this->host_.access_account(address_from_uint256(0xC0FFEE)),
+        EVMC_ACCESS_WARM);
+    ASSERT_EQ(this->host_.recorded_calls.size(), 1);
+
+    if constexpr (TestFixture::Trait::evm_rev() >= KINET_ETH_PRAGUE) {
+        ASSERT_EQ(
+            this->host_.recorded_calls[0].flags &
+                static_cast<uint32_t>(EVMC_DELEGATED),
+            static_cast<uint32_t>(EVMC_DELEGATED));
+    }
+    else {
+        ASSERT_NE(
+            this->host_.recorded_calls[0].flags &
+                static_cast<uint32_t>(EVMC_DELEGATED),
+            static_cast<uint32_t>(EVMC_DELEGATED));
+    }
+}
+
+TYPED_TEST(RuntimeTraitsTest, DelegatedCallBadCode1)
+{
+    std::array<uint8_t, 2> baad_addr{0xBA, 0xAD};
+    std::vector<uint8_t> coffee_code = {0xef, 0x01, 0x00};
+    coffee_code.append_range(baad_addr);
+    TestFixture::add_account_at(0xC0FFEE, coffee_code);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::call<typename TestFixture::Trait>);
+    this->ctx_.gas_remaining = 100000;
+    this->host_.call_result = TestFixture::success_result(2000);
+
+    auto res = do_call(10000, 0xC0FFEE, 1, 0, 0, 0, 0);
+
+    ASSERT_EQ(res, 1);
+    ASSERT_EQ(this->ctx_.result.status, StatusCode::Success);
+    ASSERT_EQ(this->host_.recorded_calls.size(), 1);
+    ASSERT_EQ(
+        this->host_.recorded_calls[0].flags &
+            static_cast<uint32_t>(EVMC_DELEGATED),
+        0);
+}
+
+TYPED_TEST(RuntimeTraitsTest, DelegatedCallBadCode2)
+{
+    std::vector<uint8_t> coffee_code = {0xef, 0x01, 0x00};
+    TestFixture::add_account_at(0xC0FFEE, coffee_code);
+
+    auto do_call = TestFixture::wrap(
+        kinet::vm::runtime::call<typename TestFixture::Trait>);
+    this->ctx_.gas_remaining = 100000;
+    this->host_.call_result = TestFixture::success_result(2000);
+
+    auto res = do_call(10000, 0xC0FFEE, 1, 0, 0, 0, 0);
+
+    ASSERT_EQ(res, 1);
+    ASSERT_EQ(this->ctx_.result.status, StatusCode::Success);
+    ASSERT_EQ(this->host_.recorded_calls.size(), 1);
+    ASSERT_EQ(
+        this->host_.recorded_calls[0].flags &
+            static_cast<uint32_t>(EVMC_DELEGATED),
+        0);
+}

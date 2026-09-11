@@ -1,0 +1,746 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include "assertions.hpp"
+#include "compiler_hook.hpp"
+#include "generator.hpp"
+
+#include <test/utils/test_state.hpp>
+#include <test/vm/utils/test_block_hash_buffer.hpp>
+#include <test/vm/utils/test_host.hpp>
+
+#include <category/core/address.hpp>
+#include <category/core/assert.h>
+#include <category/core/bytes.hpp>
+#include <category/execution/ethereum/chain/ethereum_mainnet.hpp>
+#include <category/execution/ethereum/core/transaction.hpp>
+#include <category/execution/ethereum/create_contract_address.hpp>
+#include <category/execution/ethereum/db/test/commit_simple.hpp>
+#include <category/execution/ethereum/state2/block_state.hpp>
+#include <category/execution/ethereum/state3/state.hpp>
+#include <category/vm/compiler/ir/x86/types.hpp>
+#include <category/vm/evm/opcodes.hpp>
+#include <category/vm/evm/revision.h>
+#include <category/vm/fuzzing/choice.hpp>
+#include <category/vm/memory_pool.hpp>
+#include <category/vm/utils/debug.hpp>
+
+#include <evmc/evmc.h>
+#include <evmc/evmc.hpp>
+
+#include <CLI/CLI.hpp>
+#include <category/core/int.hpp>
+
+#include <kinetml_evm/kinetml_evm.hpp>
+
+#include <algorithm>
+#include <array>
+#include <bits/chrono.h>
+#include <cassert>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <format>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <random>
+#include <span>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+using namespace kinet;
+using namespace kinet::literals;
+using namespace kinet::vm::fuzzing;
+using namespace std::chrono_literals;
+
+using kinet::test::TestBlockHashBuffer;
+using enum kinet::vm::compiler::EvmOpCode;
+using kinet::vm::compiler::native::CompilerConfig;
+
+struct FuzzerTestState
+{
+    kinet::test::TestState<false> test_state = {};
+    vm::VM vm;
+
+    explicit FuzzerTestState(vm::VM::Mode mode)
+        : vm{mode}
+    {
+    }
+};
+
+using FuzzerTestStateRef = std::shared_ptr<FuzzerTestState>;
+
+struct InterpreterFuzzerVmVariant
+{
+};
+
+enum class FuzzerVmTag
+{
+    Compiler,
+    Interpreter
+};
+
+class BlockNumberState
+{
+    uint64_t prev_block_number{};
+
+public:
+    uint64_t next()
+    {
+        return ++prev_block_number;
+    }
+};
+
+static constexpr std::string_view to_string(evmc_status_code const sc) noexcept
+{
+    switch (sc) {
+    case EVMC_SUCCESS:
+        return "SUCCESS";
+    case EVMC_FAILURE:
+        return "FAILURE";
+    case EVMC_REVERT:
+        return "REVERT";
+    case EVMC_OUT_OF_GAS:
+        return "OUT_OF_GAS";
+    case EVMC_INVALID_INSTRUCTION:
+        return "INVALID_INSTRUCTION";
+    case EVMC_UNDEFINED_INSTRUCTION:
+        return "UNDEFINED_INSTRUCTION";
+    case EVMC_STACK_OVERFLOW:
+        return "STACK_OVERFLOW";
+    case EVMC_STACK_UNDERFLOW:
+        return "STACK_UNDERFLOW";
+    case EVMC_BAD_JUMP_DESTINATION:
+        return "BAD_JUMP_DESTINATION";
+    case EVMC_INVALID_MEMORY_ACCESS:
+        return "INVALID_MEMORY_ACCESS";
+    case EVMC_CALL_DEPTH_EXCEEDED:
+        return "CALL_DEPTH_EXCEEDED";
+    case EVMC_STATIC_MODE_VIOLATION:
+        return "STATIC_MODE_VIOLATION";
+    case EVMC_PRECOMPILE_FAILURE:
+        return "PRECOMPILE_FAILURE";
+    case EVMC_ARGUMENT_OUT_OF_RANGE:
+        return "ARGUMENT_OUT_OF_RANGE";
+    case EVMC_INSUFFICIENT_BALANCE:
+        return "INSUFFICIENT_BALANCE";
+    case EVMC_INTERNAL_ERROR:
+        return "INTERNAL_ERROR";
+    case EVMC_REJECTED:
+        return "REJECTED";
+    case EVMC_OUT_OF_MEMORY:
+        return "OUT_OF_MEMORY";
+    default:
+        return "OTHER";
+    }
+}
+
+static constexpr Address genesis_address =
+    kinet::address_from_hex("0xBEEFCAFE000000000000000000000000BA5EBA11");
+
+struct TransitionState
+{
+    FuzzerTestStateRef test_state;
+    BlockState block_state;
+    State state;
+
+    TransitionState(FuzzerTestStateRef ts)
+        : test_state{ts}
+        , block_state{ts->test_state.trie_db, ts->vm}
+        , state{block_state, Incarnation{0, 0}}
+    {
+        state.push();
+    }
+
+    void accept(uint64_t block_number)
+    {
+        state.pop_accept();
+        commit(block_number);
+    }
+
+    void reject()
+    {
+        state.pop_reject();
+    }
+
+private:
+    void commit(uint64_t block_number)
+    {
+        block_state.merge(state);
+        auto [released_state, released_code, _] =
+            std::move(block_state).release();
+        test::commit_simple(
+            test_state->test_state.trie_db,
+            *released_state,
+            released_code,
+            NULL_HASH_BLAKE3,
+            BlockHeader{.number = block_number});
+    }
+};
+
+static constexpr auto block_gas_limit = 300'000'000;
+
+static Transaction
+tx_from(TransitionState &tstate, evmc_message const &msg) noexcept
+{
+    auto tx = Transaction{};
+    tx.to = msg.recipient;
+    tx.gas_limit = block_gas_limit;
+    tx.nonce = tstate.state.get_nonce(msg.sender);
+    return tx;
+}
+
+template <Traits traits>
+static evmc::Result message_call(
+    TransitionState &tstate, BlockHashBuffer const &block_hash_buffer,
+    Transaction const &tx, evmc_message const &msg,
+    BlockHeader const &block_header)
+{
+    std::optional<uint256_t> base_fee_per_gas{};
+    std::vector<std::optional<Address>> authorities{};
+    EthereumMainnet const chain{};
+
+    auto test_host = test::TestHost<traits>{
+        block_hash_buffer,
+        tstate.state,
+        tx,
+        msg.sender,
+        base_fee_per_gas,
+        authorities,
+        block_header,
+        chain};
+    auto &host = test_host.get_evmc_host();
+    return host.call(msg);
+}
+
+template <Traits traits>
+static evmc::Result transition(
+    TransitionState &tstate, evmc_message const &msg,
+    BlockHashBuffer const &block_hash_buffer, BlockHeader const &block_header)
+{
+    auto tx = tx_from(tstate, msg);
+
+    KINET_ASSERT(tx.to.has_value());
+    tstate.state.add_to_balance(*tx.to, 0); // initialize the account
+    tstate.state.access_account(*tx.to);
+
+    tstate.state.access_account(msg.sender);
+    tstate.state.add_to_balance(msg.sender, load_be<uint256_t>(msg.value));
+    tstate.state.set_nonce(msg.sender, tstate.state.get_nonce(msg.sender) + 1);
+
+    return message_call<traits>(
+        tstate, block_hash_buffer, tx, msg, block_header);
+}
+
+static Address deploy_contract(
+    TransitionState &tstate, std::span<std::uint8_t const> const code)
+{
+    auto const nonce = tstate.state.get_nonce(genesis_address);
+    tstate.state.set_nonce(genesis_address, nonce + 1);
+
+    auto const create_address = create_contract_address(genesis_address, nonce);
+    KINET_ASSERT(!tstate.state.account_exists(create_address));
+
+    tstate.state.create_account_no_rollback(create_address);
+    tstate.state.set_code(create_address, {code.data(), code.size()});
+
+    KINET_ASSERT(tstate.state.account_exists(create_address));
+    auto const vcode = tstate.state.get_code(create_address);
+    auto const &icode = vcode->intercode();
+    KINET_ASSERT(
+        byte_string_view(code.data(), code.size()) ==
+        byte_string_view(icode->code(), icode->size()));
+
+    return create_address;
+}
+
+static Address deploy_contracts(
+    FuzzerTestStateRef spec_state, FuzzerTestStateRef kinet_state,
+    std::span<std::uint8_t const> const code, uint64_t block_number)
+{
+    TransitionState spec_tstate{spec_state};
+    TransitionState kinet_tstate{kinet_state};
+    auto const a = deploy_contract(spec_tstate, code);
+    auto const a1 = deploy_contract(kinet_tstate, code);
+    KINET_ASSERT(a == a1);
+    assert_equal(spec_tstate.state, kinet_tstate.state);
+    spec_tstate.accept(block_number);
+    kinet_tstate.accept(block_number);
+    return a;
+}
+
+static Address
+deploy_delegated_contract(TransitionState &tstate, Address const &delegatee)
+{
+    std::vector<uint8_t> code = {0xef, 0x01, 0x00};
+    code.append_range(delegatee.bytes);
+    KINET_ASSERT(code.size() == 23);
+    return deploy_contract(tstate, code);
+}
+
+static Address deploy_delegated_contracts(
+    FuzzerTestStateRef spec_state, FuzzerTestStateRef kinet_state,
+    Address delegatee, uint64_t block_number)
+{
+    TransitionState spec_tstate{spec_state};
+    TransitionState kinet_tstate{kinet_state};
+    auto const a = deploy_delegated_contract(spec_tstate, delegatee);
+    auto const a1 = deploy_delegated_contract(kinet_tstate, delegatee);
+    KINET_ASSERT(a == a1);
+    assert_equal(spec_tstate.state, kinet_tstate.state);
+    spec_tstate.accept(block_number);
+    kinet_tstate.accept(block_number);
+    return a;
+}
+
+static void set_genesis_balance(FuzzerTestStateRef state, uint64_t block_number)
+{
+    // Set genesis account balance to some large balance, sufficiently small
+    // so that token supply will not overflow uint256.
+    constexpr auto balance = std::numeric_limits<uint256_t>::max() / 2;
+    TransitionState tstate{state};
+    tstate.state.add_to_balance(genesis_address, balance);
+    KINET_ASSERT(tstate.state.get_balance(genesis_address) == balance);
+    tstate.accept(block_number);
+}
+
+static void set_genesis_balances(
+    FuzzerTestStateRef spec_state, FuzzerTestStateRef kinet_state,
+    uint64_t block_number)
+{
+    set_genesis_balance(spec_state, block_number);
+    set_genesis_balance(kinet_state, block_number);
+}
+
+using random_engine_t = std::mt19937_64;
+
+namespace
+{
+    struct arguments
+    {
+        using seed_t = random_engine_t::result_type;
+        static constexpr seed_t default_seed =
+            std::numeric_limits<seed_t>::max();
+
+        int64_t iterations_per_run = 100;
+        std::size_t messages = 4;
+        seed_t seed = default_seed;
+        std::size_t runs = std::numeric_limits<std::size_t>::max();
+        bool print_stats = false;
+        FuzzerVmTag implementation = FuzzerVmTag::Compiler;
+        kinet_revision revision = KINET_EIGHT;
+        std::optional<std::string> focus_path = std::nullopt;
+        std::optional<GeneratorFocus> focus = std::nullopt;
+
+        void set_random_seed_if_default()
+        {
+            if (seed == default_seed) {
+                seed = std::random_device()();
+            }
+        }
+    };
+}
+
+static arguments parse_args(int const argc, char **const argv)
+{
+    auto app = CLI::App("Kinet VM Fuzzer");
+    auto args = arguments{};
+
+    app.add_option(
+        "-i,--iterations-per-run",
+        args.iterations_per_run,
+        "Number of fuzz iterations in each run (default 100)");
+
+    app.add_option(
+        "-n,--messages",
+        args.messages,
+        "Number of messages to send per iteration (default 4)");
+
+    app.add_option(
+        "--seed",
+        args.seed,
+        "Seed to use for reproducible fuzzing (random by default)");
+
+    app.add_option("--focus", args.focus_path, "Path to the JSON focus config");
+
+    auto const impl_map = std::map<std::string, FuzzerVmTag>{
+        {"interpreter", FuzzerVmTag::Interpreter},
+        {"compiler", FuzzerVmTag::Compiler},
+    };
+
+    app.add_option(
+           "--implementation", args.implementation, "VM implementation to fuzz")
+        ->transform(CLI::CheckedTransformer(impl_map, CLI::ignore_case));
+
+    app.add_option(
+        "-r,--runs",
+        args.runs,
+        "Number of runs (evm state is reset between runs) (unbounded by "
+        "default)");
+
+    app.add_flag(
+        "--print-stats",
+        args.print_stats,
+        "Print message result statistics when logging");
+
+    auto const rev_map =
+        std::map<std::string, kinet_revision>{{"KINET_EIGHT", KINET_EIGHT}};
+    app.add_option(
+           "--revision",
+           args.revision,
+           std::format(
+               "Set Kinet revision (default: {})",
+               kinet_revision_to_string(args.revision)))
+        ->transform(CLI::CheckedTransformer(rev_map, CLI::ignore_case))
+        ->option_text("TEXT");
+
+    try {
+        app.parse(argc, argv);
+    }
+    catch (CLI::ParseError const &e) {
+        std::exit(app.exit(e));
+    }
+
+    args.set_random_seed_if_default();
+    return args;
+}
+
+template <Traits traits>
+static evmc_status_code fuzz_iteration(
+    evmc_message const &msg, BlockHashBuffer const &block_hash_buffer,
+    FuzzerTestStateRef spec_state, FuzzerTestStateRef kinet_state,
+    BlockHeader const &block_header)
+{
+    KINET_ASSERT(
+        spec_state->test_state.trie_db.state_root() ==
+        kinet_state->test_state.trie_db.state_root());
+
+    TransitionState spec_tstate{spec_state};
+    auto const spec_result =
+        transition<traits>(spec_tstate, msg, block_hash_buffer, block_header);
+
+    TransitionState kinet_tstate{kinet_state};
+    auto const kinet_result =
+        transition<traits>(kinet_tstate, msg, block_hash_buffer, block_header);
+
+    // Ideally we will verify out-of-gas error strictly when testing the
+    // interpreter. However the kinet-ml evm does not agree on specific error
+    // codes at present.
+    assert_equal(spec_result, kinet_result, false);
+
+    assert_equal(spec_tstate.state, kinet_tstate.state);
+
+    if (kinet_result.status_code == EVMC_SUCCESS) {
+        spec_tstate.accept(block_header.number);
+        kinet_tstate.accept(block_header.number);
+    }
+    else {
+        spec_tstate.reject();
+        kinet_tstate.reject();
+    }
+
+    KINET_ASSERT(
+        spec_state->test_state.trie_db.state_root() ==
+        kinet_state->test_state.trie_db.state_root());
+
+    return spec_result.status_code;
+}
+
+static void
+log(std::chrono::high_resolution_clock::time_point start, arguments const &args,
+    std::unordered_map<evmc_status_code, std::size_t> const &exit_code_stats,
+    std::size_t const run_index, std::size_t const total_messages)
+{
+    using namespace std::chrono;
+
+    constexpr auto ns_factor = duration_cast<nanoseconds>(1s).count();
+
+    auto const end = high_resolution_clock::now();
+    auto const diff = (end - start).count();
+    auto const per_contract = diff / args.iterations_per_run;
+
+    std::cerr << std::format(
+        "[{}]: {:.4f}s / iteration\n",
+        run_index + 1,
+        static_cast<double>(per_contract) / ns_factor);
+
+    if (args.print_stats) {
+        for (auto const &[k, v] : exit_code_stats) {
+            auto const percentage =
+                (static_cast<double>(v) / static_cast<double>(total_messages)) *
+                100;
+            std::cerr << std::format(
+                "  {:<21}: {:.2f}%\n", to_string(k), percentage);
+        }
+    }
+}
+
+template <typename Engine>
+static CompilerConfig create_compiler_config(Engine &engine)
+{
+    return {
+        .runtime_debug_trace =
+            vm::utils::is_compiler_runtime_debug_trace_enabled,
+        .max_code_size_offset = vm::interpreter::code_size_t::max(),
+        .post_instruction_emit_hook = compiler_emit_hook(engine)};
+}
+
+// Coin toss, biased whenever p != 0.5
+template <typename Engine>
+static bool toss(Engine &engine, double p)
+{
+    std::bernoulli_distribution dist(p);
+    return dist(engine);
+}
+
+template <typename Engine>
+static TestBlockHashBuffer generate_test_block_hash_buffer(Engine &engine)
+{
+    TestBlockHashBuffer b;
+    for (size_t i = 0; i < BlockHashBuffer::N; ++i) {
+        auto pre_hash = some_good_constant(engine).value;
+        if (!pre_hash) {
+            // Update pre_hash if it is zero, because at the time of writing,
+            // if pre_hash is zero then we will hit an assertion failure later
+            pre_hash = random_constant(engine).value;
+            KINET_ASSERT(!!pre_hash);
+        }
+        b.set_blockhash(i, store_be_as<bytes32_t>(pre_hash));
+    }
+    return b;
+}
+
+template <typename Engine>
+static BlockHeader generate_block_header(Engine &engine, uint64_t block_number)
+{
+    auto pre_difficulty =
+        store_be_as<bytes32_t>(some_good_constant(engine).value);
+    return BlockHeader{
+        .parent_hash = store_be_as<bytes32_t>(some_good_constant(engine).value),
+        .ommers_hash = store_be_as<bytes32_t>(some_good_constant(engine).value),
+        .state_root = store_be_as<bytes32_t>(some_good_constant(engine).value),
+        .transactions_root =
+            store_be_as<bytes32_t>(some_good_constant(engine).value),
+        .receipts_root =
+            store_be_as<bytes32_t>(some_good_constant(engine).value),
+        .prev_randao = store_be_as<bytes32_t>(some_good_constant(engine).value),
+        .difficulty = load_be<uint256_t>(pre_difficulty),
+        .number = block_number,
+        .gas_limit = random_uint32(engine) % (block_gas_limit + 1),
+        .gas_used = random_uint32(engine) % (block_gas_limit + 1),
+        .timestamp = random_uint64(engine),
+        .beneficiary = random_address(engine),
+    };
+}
+
+class TimeoutWaitThread
+{
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    bool done_;
+    std::thread thread_;
+
+    // A long timeout is required because the execution engines are running
+    // in debug_tstore mode, which causes transient storage operations, not
+    // accounted for by gas.
+    static constexpr auto timeout_ = std::chrono::minutes{7};
+
+public:
+    TimeoutWaitThread()
+        : done_{}
+        , thread_{[this] { this->timeout_wait(); }}
+    {
+    }
+
+    ~TimeoutWaitThread()
+    {
+        {
+            std::unique_lock<std::mutex> lock{mtx_};
+            done_ = true;
+        }
+        cv_.notify_one();
+        thread_.join();
+    }
+
+private:
+    void timeout_wait()
+    {
+        std::unique_lock<std::mutex> lock{mtx_};
+        auto const done =
+            cv_.wait_for(lock, timeout_, [this] { return done_; });
+        if (!done) {
+            std::cerr << "FUZZER TIMEOUT" << std::endl;
+            std::terminate();
+        }
+    }
+};
+
+template <Traits traits>
+static void do_run(
+    kinet::vm::MemoryPool &memory_pool, std::size_t const run_index,
+    arguments const &args)
+{
+    auto engine = random_engine_t(args.seed);
+
+    auto spec_vm = evmc::VM(evmc_create_kinetml_evm_debug_tstore());
+    auto spec_state =
+        std::make_shared<FuzzerTestState>(vm::VM::InterpreterOnly);
+    // VM mode of spec_state is ignored by overriding execute:
+    spec_state->vm.debug_set_execute_override(
+        [&spec_vm](
+            auto const *const host,
+            auto *const context,
+            auto const rev,
+            auto const *const msg,
+            auto const *const code,
+            auto const code_size) -> evmc::Result {
+            return spec_vm.execute(
+                *host, context, to_evmc_revision(rev), *msg, code, code_size);
+        });
+
+    auto kinet_state = [&] {
+        if (args.implementation == FuzzerVmTag::Compiler) {
+            auto s = std::make_shared<FuzzerTestState>(vm::VM::CompilerOnly);
+            s->vm.set_compiler_config(create_compiler_config(engine));
+            return s;
+        }
+        return std::make_shared<FuzzerTestState>(vm::VM::InterpreterOnly);
+    }();
+
+    BlockNumberState block_counter;
+
+    set_genesis_balances(spec_state, kinet_state, block_counter.next());
+
+    auto contract_addresses = std::vector<Address>{};
+    auto known_addresses = std::vector<Address>{};
+
+    auto exit_code_stats = std::unordered_map<evmc_status_code, std::size_t>{};
+    auto total_messages = std::size_t{0};
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    auto block_hash_buffer = generate_test_block_hash_buffer(engine);
+
+    for (auto i = 0; i < args.iterations_per_run; ++i) {
+        TimeoutWaitThread timeout_wait_thread;
+        using kinet::vm::fuzzing::GeneratorFocus;
+        auto const &focus =
+            args.focus
+                ? *args.focus
+                : discrete_choice<GeneratorFocus>(
+                      engine,
+                      [](auto &) { return generic_focus; },
+                      Choice(0.60, [](auto &) { return pow2_focus; }),
+                      Choice(0.05, [](auto &) { return dyn_jump_focus; }));
+
+        if (toss(engine, 0.001)) {
+            auto precompile =
+                kinet::vm::fuzzing::generate_precompile_address<traits>(engine);
+            auto const a = deploy_delegated_contracts(
+                spec_state, kinet_state, precompile, block_counter.next());
+            known_addresses.push_back(a);
+        }
+
+        for (;;) {
+            auto const contract = kinet::vm::fuzzing::generate_program<traits>(
+                focus, engine, known_addresses);
+
+            auto const a = deploy_contracts(
+                spec_state, kinet_state, contract, block_counter.next());
+            contract_addresses.push_back(a);
+            known_addresses.push_back(a);
+
+            if (toss(engine, 0.2)) {
+                auto const b = deploy_delegated_contracts(
+                    spec_state, kinet_state, a, block_counter.next());
+                known_addresses.push_back(b);
+            }
+            break;
+        }
+
+        for (auto j = 0u; j < args.messages; ++j) {
+            auto msg_memory = memory_pool.alloc_ref();
+            auto msg = [&] {
+                TransitionState tstate{kinet_state};
+                return kinet::vm::fuzzing::generate_message(
+                    focus,
+                    engine,
+                    contract_addresses,
+                    {genesis_address},
+                    [&](auto const &address) {
+                        return tstate.state.get_code(address);
+                    },
+                    msg_memory.get(),
+                    memory_pool.alloc_capacity());
+            }();
+            ++total_messages;
+
+            auto const block_header =
+                generate_block_header(engine, block_counter.next());
+            block_hash_buffer.set_block_number(block_header.number);
+            auto const ec = fuzz_iteration<traits>(
+                *msg, block_hash_buffer, spec_state, kinet_state, block_header);
+            ++exit_code_stats[ec];
+        }
+    }
+
+    log(start_time, args, exit_code_stats, run_index, total_messages);
+}
+
+static void run_switch(
+    kinet_revision rev, kinet::vm::MemoryPool &memory_pool,
+    std::size_t const run_index, arguments const &args)
+{
+    KINET_ASSERT(rev == KINET_EIGHT);
+    do_run<KinetTraits<KINET_EIGHT>>(memory_pool, run_index, args);
+}
+
+static void run_loop(int argc, char **argv)
+{
+    kinet::vm::MemoryPool memory_pool{512};
+    auto args = parse_args(argc, argv);
+    if (args.focus_path) {
+        args.focus = parse_generator_focus(*args.focus_path);
+    }
+    auto const *msg_rev = kinet_revision_to_string(args.revision);
+    for (size_t i = 0u; i < args.runs; ++i) {
+        std::cerr << std::format(
+            "Fuzzing with seed @ {}: {}\n", msg_rev, args.seed);
+        run_switch(args.revision, memory_pool, i, args);
+        args.seed = random_engine_t(args.seed)();
+    }
+}
+
+int main(int argc, char **argv)
+{
+    if (kinet::vm::utils::is_fuzzing_kinet_vm) {
+        run_loop(argc, argv);
+        return 0;
+    }
+    std::cerr << "\nFuzzer not started:\n"
+                 "Make sure to configure with -DKINET_COMPILER_TESTING=ON and\n"
+                 "set environment variable KINET_COMPILER_FUZZING=1 before\n"
+                 "starting the fuzzer\n";
+    return 1;
+}

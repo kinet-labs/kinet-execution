@@ -1,0 +1,71 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/bytes.hpp>
+#include <category/core/int.hpp>
+#include <category/core/runtime/uint256.hpp>
+#include <category/vm/runtime/environment.hpp>
+#include <category/vm/runtime/transmute.hpp>
+#include <category/vm/runtime/types.hpp>
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+
+namespace kinet::vm::runtime
+{
+    void blockhash(
+        Context *const ctx, uint256_t *const result_ptr,
+        uint256_t const *const block_number_ptr)
+    {
+        if (!is_bounded_by_bits<63>(*block_number_ptr)) {
+            *result_ptr = 0;
+            return;
+        }
+
+        auto const block_number = static_cast<int64_t>(*block_number_ptr);
+        auto const &tx_context = *ctx->env.tx_context;
+
+        auto const first_allowed_block =
+            std::max(tx_context.block_number - 256, 0L);
+        if (block_number >= first_allowed_block &&
+            block_number < tx_context.block_number) {
+            auto const hash = static_cast<bytes32_t>(
+                ctx->host->get_block_hash(ctx->context, block_number));
+            *result_ptr = load_be<uint256_t>(hash);
+        }
+        else {
+            *result_ptr = 0;
+        }
+    }
+
+    void selfbalance(Context *const ctx, uint256_t *const result_ptr)
+    {
+        auto const balance = static_cast<bytes32_t>(
+            ctx->host->get_balance(ctx->context, &ctx->env.recipient));
+        *result_ptr = load_be<uint256_t>(balance);
+    }
+
+    void blobhash(
+        Context *const ctx, uint256_t *const result_ptr,
+        uint256_t const *const index)
+    {
+        auto const &c = *ctx->env.tx_context;
+        *result_ptr = (*index < c.blob_hashes_count)
+                          ? load_be<uint256_t>(static_cast<bytes32_t>(
+                                c.blob_hashes[static_cast<size_t>(*index)]))
+                          : 0;
+    }
+}

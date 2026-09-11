@@ -1,0 +1,839 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/assert.h>
+#include <category/core/byte_string.hpp>
+#include <category/core/config.hpp>
+#include <category/core/endian.hpp> // little endian
+#include <category/core/log.hpp>
+#include <category/core/nibble.h>
+#include <category/core/runtime/unaligned.hpp>
+#include <category/execution/ethereum/core/rlp/block_rlp.hpp>
+#include <category/execution/ethereum/db/db_snapshot.h>
+#include <category/execution/ethereum/db/state_machine_init.hpp>
+#include <category/execution/ethereum/db/util.hpp>
+#include <category/execution/kinet/db/state_machine_init.hpp>
+#include <category/execution/kinet/db/storage_page.hpp>
+#include <category/mpt/db.hpp>
+#include <category/mpt/ondisk_db_config.hpp>
+
+#include <ankerl/unordered_dense.h>
+
+#include <deque>
+#include <limits>
+#include <memory>
+#include <optional>
+
+struct kinet_db_snapshot_loader
+{
+    uint64_t block;
+    kinet::mpt::Db db;
+    kinet::mpt::Node::SharedPtr root;
+    std::array<kinet::byte_string, 256> eth_headers;
+    std::deque<kinet_hash256> hash_alloc;
+    std::deque<kinet::mpt::Update> update_alloc;
+    std::deque<kinet::byte_string> bytes_alloc;
+    std::array<
+        ankerl::unordered_dense::segmented_map<uint64_t, kinet::mpt::Update>,
+        KINET_SNAPSHOT_SHARDS>
+        account_offset_to_update;
+    // Per-shard page accumulator used only when page_encoded. Maps
+    // account_offset -> (page_key -> assembled storage_page_t).
+    std::array<
+        ankerl::unordered_dense::segmented_map<
+            uint64_t, ankerl::unordered_dense::map<
+                          kinet::bytes32_t, kinet::storage_page_t>>,
+        KINET_SNAPSHOT_SHARDS>
+        page_accumulator;
+    kinet::mpt::UpdateList state_updates;
+    kinet::mpt::UpdateList code_updates;
+    uint64_t bytes_read;
+
+    kinet_db_snapshot_loader(
+        uint64_t const block, char const *const *const dbname_paths,
+        size_t const len, unsigned const sq_thread_cpu,
+        bool const load_to_secondary)
+        : block{block}
+        , db{open_target_db(
+              dbname_paths, len, sq_thread_cpu, load_to_secondary)}
+        , bytes_read{0}
+    {
+    }
+
+    bool page_encoded() const
+    {
+        return db.state_machine_type() == kinet::mpt::state_machine_kind::kinet;
+    }
+
+private:
+    static kinet::mpt::Db open_target_db(
+        char const *const *const dbname_paths, size_t const len,
+        unsigned const sq_thread_cpu, bool const load_to_secondary)
+    {
+        kinet::mpt::Db primary{kinet::mpt::OnDiskDbConfig{
+            .append = true,
+            .compaction = false,
+            .rd_buffers = 8192,
+            .wr_buffers = 32,
+            .uring_entries = 128,
+            .sq_thread_cpu =
+                sq_thread_cpu == std::numeric_limits<unsigned>::max()
+                    ? std::nullopt
+                    : std::make_optional(sq_thread_cpu),
+            .dbname_paths = {dbname_paths, dbname_paths + len}}};
+        if (!load_to_secondary) {
+            return primary;
+        }
+        auto secondary = primary.open_secondary_timeline();
+        KINET_ASSERT_PRINTF(
+            secondary.has_value(),
+            "secondary timeline is not active; activate it and stamp its "
+            "state_machine_kind using kinet-mpt tool before loading a snapshot "
+            "into it");
+        return std::move(*secondary);
+    }
+};
+
+KINET_ANONYMOUS_NAMESPACE_BEGIN
+
+uint64_t get_shard(kinet::mpt::NibblesView const path)
+{
+    uint64_t ret = 0;
+    for (unsigned i = 0; i < KINET_SNAPSHOT_SHARD_NIBBLES; ++i) {
+        ret <<= 4;
+        ret |= path.get(i);
+    }
+    KINET_ASSERT(ret < KINET_SNAPSHOT_SHARDS);
+    return ret;
+}
+
+// When the target is page-encoded, drain the accumulator into per-account
+// `next` lists. Each page becomes one Update keyed by keccak256(page_key)
+// with value encode_storage_page_db(page_key, page) (or std::nullopt if the
+// page is empty so the entry is a deletion). The encoded byte_strings are
+// kept alive in loader->bytes_alloc until the upsert completes; the Update
+// nodes are kept in loader->update_alloc for the same reason.
+void kinet_db_snapshot_loader_finalize_pages(
+    kinet_db_snapshot_loader *const loader)
+{
+    using namespace kinet;
+    using namespace kinet::mpt;
+    if (!loader->page_encoded()) {
+        return;
+    }
+    for (size_t shard = 0; shard < KINET_SNAPSHOT_SHARDS; ++shard) {
+        auto &shard_pages = loader->page_accumulator.at(shard);
+        if (shard_pages.empty()) {
+            continue;
+        }
+        auto &shard_accounts = loader->account_offset_to_update.at(shard);
+        for (auto &[account_offset, pages] : shard_pages) {
+            auto &account_update = shard_accounts.at(account_offset);
+            for (auto const &[page_key, page] : pages) {
+                bool const is_empty = page.is_empty();
+                std::optional<byte_string_view> value;
+                if (!is_empty) {
+                    value = byte_string_view{loader->bytes_alloc.emplace_back(
+                        encode_storage_page_db(page_key, page))};
+                }
+                account_update.next.push_front(
+                    loader->update_alloc.emplace_back(Update{
+                        .key = loader->hash_alloc.emplace_back(keccak256(
+                            {page_key.bytes, sizeof(page_key.bytes)})),
+                        .value = value,
+                        .incarnation = false,
+                        .next = UpdateList{},
+                        .version = static_cast<int64_t>(loader->block)}));
+            }
+        }
+        shard_pages.clear();
+    }
+}
+
+void kinet_db_snapshot_loader_flush(kinet_db_snapshot_loader *const loader)
+{
+    using namespace kinet;
+    using namespace kinet::mpt;
+
+    kinet_db_snapshot_loader_finalize_pages(loader);
+
+    Update state_update{
+        .key = state_nibbles,
+        .value = byte_string_view{},
+        .incarnation = false,
+        .next = std::move(loader->state_updates),
+        .version = static_cast<int64_t>(loader->block)};
+    Update code_update{
+        .key = code_nibbles,
+        .value = byte_string_view{},
+        .incarnation = false,
+        .next = std::move(loader->code_updates),
+        .version = static_cast<int64_t>(loader->block)};
+
+    UpdateList updates;
+    updates.push_front(state_update);
+    updates.push_front(code_update);
+
+    UpdateList finalized_updates;
+    Update finalized{
+        .key = finalized_nibbles,
+        .value = byte_string_view{},
+        .incarnation = false,
+        .next = std::move(updates),
+        .version = static_cast<int64_t>(loader->block)};
+    finalized_updates.push_front(finalized);
+
+    loader->root = loader->db.upsert(
+        std::move(loader->root),
+        std::move(finalized_updates),
+        loader->block,
+        false,
+        false);
+    loader->hash_alloc.clear();
+    loader->update_alloc.clear();
+    loader->bytes_alloc.clear();
+    for (auto &map : loader->account_offset_to_update) {
+        map.clear();
+    }
+    for (auto &map : loader->page_accumulator) {
+        map.clear();
+    }
+    loader->state_updates.clear();
+    loader->code_updates.clear();
+    loader->bytes_read = 0;
+}
+
+uint64_t kinet_db_snapshot_loader_read_account(
+    kinet_db_snapshot_loader *const loader, uint64_t const shard,
+    uint64_t const account_offset, kinet::byte_string_view const accounts)
+{
+    using namespace kinet;
+    using namespace kinet::mpt;
+    byte_string_view bytes{accounts.substr(account_offset)};
+    byte_string_view const before{bytes};
+    auto const res = decode_account_db_raw(bytes);
+    KINET_ASSERT(res.has_value());
+    auto const [address, account] = res.value();
+    KINET_ASSERT(address.size() == sizeof(Address));
+    uint64_t const bytes_consumed = before.size() - bytes.size();
+    auto const [it, success] =
+        loader->account_offset_to_update.at(shard).emplace(
+            account_offset,
+            Update{
+                .key = loader->hash_alloc.emplace_back(keccak256(address)),
+                .value = before.substr(0, bytes_consumed),
+                .incarnation = false,
+                .next = UpdateList{},
+                .version = static_cast<int64_t>(loader->block)});
+    KINET_ASSERT(success);
+    loader->state_updates.push_front(it->second);
+    loader->bytes_read += bytes_consumed;
+    return bytes_consumed;
+}
+
+// Consume the stream header if there is one, leaving `stream` at its first
+// record.
+void read_stream_header(
+    kinet::byte_string_view &stream, kinet_snapshot_type const kind)
+{
+    using namespace kinet;
+    if (stream.size() < sizeof(kinet_snapshot_stream_header)) {
+        return;
+    }
+    auto const header =
+        unaligned_load<kinet_snapshot_stream_header>(stream.data());
+    if (header.magic != KINET_SNAPSHOT_STREAM_MAGIC) {
+        return;
+    }
+    // A legacy stream can hold the guard byte by chance, but not the magic, so
+    // past the magic a bad guard is corruption rather than an older layout and
+    // must not silently bypass the version and kind checks below.
+    KINET_ASSERT_PRINTF(
+        header.guard == KINET_SNAPSHOT_STREAM_GUARD,
+        "snapshot stream opens with the header magic but guard 0x%02x "
+        "(expected 0x%02x)",
+        header.guard,
+        KINET_SNAPSHOT_STREAM_GUARD);
+    KINET_ASSERT_PRINTF(
+        header.version == KINET_SNAPSHOT_STREAM_VERSION,
+        "snapshot stream version %u is not supported (expected %u)",
+        header.version,
+        KINET_SNAPSHOT_STREAM_VERSION);
+    KINET_ASSERT_PRINTF(
+        header.kind == kind,
+        "snapshot stream holds kind %u where kind %u was expected",
+        header.kind,
+        static_cast<unsigned>(kind));
+    stream.remove_prefix(sizeof(header));
+}
+
+class NibblePath
+{
+private:
+    // 128 nibbles max: 64 (account hash) + 64 (storage hash)
+    // Note: finalized and code/data nibbles are handled separately and not
+    // stored in path
+    std::array<unsigned char, 64> buffer_{};
+    uint8_t length_{0};
+
+public:
+    void
+    append(unsigned char const branch, kinet::mpt::NibblesView const node_path)
+    {
+        using namespace kinet::mpt;
+        unsigned const src_nibbles = node_path.nibble_size();
+        KINET_ASSERT(length_ + 1 + src_nibbles <= buffer_.size() * 2);
+
+        // Append branch nibble
+        set_nibble(buffer_.data(), length_, branch);
+        ++length_;
+
+        if (src_nibbles == 0) {
+            return;
+        }
+
+        for (unsigned i = 0; i < src_nibbles; ++i) {
+            set_nibble(buffer_.data(), length_ + i, node_path.get(i));
+        }
+        length_ = static_cast<uint8_t>(length_ + src_nibbles);
+    }
+
+    void pop(uint8_t const nibble_count)
+    {
+        KINET_ASSERT(length_ >= nibble_count);
+        length_ -= nibble_count;
+    }
+
+    [[nodiscard]] kinet::mpt::NibblesView view() const
+    {
+        return kinet::mpt::NibblesView(0, length_, buffer_.data());
+    }
+
+    [[nodiscard]] uint8_t length() const
+    {
+        return length_;
+    }
+};
+
+using SnapshotWriteFn = uint64_t (*)(
+    uint64_t shard, kinet_snapshot_type, unsigned char const *bytes, size_t len,
+    void *user);
+
+// Writes the records of every stream of one dump, and is shared by every clone
+// of the traverse machine as well as by the eth-header writes outside it.
+//
+// Every record goes through here so that no stream can be opened without its
+// header: a stream missing one is indistinguishable from a stream written
+// before headers existed, so it would load without complaint.
+class SnapshotStreamWriter
+{
+    SnapshotWriteFn const write_;
+    void *const user_;
+    std::array<
+        std::array<bool, KINET_SNAPSHOT_FILES_PER_SHARD>, KINET_SNAPSHOT_SHARDS>
+        header_written_{};
+    // Length of each shard's account stream counted from its first record, so
+    // that the offsets it hands out do not shift when a header is present.
+    std::array<uint64_t, KINET_SNAPSHOT_SHARDS> account_bytes_written_{};
+
+    // Written lazily so that a kind a shard has no records for leaves a
+    // zero-length stream rather than a header-only one.
+    void write_stream_header_once(
+        uint64_t const shard, kinet_snapshot_type const kind)
+    {
+        auto &written = header_written_.at(shard).at(kind);
+        if (written) {
+            return;
+        }
+        kinet_snapshot_stream_header const header{
+            .magic = KINET_SNAPSHOT_STREAM_MAGIC,
+            .version = KINET_SNAPSHOT_STREAM_VERSION,
+            .kind = static_cast<uint8_t>(kind),
+            .reserved = 0,
+            .guard = KINET_SNAPSHOT_STREAM_GUARD};
+        std::array<unsigned char, sizeof(header)> bytes;
+        kinet::unaligned_store(bytes.data(), header);
+        KINET_ASSERT(
+            write_(shard, kind, bytes.data(), bytes.size(), user_) ==
+            bytes.size());
+        written = true;
+    }
+
+public:
+    SnapshotStreamWriter(SnapshotWriteFn const write, void *const user)
+        : write_{write}
+        , user_{user}
+    {
+    }
+
+    SnapshotStreamWriter(SnapshotStreamWriter const &) = delete;
+
+    void write_record(
+        uint64_t const shard, kinet_snapshot_type const kind,
+        unsigned char const *const bytes, size_t const len)
+    {
+        write_stream_header_once(shard, kind);
+        KINET_ASSERT(write_(shard, kind, bytes, len, user_) == len);
+    }
+
+    // Appends one account record, returning the offset it occupies in the
+    // shard's account stream, which is how a storage record names its account.
+    uint64_t write_account_record(
+        uint64_t const shard, unsigned char const *const bytes,
+        size_t const len)
+    {
+        uint64_t const offset = account_bytes_written_.at(shard);
+        account_bytes_written_.at(shard) += len;
+        write_record(shard, KINET_SNAPSHOT_ACCOUNT, bytes, len);
+        return offset;
+    }
+};
+
+struct KinetSnapshotTraverseMachine : public kinet::mpt::TraverseMachine
+{
+    unsigned char nibble;
+    NibblePath path;
+    SnapshotStreamWriter &writer;
+    uint64_t account_offset;
+    uint64_t total_shards;
+    uint64_t shard_number;
+    // Source db is page-encoded: storage leaves hold encoded pages rather than
+    // single slots, so they are expanded to slot-format entries on dump.
+    bool page_encoded;
+
+    KinetSnapshotTraverseMachine(
+        SnapshotStreamWriter &writer, uint64_t const total_shards,
+        uint64_t const shard_number, bool const page_encoded)
+        : nibble{kinet::mpt::INVALID_BRANCH}
+        , path{}
+        , writer{writer}
+        , account_offset{std::numeric_limits<uint64_t>::max()}
+        , total_shards{total_shards}
+        , shard_number{shard_number}
+        , page_encoded{page_encoded}
+    {
+    }
+
+    virtual bool
+    down(unsigned char const branch, kinet::mpt::Node const &node) override
+    {
+        using namespace kinet;
+        using namespace kinet::mpt;
+        constexpr unsigned HASH_SIZE = KECCAK256_SIZE * 2;
+
+        if (branch == INVALID_BRANCH) {
+            KINET_ASSERT(path.length() == 0);
+            return true;
+        }
+        else if (path.length() == 0 && nibble == INVALID_BRANCH) {
+            nibble = branch;
+            return true;
+        }
+        KINET_ASSERT(nibble == STATE_NIBBLE || nibble == CODE_NIBBLE);
+
+        path.append(branch, node.path_nibble_view());
+
+        // Path not long enough to determine shard yet, continue traversing
+        if (path.length() < KINET_SNAPSHOT_SHARD_NIBBLES) {
+            return true;
+        }
+
+        uint64_t const shard = get_shard(path.view());
+
+        // Return false to skip entire subtree since all descendants have same
+        // shard
+        if (shard % total_shards != shard_number) {
+            return false;
+        }
+
+        // If intermediate node (no value), continue traversing deeper
+        if (!node.has_value()) {
+            return true;
+        }
+
+        byte_string_view const val = node.value();
+        if (nibble == CODE_NIBBLE) {
+            KINET_ASSERT(path.length() == HASH_SIZE);
+            uint64_t const len = val.size();
+            writer.write_record(
+                shard,
+                KINET_SNAPSHOT_CODE,
+                reinterpret_cast<unsigned char const *>(&len),
+                sizeof(len));
+            writer.write_record(
+                shard, KINET_SNAPSHOT_CODE, val.data(), val.size());
+        }
+        else {
+            KINET_ASSERT(nibble == STATE_NIBBLE);
+            if (path.length() == HASH_SIZE) {
+                account_offset =
+                    writer.write_account_record(shard, val.data(), val.size());
+            }
+            else {
+                KINET_ASSERT(path.length() == (HASH_SIZE * 2));
+                // Emit one slot-format storage entry, prefixed with the owning
+                // account's offset so the loader can re-link it.
+                auto const emit_slot = [&](byte_string_view const entry) {
+                    writer.write_record(
+                        shard,
+                        KINET_SNAPSHOT_STORAGE,
+                        reinterpret_cast<unsigned char const *>(
+                            &account_offset),
+                        sizeof(account_offset));
+                    writer.write_record(
+                        shard,
+                        KINET_SNAPSHOT_STORAGE,
+                        entry.data(),
+                        entry.size());
+                };
+                if (page_encoded) {
+                    // Source db is page-encoded: expand the storage leaf into
+                    // one slot-encoded entry per non-zero slot so the dumped
+                    // snapshot stays slot-granular and loads unchanged.
+                    auto const decoded =
+                        decode_storage_page_leaf(byte_string_view{val});
+                    KINET_ASSERT(decoded.has_value());
+                    for (auto const [slot_key, slot_val] :
+                         decoded.value().slots()) {
+                        emit_slot(encode_storage_db(slot_key, slot_val));
+                    }
+                }
+                else {
+                    emit_slot(val);
+                }
+            }
+        }
+
+        return true;
+    }
+
+    virtual void up(unsigned char const, kinet::mpt::Node const &node) override
+    {
+        if (path.length() == 0) {
+            nibble = kinet::mpt::INVALID_BRANCH;
+            return;
+        }
+        // Remove branch nibble + node path nibbles that were added in down()
+        path.pop(static_cast<uint8_t>(1 + node.path_nibbles_len()));
+    }
+
+    virtual std::unique_ptr<TraverseMachine> clone() const override
+    {
+        return std::make_unique<KinetSnapshotTraverseMachine>(*this);
+    }
+
+    virtual bool
+    should_visit(kinet::mpt::Node const &, unsigned char const branch) override
+    {
+        using namespace kinet;
+        using namespace kinet::mpt;
+        if (path.length() == 0 && nibble == INVALID_BRANCH) {
+            KINET_ASSERT(branch != INVALID_BRANCH);
+            return branch == STATE_NIBBLE || branch == CODE_NIBBLE;
+        }
+        return true;
+    }
+};
+
+KINET_ANONYMOUS_NAMESPACE_END
+
+// Directory Format
+//   block number
+//     shard
+//       account
+//       storage
+//       code
+//       eth_header
+// Each file holds one stream, empty or in the layout db_snapshot.h describes.
+bool kinet_db_dump_snapshot(
+    char const *const *const dbname_paths, size_t const len,
+    unsigned const sq_thread_cpu, uint64_t const block,
+    uint64_t (*write)(
+        uint64_t shard, kinet_snapshot_type, unsigned char const *bytes,
+        size_t len, void *user),
+    void *const user, unsigned const dump_concurrency_limit,
+    uint64_t const total_shards, uint64_t const shard_number,
+    bool const dump_from_secondary)
+{
+    using namespace kinet;
+    using namespace kinet::mpt;
+
+    KINET_ASSERT_PRINTF(
+        total_shards >= 1, "total_shards must be >= 1, got %lu", total_shards);
+    KINET_ASSERT_PRINTF(
+        shard_number < total_shards,
+        "shard_number (%lu) must be < total_shards (%lu)",
+        shard_number,
+        total_shards);
+
+    // Set all queue sizes to dump_concurrency_limit to avoid double queuing
+    ReadOnlyOnDiskDbConfig const config{
+        .rd_buffers = dump_concurrency_limit,
+        .uring_entries = dump_concurrency_limit,
+        .sq_thread_cpu = sq_thread_cpu != std::numeric_limits<unsigned>::max()
+                             ? std::make_optional(sq_thread_cpu)
+                             : std::nullopt,
+        .dbname_paths = {dbname_paths, dbname_paths + len},
+        .concurrent_read_io_limit = dump_concurrency_limit};
+    AsyncIOContext io_context{config};
+    Db db{
+        io_context,
+        dump_from_secondary ? timeline_id::secondary : timeline_id::primary};
+
+    SnapshotStreamWriter writer{write, user};
+    for (uint64_t b = block < 256 ? 0 : block - 255; b <= block; ++b) {
+        uint64_t const header_shard = block - b;
+        if (header_shard % total_shards != shard_number) {
+            continue;
+        }
+
+        auto const header_cursor_res = db.find(
+            concat(FINALIZED_NIBBLE, NibblesView{block_header_nibbles}), b);
+        if (!header_cursor_res.has_value()) {
+            LOG_INFO(
+                "Could not query block header {} from db -- {}",
+                b,
+                header_cursor_res.error().message().c_str());
+            return false;
+        }
+        auto const header_view = header_cursor_res.value().node->value();
+        writer.write_record(
+            header_shard,
+            KINET_SNAPSHOT_ETH_HEADER,
+            header_view.data(),
+            header_view.size());
+    }
+
+    auto const root = db.load_root_for_version(block);
+    if (!root) {
+        LOG_INFO("root not valid for block {}", block);
+        return false;
+    }
+    auto const finalized_root_res =
+        db.find(NodeCursor{root}, finalized_nibbles, block);
+    if (!finalized_root_res.has_value()) {
+        LOG_INFO("block {} not finalized", block);
+        return false;
+    }
+    auto const &finalized_root = finalized_root_res.value();
+    if (db.find(finalized_root, state_nibbles, block).has_error() ||
+        db.find(finalized_root, code_nibbles, block).has_error()) {
+        LOG_INFO("no code and/or state for block {}", block);
+        return false;
+    }
+
+    KinetSnapshotTraverseMachine machine{
+        writer,
+        total_shards,
+        shard_number,
+        db.state_machine_type() == state_machine_kind::kinet};
+    bool const success =
+        db.traverse(finalized_root, machine, block, dump_concurrency_limit);
+    if (!success) {
+        LOG_INFO("db traverse for block {} unsuccessful", block);
+    }
+    return success;
+}
+
+// Loads the standard slot-encoded snapshot (the format produced by
+// kinet_db_dump_snapshot against a slot db) into one timeline:
+//   * load_to_secondary == false: the primary timeline.
+//   * load_to_secondary == true:  an already-activated secondary timeline.
+// The target's storage encoding is derived from its persisted
+// state_machine_kind; a page-encoded target converts slot leaves to page
+// leaves on the fly. The target's kind must already be stamped on disk.
+kinet_db_snapshot_loader *kinet_db_snapshot_loader_create(
+    uint64_t const block, char const *const *const dbname_paths,
+    size_t const len, unsigned const sq_thread_cpu,
+    bool const load_to_secondary)
+{
+    // The metadata-driven Db ctor and open_secondary_timeline() resolve the
+    // persisted kind through the registry, so both factories must be present.
+    kinet::register_ethereum_state_machines();
+    kinet::register_kinet_state_machines();
+    auto *loader = new kinet_db_snapshot_loader(
+        block, dbname_paths, len, sq_thread_cpu, load_to_secondary);
+    KINET_ASSERT(
+        loader->db.get_latest_version() == kinet::mpt::INVALID_BLOCK_NUM,
+        "database must be empty when loading snapshot");
+    return loader;
+}
+
+void kinet_db_snapshot_loader_load(
+    kinet_db_snapshot_loader *const loader, uint64_t const shard,
+    unsigned char const *const eth_header, size_t const eth_header_len,
+    unsigned char const *const account, size_t const account_len,
+    unsigned char const *const storage, size_t const storage_len,
+    unsigned char const *const code, size_t const code_len)
+{
+    using namespace kinet;
+    using namespace kinet::mpt;
+    constexpr size_t BYTES_READ_BEFORE_FLUSH = 10ull * 1024 * 1024 * 1024;
+    KINET_ASSERT(loader);
+    // Account offsets index from the first account record, so the storage loop
+    // below must resolve them against this header-stripped view rather than the
+    // raw buffer.
+    byte_string_view accounts{};
+    if (account) {
+        accounts = byte_string_view{account, account_len};
+        read_stream_header(accounts, KINET_SNAPSHOT_ACCOUNT);
+        for (uint64_t account_offset = 0; account_offset != accounts.size();) {
+            account_offset += kinet_db_snapshot_loader_read_account(
+                loader, shard, account_offset, accounts);
+            if (loader->bytes_read >= BYTES_READ_BEFORE_FLUSH) {
+                kinet_db_snapshot_loader_flush(loader);
+            }
+            KINET_ASSERT(account_offset <= accounts.size());
+        }
+    }
+
+    if (storage) {
+        KINET_ASSERT(account);
+        byte_string_view storage_view{storage, storage_len};
+        read_stream_header(storage_view, KINET_SNAPSHOT_STORAGE);
+        auto &account_offset_to_update =
+            loader->account_offset_to_update.at(shard);
+        while (!storage_view.empty()) {
+            KINET_ASSERT(storage_view.size() >= sizeof(uint64_t));
+            uint64_t const account_offset =
+                unaligned_load<uint64_t>(storage_view.data());
+            if (!account_offset_to_update.contains(account_offset)) {
+                kinet_db_snapshot_loader_read_account(
+                    loader, shard, account_offset, accounts);
+            }
+            storage_view.remove_prefix(sizeof(account_offset));
+            byte_string_view const before{storage_view};
+            uint64_t consumed;
+            if (loader->page_encoded()) {
+                // The storage byte stream concatenates multiple
+                // [account_offset, leaf.value()] entries, so we use
+                // decode_storage_db_raw which advances the view in place
+                // and tolerates trailing bytes. Convert the raw views to
+                // bytes32_t (right-aligned) for the page accumulator.
+                auto const res = decode_storage_db_raw(storage_view);
+                KINET_ASSERT(res.has_value());
+                bytes32_t const slot_key = to_bytes(res.value().first);
+                bytes32_t const slot_val = to_bytes(res.value().second);
+                consumed = before.size() - storage_view.size();
+                bytes32_t const pg_key = compute_page_key(slot_key);
+                uint8_t const slot_off = compute_slot_offset(slot_key);
+                auto &shard_pages = loader->page_accumulator.at(shard);
+                shard_pages[account_offset][pg_key].set(slot_off, slot_val);
+            }
+            else {
+                auto const res = decode_storage_db_raw(storage_view);
+                KINET_ASSERT(res.has_value());
+                auto &update = account_offset_to_update.at(account_offset);
+                consumed = before.size() - storage_view.size();
+                update.next.push_front(loader->update_alloc.emplace_back(Update{
+                    .key = loader->hash_alloc.emplace_back(
+                        keccak256(to_bytes(res.value().first))),
+                    .value = before.substr(0, consumed),
+                    .next = UpdateList{},
+                    .version = static_cast<int64_t>(loader->block)}));
+            }
+            loader->bytes_read += consumed;
+            // When page-encoded, all slots that share a page_key must be in
+            // the same flush. A mid-loop flush would emit a page Update for
+            // the slots seen so far; later slots in the same page would start
+            // a fresh accumulator entry and the next flush would emit another
+            // Update for the same keccak256(page_key), causing the mpt
+            // upsert to overwrite the earlier page (set-not-merge). Defer
+            // flushing until the unconditional final flush at end of load().
+            //
+            // Consequence: the page accumulator holds a whole shard's storage
+            // in RAM before that final flush. With the current state size this
+            // is not a problem. There will be a follow up to bound the memory
+            // usage.
+            if (!loader->page_encoded() &&
+                loader->bytes_read >= BYTES_READ_BEFORE_FLUSH) {
+                kinet_db_snapshot_loader_flush(loader);
+            }
+        }
+    }
+
+    if (code) {
+        byte_string_view code_view{code, code_len};
+        read_stream_header(code_view, KINET_SNAPSHOT_CODE);
+        while (!code_view.empty()) {
+            KINET_ASSERT(code_view.size() >= sizeof(uint64_t));
+            uint64_t const size = unaligned_load<uint64_t>(code_view.data());
+            code_view.remove_prefix(sizeof(uint64_t));
+            KINET_ASSERT(code_view.size() >= size);
+            byte_string_view const val = code_view.substr(0, size);
+            loader->code_updates.push_front(
+                loader->update_alloc.emplace_back(Update{
+                    .key = loader->hash_alloc.emplace_back(keccak256(val)),
+                    .value = val,
+                    .incarnation = false,
+                    .next = UpdateList{},
+                    .version = static_cast<int64_t>(loader->block)}));
+            code_view.remove_prefix(size);
+            loader->bytes_read += sizeof(uint64_t) + size;
+            if (loader->bytes_read >= BYTES_READ_BEFORE_FLUSH) {
+                kinet_db_snapshot_loader_flush(loader);
+            }
+        }
+    }
+
+    if (eth_header) {
+        byte_string_view enc{eth_header, eth_header_len};
+        read_stream_header(enc, KINET_SNAPSHOT_ETH_HEADER);
+        byte_string_view const rlp_header{enc};
+        auto const header = rlp::decode_block_header(enc);
+        KINET_ASSERT(header.has_value());
+        KINET_ASSERT(header.value().number == (loader->block - shard));
+        // stash to upsert versions last
+        loader->eth_headers.at(shard).assign(rlp_header);
+    }
+    kinet_db_snapshot_loader_flush(loader);
+}
+
+void kinet_db_snapshot_loader_destroy(kinet_db_snapshot_loader *const loader)
+{
+    using namespace kinet;
+    using namespace kinet::mpt;
+    for (size_t i = 0; i < loader->eth_headers.size(); ++i) {
+        auto const &enc = loader->eth_headers[i];
+        if (enc.empty()) {
+            continue;
+        }
+        uint64_t const block = loader->block - i;
+        Update block_header_update{
+            .key = block_header_nibbles,
+            .value = enc,
+            .incarnation = true,
+            .next = UpdateList{},
+            .version = static_cast<int64_t>(block)};
+        UpdateList updates;
+        updates.push_front(block_header_update);
+        UpdateList finalized_updates;
+        Update finalized{
+            .key = finalized_nibbles,
+            .value = byte_string_view{},
+            .incarnation = false,
+            .next = std::move(updates),
+            .version = static_cast<int64_t>(block)};
+        finalized_updates.push_front(finalized);
+        loader->db.upsert(
+            loader->db.load_root_for_version(block),
+            std::move(finalized_updates),
+            block,
+            false,
+            false);
+    }
+    loader->db.update_finalized_version(loader->block);
+    delete loader;
+}

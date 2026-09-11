@@ -1,0 +1,106 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/byte_string.hpp>
+#include <category/core/keccak.hpp>
+#include <category/execution/ethereum/create_contract_address.hpp>
+
+#include <evmc/evmc.hpp>
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+
+using namespace kinet;
+
+TEST(Execution, create_contract_address)
+{
+    // USDT Stablecoin contract
+    EXPECT_EQ(
+        create_contract_address(
+            0x36928500bc1dcd7af6a2b4008875cc336b927d57_address, 6),
+        0xdac17f958d2ee523a2206206994597c13d831ec7_address);
+}
+
+TEST(Execution, create2_contract_address)
+{
+    // all examples from EIP-1014
+    static constexpr auto null_salt{
+        0x0000000000000000000000000000000000000000000000000000000000000000_bytes32};
+    static constexpr auto feed_salt{
+        0x000000000000000000000000feed000000000000000000000000000000000000_bytes32};
+    static constexpr auto cafebabe_salt{
+        0x00000000000000000000000000000000000000000000000000000000cafebabe_bytes32};
+    static uint8_t const zero[1]{0x00};
+    static uint8_t const deadbeef[4]{0xde, 0xad, 0xbe, 0xef};
+    static byte_string const deadcattle{
+        0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe,
+        0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad,
+        0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde,
+        0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef};
+
+    auto const zero_hash = keccak256(zero);
+    EXPECT_EQ(
+        create2_contract_address(
+            0x0000000000000000000000000000000000000000_address,
+            null_salt,
+            zero_hash),
+        0x4d1a2e2bb4f88f0250f26ffff098b0b30b26bf38_address);
+
+    EXPECT_EQ(
+        create2_contract_address(
+            0xdeadbeef00000000000000000000000000000000_address,
+            null_salt,
+            zero_hash),
+        0xB928f69Bb1D91Cd65274e3c79d8986362984fDA3_address);
+
+    EXPECT_EQ(
+        create2_contract_address(
+            0xdeadbeef00000000000000000000000000000000_address,
+            feed_salt,
+            zero_hash),
+        0xD04116cDd17beBE565EB2422F2497E06cC1C9833_address);
+
+    auto const deadbeef_hash = keccak256(deadbeef);
+    EXPECT_EQ(
+        create2_contract_address(
+            0x0000000000000000000000000000000000000000_address,
+            null_salt,
+            deadbeef_hash),
+        0x70f2b2914A2a4b783FaEFb75f459A580616Fcb5e_address);
+
+    EXPECT_EQ(
+        create2_contract_address(
+            0x00000000000000000000000000000000deadbeef_address,
+            cafebabe_salt,
+            deadbeef_hash),
+        0x60f3f640a8508fC6a86d45DF051962668E1e8AC7_address);
+
+    auto const deadcattle_hash = keccak256(deadcattle);
+    EXPECT_EQ(
+        create2_contract_address(
+            0x00000000000000000000000000000000deadbeef_address,
+            cafebabe_salt,
+            deadcattle_hash),
+        0x1d8bfDC5D46DC4f61D6b6115972536eBE6A8854C_address);
+
+    auto const null_hash = keccak256(byte_string_view{});
+    EXPECT_EQ(
+        create2_contract_address(
+            0x0000000000000000000000000000000000000000_address,
+            null_salt,
+            null_hash),
+        0xE33C0C7F7df4809055C3ebA6c09CFe4BaF1BD9e0_address);
+}

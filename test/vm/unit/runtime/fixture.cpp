@@ -1,0 +1,187 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include "fixture.hpp"
+
+#include <algorithm>
+#include <category/core/address.hpp>
+#include <category/core/bytes.hpp>
+#include <category/core/int.hpp>
+#include <category/core/keccak.hpp>
+#include <category/core/runtime/uint256.hpp>
+#include <category/vm/runtime/transmute.hpp>
+
+#include <evmc/evmc.h>
+#include <evmc/evmc.hpp>
+#include <evmc/mocked_host.hpp>
+
+#include <array>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <numeric>
+#include <span>
+#include <string_view>
+
+using namespace kinet::vm::runtime;
+
+namespace kinet::vm::compiler::test
+{
+    namespace
+    {
+        void init_host(
+            kinet::vm::test::MockedHost &host,
+            std::array<evmc_bytes32, 2> &blob_hashes_)
+        {
+            host.tx_context = evmc_tx_context{
+                .tx_gas_price = store_be_as<bytes32_t>(uint256_t{56762}),
+                .tx_origin = 0x000000000000000000000000000000005CA1AB1E_address,
+                .block_coinbase =
+                    0x00000000000000000000000000000000BA5EBA11_address,
+                .block_number = 23784,
+                .block_timestamp = 1733494490,
+                .block_gas_limit = 30000000,
+                .block_prev_randao = store_be_as<bytes32_t>(uint256_t{89273}),
+                .chain_id = store_be_as<bytes32_t>(uint256_t{2342}),
+                .block_base_fee = store_be_as<bytes32_t>(uint256_t{389}),
+                .blob_base_fee = store_be_as<bytes32_t>(uint256_t{98988}),
+                .blob_hashes = blob_hashes_.data(),
+                .blob_hashes_count = blob_hashes_.size(),
+                .initcodes = nullptr,
+                .initcodes_count = 0,
+                .block_round = 0,
+            };
+
+            host.block_hash = store_be_as<bytes32_t>(
+                0x105DF6064F84551C4100A368056B8AF0E491077245DAB1536D2CFA6AB78421CE_u256);
+        }
+    }
+
+    RuntimeTestBase::RuntimeTestBase()
+        : blob_hashes_{store_be_as<bytes32_t>(uint256_t{1}), store_be_as<bytes32_t>(uint256_t{2})}
+        , host_{}
+        , test_ctx_{[&](auto &x) {
+            x.host = &host_.get_interface(), x.context = host_.to_context(),
+            x.gas_remaining = std::numeric_limits<std::int64_t>::max(),
+            x.gas_refund = 0,
+            x.env = {
+                .evmc_flags = 0,
+                .depth = 0,
+                .recipient = 0x0000000000000000000000000000000000000001_address,
+                .sender = 0x0000000000000000000000000000000000000002_address,
+                .value = {},
+                .create2_salt = {},
+                .input_data = &call_data_[0],
+                .code = &code_[0],
+                .return_data = {},
+                .input_data_size = sizeof(call_data_),
+                .code_size = sizeof(code_),
+                .return_data_size = 0,
+                .tx_context = &host_.tx_context,
+            };
+        }}
+        , ctx_{*test_ctx_}
+    {
+        init_host(host_, blob_hashes_);
+        std::iota(code_.rbegin(), code_.rend(), 0);
+        std::iota(call_data_.begin(), call_data_.end(), 0);
+        std::iota(call_return_data_.begin(), call_return_data_.end(), 0);
+    }
+
+    evmc_result RuntimeTestBase::success_result(
+        std::int64_t const gas_left, std::int64_t const gas_refund)
+    {
+        auto output_data = result_data();
+        return {
+            .status_code = EVMC_SUCCESS,
+            .gas_left = gas_left,
+            .gas_refund = gas_refund,
+            .output_data = output_data.data(),
+            .output_size = output_data.size(),
+            .release = nullptr,
+            .create_address = {},
+            .padding = {},
+        };
+    }
+
+    evmc_result RuntimeTestBase::create_result(
+        Address const prog_addr, std::int64_t const gas_left,
+        std::int64_t const gas_refund)
+    {
+        auto output_data = result_data();
+        return {
+            .status_code = EVMC_SUCCESS,
+            .gas_left = gas_left,
+            .gas_refund = gas_refund,
+            .output_data = output_data.data(),
+            .output_size = output_data.size(),
+            .release = nullptr,
+            .create_address = prog_addr,
+            .padding = {},
+        };
+    }
+
+    evmc_result RuntimeTestBase::failure_result(evmc_status_code const sc)
+    {
+        auto output_data = result_data();
+        return {
+            .status_code = sc,
+            .gas_left = 0,
+            .gas_refund = 0,
+            .output_data = output_data.data(),
+            .output_size = output_data.size(),
+            .release = nullptr,
+            .create_address = {},
+            .padding = {},
+        };
+    }
+
+    void
+    RuntimeTestBase::set_balance(uint256_t const addr, uint256_t const balance)
+    {
+        host_.accounts[address_from_uint256(addr)].balance =
+            store_be_as<bytes32_t>(balance);
+    }
+
+    std::basic_string_view<uint8_t> RuntimeTestBase::result_data()
+    {
+        auto output_size = call_return_data_.size();
+        auto *output_data =
+            reinterpret_cast<std::uint8_t *>(std::malloc(output_size));
+        std::memcpy(output_data, call_return_data_.data(), output_size);
+        return {output_data, output_size};
+    }
+
+    void RuntimeTestBase::add_account_at(
+        uint256_t const addr, std::span<uint8_t> const code)
+    {
+        auto const contract_addr = address_from_uint256(addr);
+        auto const codehash = keccak256({code.data(), code.size()});
+        bytes32_t codehash_bytes;
+        std::copy(codehash.bytes, codehash.bytes + 32, codehash_bytes.bytes);
+        auto const account = evmc::MockedAccount{
+            .nonce = 0,
+            .code = evmc::bytes(code.data(), code.size()),
+            .codehash = codehash_bytes,
+            .balance = {},
+            .storage = {},
+            .transient_storage = {},
+        };
+        auto const [_, inserted] =
+            host_.accounts.insert({contract_addr, account});
+        ASSERT_TRUE(inserted);
+    }
+}

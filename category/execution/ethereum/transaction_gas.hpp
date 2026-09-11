@@ -1,0 +1,107 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/core/checked_math.hpp>
+#include <category/core/config.hpp>
+#include <category/core/int.hpp>
+#include <category/core/result.hpp>
+#include <category/execution/ethereum/chain/blob_schedule.hpp>
+#include <category/vm/evm/traits.hpp>
+
+#include <evmc/evmc.h>
+
+#include <cstdint>
+
+KINET_NAMESPACE_BEGIN
+
+struct Transaction;
+struct BlockHeader;
+
+template <Traits traits>
+uint64_t g_data(Transaction const &) noexcept;
+
+template <Traits traits>
+uint64_t intrinsic_gas(Transaction const &) noexcept;
+
+template <Traits traits>
+uint64_t floor_data_gas(Transaction const &) noexcept;
+
+template <Traits traits>
+uint256_t
+gas_price(Transaction const &, uint256_t const &base_fee_per_gas) noexcept;
+
+template <Traits traits>
+uint64_t g_star(Transaction const &, uint64_t gas_remaining, uint64_t refund);
+
+template <Traits traits>
+uint64_t compute_gas_refund(
+    Transaction const &, uint64_t gas_remaining, uint64_t refund);
+
+template <Traits traits>
+uint256_t calculate_txn_award(
+    Transaction const &, uint256_t const &base_fee_per_gas,
+    uint64_t gas_used) noexcept;
+
+inline Result<uint256_t>
+max_gas_cost(uint64_t const gas_limit, uint256_t const max_fee_per_gas) noexcept
+{
+    return checked_mul(uint256_t{gas_limit}, max_fee_per_gas);
+}
+
+// EIP-4844
+inline constexpr uint64_t GAS_PER_BLOB = 131'072;
+
+// EIP-7918
+inline constexpr uint64_t BLOB_BASE_COST = 8192;
+
+template <Traits traits>
+constexpr BlobSchedule default_blob_schedule() noexcept
+{
+    // EIP-7691 increases the blob count where active.
+    if constexpr (traits::eip_7691_active()) {
+        return PRAGUE_BLOB_SCHEDULE;
+    }
+    else {
+        return CANCUN_BLOB_SCHEDULE;
+    }
+}
+
+constexpr uint64_t
+max_blob_gas_per_block(BlobSchedule const &blob_schedule) noexcept
+{
+    return blob_schedule.max_blobs_per_block * GAS_PER_BLOB;
+}
+
+constexpr uint64_t
+target_blob_gas_per_block(BlobSchedule const &blob_schedule) noexcept
+{
+    return blob_schedule.target_blobs_per_block * GAS_PER_BLOB;
+}
+
+uint256_t
+calc_blob_fee(Transaction const &, uint64_t, BlobSchedule const &) noexcept;
+
+uint256_t get_base_fee_per_blob_gas(uint64_t, BlobSchedule const &) noexcept;
+
+template <Traits traits>
+uint64_t calc_excess_blob_gas(
+    BlockHeader const &parent_header,
+    BlobSchedule const &current_blob_schedule) noexcept;
+
+uint64_t get_total_blob_gas(Transaction const &) noexcept;
+
+KINET_NAMESPACE_END

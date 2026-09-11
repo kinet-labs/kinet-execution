@@ -1,0 +1,1763 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/mpt/db.hpp>
+
+#include <category/async/concepts.hpp>
+#include <category/async/config.hpp>
+#include <category/async/connected_operation.hpp>
+#include <category/async/detail/scope_polyfill.hpp>
+#include <category/async/erased_connected_operation.hpp>
+#include <category/async/io.hpp>
+#include <category/async/sender_errc.hpp>
+#include <category/async/storage_pool.hpp>
+#include <category/core/assert.h>
+#include <category/core/byte_string.hpp>
+#include <category/core/bytes.hpp>
+#include <category/core/io/buffers.hpp>
+#include <category/core/io/ring.hpp>
+#include <category/core/log.hpp>
+#include <category/core/result.hpp>
+#include <category/mpt/config.hpp>
+#include <category/mpt/db_error.hpp>
+#include <category/mpt/db_metadata_context.hpp>
+#include <category/mpt/detail/timeline.hpp>
+#include <category/mpt/find_request_sender.hpp>
+#include <category/mpt/nibbles_view.hpp>
+#include <category/mpt/node.hpp>
+#include <category/mpt/node_cache.hpp>
+#include <category/mpt/node_cursor.hpp>
+#include <category/mpt/ondisk_db_config.hpp>
+#include <category/mpt/state_machine_kind.hpp>
+#include <category/mpt/traverse.hpp>
+#include <category/mpt/trie.hpp>
+#include <category/mpt/update.hpp>
+#include <category/mpt/util.hpp>
+
+#include <boost/fiber/operations.hpp>
+
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <unistd.h>
+
+#undef BLOCK_SIZE // without this concurrentqueue.h gets sad
+#include <concurrentqueue.h>
+
+KINET_MPT_NAMESPACE_BEGIN
+
+struct Db::Impl
+{
+    virtual ~Impl() = default;
+
+    virtual UpdateAux &aux() = 0;
+
+    virtual Node::SharedPtr upsert_fiber_blocking(
+        Node::SharedPtr, UpdateList &&, uint64_t, bool enable_compaction,
+        bool can_write_to_fast, bool write_root) = 0;
+    virtual Node::SharedPtr copy_trie_fiber_blocking(
+        Node::SharedPtr src_root, NibblesView src, Node::SharedPtr dest_root,
+        NibblesView dest, uint64_t dest_version, bool write_root = true) = 0;
+    virtual find_cursor_result_type find_fiber_blocking(
+        NodeCursor const &root, NibblesView const &key, uint64_t version) = 0;
+    virtual size_t prefetch_fiber_blocking(Node::SharedPtr const &) = 0;
+    virtual Node::SharedPtr load_root_for_version(uint64_t version) = 0;
+
+    virtual size_t poll(bool blocking, size_t count) = 0;
+    virtual bool traverse_fiber_blocking(
+        Node::SharedPtr, TraverseMachine &, uint64_t version,
+        size_t concurrency_limit) = 0;
+    virtual void
+    move_trie_version_fiber_blocking(uint64_t src, uint64_t dest) = 0;
+    virtual timeline_id tid() const = 0;
+
+    virtual mpt::state_machine_kind state_machine_type() const = 0;
+};
+
+AsyncIOContext::AsyncIOContext(ReadOnlyOnDiskDbConfig const &options)
+    : pool{[&] -> async::storage_pool {
+        async::storage_pool::creation_flags pool_options;
+        pool_options.open_read_only = true;
+        pool_options.disable_mismatching_storage_pool_check =
+            options.disable_mismatching_storage_pool_check;
+        KINET_ASSERT(!options.dbname_paths.empty());
+        return async::storage_pool{
+            options.dbname_paths,
+            async::storage_pool::mode::open_existing,
+            pool_options};
+    }()}
+    , read_ring{kinet::io::RingConfig{
+          options.uring_entries, options.sq_thread_cpu}}
+    , buffers{io::make_buffers_for_read_only(
+          read_ring, options.rd_buffers,
+          async::AsyncIO::KINET_IO_BUFFERS_READ_SIZE)}
+    , io{pool, buffers}
+{
+    io.set_capture_io_latencies(options.capture_io_latencies);
+    io.set_concurrent_read_io_limit(options.concurrent_read_io_limit);
+    io.set_eager_completions(options.eager_completions);
+}
+
+AsyncIOContext::AsyncIOContext(OnDiskDbConfig const &options)
+    : pool{[&] -> async::storage_pool {
+        async::storage_pool::creation_flags pool_options;
+        pool_options.num_cnv_chunks = options.root_offsets_chunk_count + 1;
+        pool_options.set_chunk_capacity(options.chunk_capacity);
+        auto const len = options.file_size_db * 1024 * 1024 * 1024 + 24576;
+        if (options.dbname_paths.empty()) {
+            return async::storage_pool{
+                async::use_anonymous_sized_inode_tag{}, len, pool_options};
+        }
+        // initialize db file on disk
+        for (auto const &dbname_path : options.dbname_paths) {
+            if (!std::filesystem::exists(dbname_path)) {
+                int const fd = ::open(
+                    dbname_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+                KINET_ASSERT_PRINTF(
+                    fd != -1, "open failed due to %s", strerror(errno));
+                auto const unfd =
+                    kinet::make_scope_exit([fd]() noexcept { ::close(fd); });
+                KINET_ASSERT_PRINTF(
+                    ::ftruncate(fd, len) != -1,
+                    "ftruncate failed due to %s",
+                    strerror(errno));
+            }
+        }
+        return async::storage_pool{
+            options.dbname_paths,
+            options.append ? async::storage_pool::mode::open_existing
+                           : async::storage_pool::mode::truncate,
+            pool_options};
+    }()}
+    , read_ring{{options.uring_entries, options.sq_thread_cpu}}
+    , write_ring{io::RingConfig{options.wr_buffers}}
+    , buffers{io::make_buffers_for_segregated_read_write(
+          read_ring, *write_ring, options.rd_buffers, options.wr_buffers,
+          async::AsyncIO::KINET_IO_BUFFERS_READ_SIZE,
+          async::AsyncIO::KINET_IO_BUFFERS_WRITE_SIZE)}
+    , io{pool, buffers}
+{
+    io.set_capture_io_latencies(options.capture_io_latencies);
+    io.set_concurrent_read_io_limit(options.concurrent_read_io_limit);
+    io.set_eager_completions(options.eager_completions);
+}
+
+class Db::ROOnDiskBlocking final : public Db::Impl
+{
+    UpdateAux aux_;
+    timeline_id const tid_;
+
+public:
+    ROOnDiskBlocking(AsyncIOContext &io_ctx, timeline_id const tid)
+        : aux_(io_ctx.io)
+        , tid_{tid}
+    {
+    }
+
+    virtual ~ROOnDiskBlocking() = default;
+
+    virtual UpdateAux &aux() override
+    {
+        return aux_;
+    }
+
+    virtual Node::SharedPtr upsert_fiber_blocking(
+        Node::SharedPtr, UpdateList &&, uint64_t, bool, bool, bool) override
+    {
+        KINET_ABORT();
+    }
+
+    virtual find_cursor_result_type find_fiber_blocking(
+        NodeCursor const &root, NibblesView const &key,
+        uint64_t const version) override
+    {
+        if (!root.is_valid()) {
+            return {NodeCursor{}, find_result::root_node_is_null_failure};
+        }
+        // the root we last loaded does not contain the version we want to find
+        if (!aux().metadata_ctx().version_is_valid_ondisk(version, tid_)) {
+            return {NodeCursor{}, find_result::version_no_longer_exist};
+        }
+        auto const res = find_blocking(aux(), root, key, version, tid_);
+        // verify version still valid in history after success
+        return aux().metadata_ctx().version_is_valid_ondisk(version, tid_)
+                   ? res
+                   : find_cursor_result_type{
+                         NodeCursor{}, find_result::version_no_longer_exist};
+    }
+
+    virtual void move_trie_version_fiber_blocking(uint64_t, uint64_t) override
+    {
+        KINET_ABORT();
+    }
+
+    virtual size_t prefetch_fiber_blocking(Node::SharedPtr const &) override
+    {
+        KINET_ABORT();
+    }
+
+    virtual Node::SharedPtr copy_trie_fiber_blocking(
+        Node::SharedPtr, NibblesView, Node::SharedPtr, NibblesView, uint64_t,
+        bool) override
+    {
+        KINET_ABORT();
+    }
+
+    virtual size_t poll(bool const blocking, size_t const count) override
+    {
+        return blocking ? aux_.io->poll_blocking(count)
+                        : aux_.io->poll_nonblocking(count);
+    }
+
+    virtual bool traverse_fiber_blocking(
+        Node::SharedPtr node, TraverseMachine &machine, uint64_t const version,
+        size_t const concurrency_limit) override
+    {
+        return preorder_traverse_ondisk(
+            aux(), std::move(node), machine, version, tid_, concurrency_limit);
+    }
+
+    virtual Node::SharedPtr
+    load_root_for_version(uint64_t const version) override
+    {
+        auto const root_offset =
+            aux().metadata_ctx().get_root_offset_at_version(version, tid_);
+        if (root_offset == INVALID_OFFSET) {
+            return nullptr;
+        }
+
+        return read_node_blocking(aux(), root_offset, version, tid_);
+    }
+
+    virtual timeline_id tid() const override
+    {
+        return tid_;
+    }
+
+    virtual mpt::state_machine_kind state_machine_type() const override
+    {
+        return aux_.metadata_ctx().get_state_machine_kind(tid_);
+    }
+};
+
+class Db::InMemory final : public Db::Impl
+{
+    UpdateAux aux_;
+    std::unique_ptr<StateMachine> machine_;
+
+public:
+    explicit InMemory(std::unique_ptr<StateMachine> machine)
+        : aux_{}
+        , machine_{std::move(machine)}
+    {
+        KINET_ASSERT(machine_);
+    }
+
+    virtual UpdateAux &aux() override
+    {
+        return aux_;
+    }
+
+    virtual Node::SharedPtr upsert_fiber_blocking(
+        Node::SharedPtr root, UpdateList &&list, uint64_t const version, bool,
+        bool, bool) override
+    {
+        return aux_.do_update(
+            std::move(root),
+            *machine_,
+            std::move(list),
+            version,
+            /*compaction=*/false,
+            /*can_write_to_fast=*/true,
+            /*write_root=*/true,
+            timeline_id::primary);
+    }
+
+    virtual Node::SharedPtr copy_trie_fiber_blocking(
+        Node::SharedPtr, NibblesView, Node::SharedPtr, NibblesView, uint64_t,
+        bool) override
+    {
+        KINET_ABORT();
+    }
+
+    virtual find_cursor_result_type find_fiber_blocking(
+        NodeCursor const &root, NibblesView const &key,
+        uint64_t const version) override
+    {
+        return find_blocking(aux(), root, key, version, timeline_id::primary);
+    }
+
+    virtual size_t prefetch_fiber_blocking(Node::SharedPtr const &) override
+    {
+        return 0;
+    }
+
+    virtual size_t poll(bool, size_t) override
+    {
+        return 0;
+    }
+
+    virtual bool traverse_fiber_blocking(
+        Node::SharedPtr const node, TraverseMachine &machine,
+        uint64_t const block_id, size_t) override
+    {
+        return preorder_traverse_blocking(aux_, *node, machine, block_id);
+    }
+
+    virtual void move_trie_version_fiber_blocking(uint64_t, uint64_t) override
+    {
+        KINET_ABORT();
+    }
+
+    virtual Node::SharedPtr load_root_for_version(uint64_t) override
+    {
+        return nullptr;
+    }
+
+    virtual timeline_id tid() const override
+    {
+        return timeline_id::primary;
+    }
+
+    virtual mpt::state_machine_kind state_machine_type() const override
+    {
+        KINET_ASSERT(machine_);
+        return machine_->kind();
+    }
+};
+
+class OnDiskDbServiceThread
+{
+public:
+    struct FiberUpsertRequest
+    {
+        ::boost::fibers::promise<Node::SharedPtr> promise;
+        Node::SharedPtr prev_root;
+        std::reference_wrapper<StateMachine> sm;
+        UpdateList updates;
+        uint64_t version;
+        bool enable_compaction;
+        bool can_write_to_fast;
+        bool write_root;
+        timeline_id tid;
+    };
+
+    struct FiberCopyTrieRequest
+    {
+        ::boost::fibers::promise<Node::SharedPtr> promise;
+        Node::SharedPtr src_root;
+        NibblesView src;
+        Node::SharedPtr dest_root;
+        NibblesView dest;
+        uint64_t dest_version;
+        timeline_id tid;
+        bool write_root;
+    };
+
+    struct FiberLoadAllFromBlockRequest
+    {
+        ::boost::fibers::promise<size_t> promise;
+        NodeCursor root;
+        std::reference_wrapper<StateMachine> sm;
+    };
+
+    struct FiberTraverseRequest
+    {
+        ::boost::fibers::promise<bool> promise;
+        Node::SharedPtr root;
+        std::reference_wrapper<TraverseMachine> machine;
+        uint64_t version;
+        size_t concurrency_limit;
+        timeline_id tid{timeline_id::primary};
+    };
+
+    struct MoveSubtrieRequest
+    {
+        ::boost::fibers::promise<void> promise;
+        uint64_t src;
+        uint64_t dest;
+        timeline_id tid;
+    };
+
+    struct FiberLoadRootVersionRequest
+    {
+        ::boost::fibers::promise<Node::SharedPtr> promise;
+        uint64_t version;
+        timeline_id tid;
+    };
+
+    struct RODbFiberFindOwningNodeRequest
+    {
+        ::boost::fibers::promise<find_result_type<NodeCursor>> promise;
+        NodeCursor start;
+        NibblesView key;
+        uint64_t version;
+        timeline_id tid;
+    };
+
+    using Comms = std::variant<
+        std::monostate, fiber_find_request_t, FiberUpsertRequest,
+        FiberLoadAllFromBlockRequest, FiberTraverseRequest, MoveSubtrieRequest,
+        FiberLoadRootVersionRequest, FiberCopyTrieRequest,
+        RODbFiberFindOwningNodeRequest>;
+
+private:
+    ::moodycamel::ConcurrentQueue<Comms> comms_;
+    std::mutex lock_;
+    std::condition_variable cond_;
+
+    struct DbAsyncWorker
+    {
+        OnDiskDbServiceThread *parent;
+        AsyncIOContext async_io;
+        UpdateAux aux;
+        std::atomic<bool> sleeping{false}, done{false};
+
+        DbAsyncWorker(
+            OnDiskDbServiceThread *const parent,
+            ReadOnlyOnDiskDbConfig const &options)
+            : parent(parent)
+            , async_io(options)
+            , aux(async_io.io)
+        {
+        }
+
+        DbAsyncWorker(
+            OnDiskDbServiceThread *const parent, OnDiskDbConfig const &options)
+            : parent(parent)
+            , async_io(options)
+            , aux{async_io.io, options.fixed_history_length}
+        {
+            if (options.rewind_to_latest_finalized) {
+                auto const latest_block_id =
+                    aux.metadata_ctx().get_latest_finalized_version();
+                if (latest_block_id == INVALID_BLOCK_NUM) {
+                    aux.clear_ondisk_db();
+                }
+                else {
+                    aux.rewind_to_version(latest_block_id);
+                }
+            }
+        }
+
+        void rodb_run(size_t const node_lru_max_mem)
+        {
+            inflight_map_owning_t inflight;
+            NodeCache node_cache{node_lru_max_mem};
+
+            Comms request;
+            unsigned did_nothing_count = 0;
+            while (!done.load(std::memory_order_acquire)) {
+                bool did_nothing = true;
+                if (parent->comms_.try_dequeue(request)) {
+                    if (auto *req = std::get_if<8>(&request); req != nullptr) {
+                        if (req->start.is_valid()) {
+                            find_owning_notify_fiber_future(
+                                aux,
+                                node_cache,
+                                inflight,
+                                std::move(req->promise),
+                                req->start,
+                                req->key,
+                                req->version,
+                                req->tid);
+                        }
+                        else {
+                            KINET_ASSERT(req->key.empty());
+                            load_root_notify_fiber_future(
+                                aux,
+                                node_cache,
+                                inflight,
+                                std::move(req->promise),
+                                req->version,
+                                req->tid);
+                        }
+                    }
+                    else if (auto *req = std::get_if<4>(&request);
+                             req != nullptr) {
+                        // verify version is valid
+                        if (aux.metadata_ctx().version_is_valid_ondisk(
+                                req->version, req->tid)) {
+                            req->promise.set_value(preorder_traverse_ondisk(
+                                aux,
+                                std::move(req->root),
+                                req->machine,
+                                req->version,
+                                req->tid,
+                                req->concurrency_limit));
+                        }
+                        else {
+                            req->promise.set_value(false);
+                        }
+                    }
+                    did_nothing = false;
+                }
+                async_io.io.poll_nonblocking(1);
+                if (did_nothing && async_io.io.io_in_flight() > 0) {
+                    did_nothing = false;
+                }
+                if (did_nothing) {
+                    did_nothing_count++;
+                }
+                else {
+                    did_nothing_count = 0;
+                }
+                if (did_nothing_count > 1000000) {
+                    std::unique_lock g(parent->lock_);
+                    sleeping.store(true, std::memory_order_release);
+                    /* Very irritatingly, Boost.Fiber may have fibers scheduled
+                     which weren't ready before, and if we sleep forever here
+                     then they never run and cause anything waiting on them to
+                     hang. So pulse Boost.Fiber every second at most for those
+                     extremely rare occasions.
+                     */
+                    parent->cond_.wait_for(g, std::chrono::seconds(1), [this] {
+                        return done.load(std::memory_order_acquire) ||
+                               parent->comms_.size_approx() > 0;
+                    });
+                    sleeping.store(false, std::memory_order_release);
+                }
+            }
+        }
+
+        // Runs in the triedb worker thread
+        void rwdb_run()
+        {
+            Comms request;
+            unsigned did_nothing_count = 0;
+            while (!done.load(std::memory_order_acquire)) {
+                bool did_nothing = true;
+                if (parent->comms_.try_dequeue(request)) {
+                    if (auto *req = std::get_if<1>(&request); req != nullptr) {
+                        find_notify_fiber_future(
+                            aux, std::move(req->promise), req->start, req->key);
+                    }
+                    else if (auto *req = std::get_if<2>(&request);
+                             req != nullptr) {
+                        req->promise.set_value(aux.do_update(
+                            std::move(req->prev_root),
+                            req->sm,
+                            std::move(req->updates),
+                            req->version,
+                            req->enable_compaction,
+                            req->can_write_to_fast,
+                            req->write_root,
+                            req->tid));
+                    }
+                    else if (auto *req = std::get_if<3>(&request);
+                             req != nullptr) {
+                        req->promise.set_value(
+                            mpt::load_all(aux, req->sm, req->root));
+                    }
+                    else if (auto *req = std::get_if<4>(&request);
+                             req != nullptr) {
+                        // verify version is valid
+                        if (aux.metadata_ctx().version_is_valid_ondisk(
+                                req->version, req->tid)) {
+                            req->promise.set_value(preorder_traverse_ondisk(
+                                aux,
+                                std::move(req->root),
+                                req->machine,
+                                req->version,
+                                req->tid,
+                                req->concurrency_limit));
+                        }
+                        else {
+                            req->promise.set_value(false);
+                        }
+                    }
+                    else if (auto *req = std::get_if<5>(&request);
+                             req != nullptr) {
+                        aux.move_trie_version_forward(
+                            req->src, req->dest, req->tid);
+                        req->promise.set_value();
+                    }
+                    else if (auto *req = std::get_if<6>(&request);
+                             req != nullptr) {
+                        auto const root_offset =
+                            aux.metadata_ctx().get_root_offset_at_version(
+                                req->version, req->tid);
+                        if (root_offset == INVALID_OFFSET) {
+                            req->promise.set_value(nullptr);
+                        }
+                        else {
+                            req->promise.set_value(read_node_blocking(
+                                aux, root_offset, req->version, req->tid));
+                        }
+                    }
+                    else if (auto *req = std::get_if<7>(&request);
+                             req != nullptr) {
+                        auto root = copy_trie_to_dest(
+                            aux,
+                            std::move(req->src_root),
+                            req->src,
+                            std::move(req->dest_root),
+                            req->dest,
+                            req->dest_version,
+                            req->tid,
+                            req->write_root);
+                        req->promise.set_value(std::move(root));
+                    }
+                    did_nothing = false;
+                }
+                async_io.io.poll_nonblocking(1);
+                if (did_nothing && async_io.io.io_in_flight() > 0) {
+                    did_nothing = false;
+                }
+                if (did_nothing) {
+                    did_nothing_count++;
+                }
+                else {
+                    did_nothing_count = 0;
+                }
+                if (did_nothing_count > 1000000) {
+                    std::unique_lock g(parent->lock_);
+                    sleeping.store(true, std::memory_order_release);
+                    /* Very irritatingly, Boost.Fiber may have fibers scheduled
+                     which weren't ready before, and if we sleep forever here
+                     then they never run and cause anything waiting on them to
+                     hang. So pulse Boost.Fiber every second at most for those
+                     extremely rare occasions.
+                     */
+                    parent->cond_.wait_for(g, std::chrono::seconds(1), [this] {
+                        return done.load(std::memory_order_acquire) ||
+                               parent->comms_.size_approx() > 0;
+                    });
+                    sleeping.store(false, std::memory_order_release);
+                }
+            }
+        }
+    };
+
+    std::unique_ptr<DbAsyncWorker> worker_;
+    std::thread worker_thread_;
+
+public:
+    OnDiskDbServiceThread(OnDiskDbServiceThread const &) = delete;
+    OnDiskDbServiceThread &operator=(OnDiskDbServiceThread const &) = delete;
+
+    explicit OnDiskDbServiceThread(OnDiskDbConfig const &options)
+        : worker_thread_([&, options = options] {
+            {
+                std::unique_lock const g(lock_);
+                worker_ = std::make_unique<DbAsyncWorker>(this, options);
+                cond_.notify_one();
+            }
+            worker_->rwdb_run();
+            std::unique_lock const g(lock_);
+            worker_.reset();
+        })
+    {
+        std::unique_lock g(lock_);
+        cond_.wait(g, [this] { return worker_ != nullptr; });
+    }
+
+    explicit OnDiskDbServiceThread(ReadOnlyOnDiskDbConfig const &options)
+        : worker_thread_([&, options = options] {
+            {
+                std::unique_lock const g(lock_);
+                worker_ = std::make_unique<DbAsyncWorker>(this, options);
+                cond_.notify_one();
+            }
+            worker_->rodb_run(options.node_lru_max_mem);
+            std::unique_lock const g(lock_);
+            worker_.reset();
+        })
+    {
+        std::unique_lock g(lock_);
+        cond_.wait(g, [this] { return worker_ != nullptr; });
+    }
+
+    ~OnDiskDbServiceThread()
+    {
+        {
+            std::unique_lock const g(lock_);
+            worker_->done.store(true, std::memory_order_release);
+            cond_.notify_one();
+        }
+        worker_thread_.join();
+        // worker_ already reset by the thread lambda (AsyncIO requires
+        // same-thread destruction). unique_ptr destructor is a no-op.
+    }
+
+    void submit(Comms request)
+    {
+        KINET_ASSERT(worker_ != nullptr);
+        comms_.enqueue(std::move(request));
+        if (worker_->sleeping.load(std::memory_order_acquire)) {
+            std::unique_lock const g(lock_);
+            cond_.notify_one();
+        }
+    }
+
+    UpdateAux &aux()
+    {
+        KINET_ASSERT(worker_ != nullptr);
+        return worker_->aux;
+    }
+
+    UpdateAux const &aux() const
+    {
+        KINET_ASSERT(worker_ != nullptr);
+        return worker_->aux;
+    }
+};
+
+class Db::RWOnDisk final : public Impl
+{
+    std::shared_ptr<OnDiskDbServiceThread> worker_thread_;
+    // Owned by this RWOnDisk. Reset by promote_secondary_to_primary: the
+    // promoted trie was written with the sibling's machine, so any upsert
+    // on this Db before close+reopen would corrupt hashes. A null check
+    // before each upsert traps that mistake.
+    std::unique_ptr<StateMachine> machine_;
+    timeline_id const tid_;
+    bool const compaction_;
+
+    // A write_root=false upsert leaves V unflushed on this RWOnDisk's
+    // timeline. Per-RWOnDisk because tid_ is fixed at construction.
+    uint64_t unflushed_version_{INVALID_BLOCK_NUM};
+
+public:
+    RWOnDisk(
+        std::shared_ptr<OnDiskDbServiceThread> worker_thread,
+        std::unique_ptr<StateMachine> machine, timeline_id const tid,
+        bool const compaction)
+        : worker_thread_(std::move(worker_thread))
+        , machine_{std::move(machine)}
+        , tid_{tid}
+        , compaction_{compaction}
+    {
+        KINET_ASSERT(worker_thread_ != nullptr);
+        KINET_ASSERT(machine_);
+    }
+
+    void clear_machine() noexcept
+    {
+        machine_.reset();
+    }
+
+    // Returns a fresh RWOnDisk wired to the same worker thread (and thus the
+    // same UpdateAux, AsyncIO, and storage pool) but bound to a different
+    // machine + timeline. Used to mint a secondary Db that shares the
+    // primary's underlying service thread.
+    std::unique_ptr<RWOnDisk> spawn_sibling(
+        std::unique_ptr<StateMachine> machine, timeline_id const tid) const
+    {
+        KINET_ASSERT(machine_ != nullptr);
+        KINET_ASSERT(machine != nullptr);
+        return std::make_unique<RWOnDisk>(
+            worker_thread_, std::move(machine), tid, compaction_);
+    }
+
+    long worker_thread_use_count() const noexcept
+    {
+        return worker_thread_.use_count();
+    }
+
+    virtual UpdateAux &aux() override
+    {
+        return worker_thread_->aux();
+    }
+
+    // threadsafe
+    virtual find_cursor_result_type find_fiber_blocking(
+        NodeCursor const &start, NibblesView const &key,
+        uint64_t const version) override
+    {
+        // Validating once suffices — RWDb does not interleave upserts and
+        // reads. An unflushed-version hit on this timeline bypasses the
+        // ondisk check since the version is in-memory only.
+        if (unflushed_version_ != version &&
+            !aux().metadata_ctx().version_is_valid_ondisk(version, tid_)) {
+            return {NodeCursor{}, find_result::version_no_longer_exist};
+        }
+        ::boost::fibers::promise<find_cursor_result_type> promise;
+        auto fut = promise.get_future();
+        worker_thread_->submit(fiber_find_request_t{
+            .promise = std::move(promise), .start = start, .key = key});
+        return fut.get();
+    }
+
+    // threadsafe
+    virtual Node::SharedPtr upsert_fiber_blocking(
+        Node::SharedPtr root, UpdateList &&updates, uint64_t const version,
+        bool const enable_compaction, bool const can_write_to_fast,
+        bool const write_root) override
+    {
+        KINET_ASSERT(machine_ != nullptr);
+        if (unflushed_version_ != INVALID_BLOCK_NUM &&
+            unflushed_version_ != version) {
+            LOG_WARNING(
+                "Update version {} while db hasn't flushed the last update on "
+                "version {}, the unflushed progress will be lost after this "
+                "point",
+                version,
+                unflushed_version_);
+        }
+        unflushed_version_ = write_root ? INVALID_BLOCK_NUM : version;
+        ::boost::fibers::promise<Node::SharedPtr> promise;
+        auto fut = promise.get_future();
+        worker_thread_->submit(OnDiskDbServiceThread::FiberUpsertRequest{
+            .promise = std::move(promise),
+            .prev_root = std::move(root),
+            .sm = *machine_,
+            .updates = std::move(updates),
+            .version = version,
+            .enable_compaction = enable_compaction && compaction_,
+            .can_write_to_fast = can_write_to_fast,
+            .write_root = write_root,
+            .tid = tid_});
+        return fut.get();
+    }
+
+    virtual void move_trie_version_fiber_blocking(
+        uint64_t const src, uint64_t const dest) override
+    {
+        ::boost::fibers::promise<void> promise;
+        auto fut = promise.get_future();
+        worker_thread_->submit(OnDiskDbServiceThread::MoveSubtrieRequest{
+            .promise = std::move(promise),
+            .src = src,
+            .dest = dest,
+            .tid = tid_});
+        fut.get();
+    }
+
+    // threadsafe
+    virtual size_t prefetch_fiber_blocking(Node::SharedPtr const &root) override
+    {
+        KINET_ASSERT(machine_ != nullptr);
+        ::boost::fibers::promise<size_t> promise;
+        auto fut = promise.get_future();
+        worker_thread_->submit(
+            OnDiskDbServiceThread::FiberLoadAllFromBlockRequest{
+                .promise = std::move(promise),
+                .root = NodeCursor{root},
+                .sm = *machine_});
+        return fut.get();
+    }
+
+    virtual size_t poll(bool, size_t) override
+    {
+        return 0;
+    }
+
+    // threadsafe
+    virtual bool traverse_fiber_blocking(
+        Node::SharedPtr node, TraverseMachine &machine, uint64_t const version,
+        size_t const concurrency_limit) override
+    {
+        ::boost::fibers::promise<bool> promise;
+        auto fut = promise.get_future();
+        worker_thread_->submit(OnDiskDbServiceThread::FiberTraverseRequest{
+            .promise = std::move(promise),
+            .root = std::move(node),
+            .machine = machine,
+            .version = version,
+            .concurrency_limit = concurrency_limit,
+            .tid = tid_});
+        return fut.get();
+    }
+
+    virtual Node::SharedPtr
+    load_root_for_version(uint64_t const version) override
+    {
+        if (!aux().metadata_ctx().version_is_valid_ondisk(version, tid_)) {
+            return nullptr;
+        }
+        ::boost::fibers::promise<Node::SharedPtr> promise;
+        auto fut = promise.get_future();
+        worker_thread_->submit(
+            OnDiskDbServiceThread::FiberLoadRootVersionRequest{
+                .promise = std::move(promise),
+                .version = version,
+                .tid = tid_});
+        return fut.get();
+    }
+
+    virtual Node::SharedPtr copy_trie_fiber_blocking(
+        Node::SharedPtr src_root, NibblesView const src_prefix,
+        Node::SharedPtr dest_root, NibblesView const dest_prefix,
+        uint64_t const dest_version, bool const write_root = true) override
+    {
+        if (unflushed_version_ != INVALID_BLOCK_NUM &&
+            unflushed_version_ != dest_version) {
+            LOG_WARNING(
+                "Update version {} while db hasn't flushed the last update on "
+                "version {}, the unflushed progress will be lost after this "
+                "point",
+                dest_version,
+                unflushed_version_);
+        }
+        unflushed_version_ = write_root ? INVALID_BLOCK_NUM : dest_version;
+
+        ::boost::fibers::promise<Node::SharedPtr> promise;
+        auto fut = promise.get_future();
+        worker_thread_->submit(OnDiskDbServiceThread::FiberCopyTrieRequest{
+            .promise = std::move(promise),
+            .src_root = std::move(src_root),
+            .src = src_prefix,
+            .dest_root = std::move(dest_root),
+            .dest = dest_prefix,
+            .dest_version = dest_version,
+            .tid = tid_,
+            .write_root = write_root});
+        return fut.get();
+    }
+
+    virtual timeline_id tid() const override
+    {
+        return tid_;
+    }
+
+    virtual mpt::state_machine_kind state_machine_type() const override
+    {
+        return worker_thread_->aux().metadata_ctx().get_state_machine_kind(
+            tid_);
+    }
+};
+
+struct RODb::Impl final
+{
+    std::shared_ptr<OnDiskDbServiceThread> worker_thread_;
+    timeline_id const tid_;
+
+    explicit Impl(
+        std::shared_ptr<OnDiskDbServiceThread> worker_thread,
+        timeline_id const tid)
+        : worker_thread_(std::move(worker_thread))
+        , tid_(tid)
+    {
+        KINET_ASSERT(worker_thread_ != nullptr);
+        KINET_ASSERT(
+            worker_thread_->aux().metadata_ctx().timeline_active(tid_),
+            "RODb opened on an inactive timeline");
+    }
+
+    UpdateAux &aux()
+    {
+        return worker_thread_->aux();
+    }
+
+    find_owning_cursor_result_type find_fiber_blocking(
+        NodeCursor const &start, NibblesView const &key, uint64_t const version)
+    {
+        ::boost::fibers::promise<find_owning_cursor_result_type> promise;
+        auto fut = promise.get_future();
+        worker_thread_->submit(
+            OnDiskDbServiceThread::RODbFiberFindOwningNodeRequest{
+                .promise = std::move(promise),
+                .start = start,
+                .key = key,
+                .version = version,
+                .tid = tid_});
+        return fut.get();
+    }
+
+    NodeCursor load_root_fiber_blocking(uint64_t const version)
+    {
+        auto const root_offset =
+            aux().metadata_ctx().get_root_offset_at_version(version, tid_);
+        if (root_offset == INVALID_OFFSET) {
+            return {};
+        }
+        auto [cursor, result] = find_fiber_blocking({}, {}, version);
+        if (result == find_result::success) {
+            KINET_ASSERT(cursor.is_valid());
+            return cursor;
+        }
+        return {};
+    }
+
+    bool traverse_fiber_blocking(
+        Node::SharedPtr node, TraverseMachine &machine, uint64_t const version,
+        size_t const concurrency_limit)
+    {
+        ::boost::fibers::promise<bool> promise;
+        auto fut = promise.get_future();
+        worker_thread_->submit(OnDiskDbServiceThread::FiberTraverseRequest{
+            .promise = std::move(promise),
+            .root = std::move(node),
+            .machine = machine,
+            .version = version,
+            .concurrency_limit = concurrency_limit,
+            .tid = tid_});
+        return fut.get();
+    }
+};
+
+RODb::RODb(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl))
+{
+}
+
+RODb::RODb(ReadOnlyOnDiskDbConfig const &options)
+    : impl_(std::make_unique<Impl>(
+          std::make_shared<OnDiskDbServiceThread>(options),
+          timeline_id::primary))
+{
+}
+
+RODb::~RODb() = default;
+
+std::unique_ptr<RODb> RODb::open_secondary_timeline() const
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(impl_->tid_ == timeline_id::primary);
+    if (!impl_->aux().metadata_ctx().timeline_active(timeline_id::secondary)) {
+        return nullptr;
+    }
+    return std::unique_ptr<RODb>(new RODb(
+        std::make_unique<Impl>(impl_->worker_thread_, timeline_id::secondary)));
+}
+
+uint64_t RODb::get_latest_version() const
+{
+    KINET_ASSERT(impl_);
+    return impl_->aux().metadata_ctx().db_history_max_version(impl_->tid_);
+}
+
+uint64_t RODb::get_earliest_version() const
+{
+    KINET_ASSERT(impl_);
+    return impl_->aux().metadata_ctx().db_history_min_valid_version(
+        impl_->tid_);
+}
+
+bool RODb::timeline_active(timeline_id const tid) const
+{
+    KINET_ASSERT(impl_);
+    return impl_->aux().metadata_ctx().timeline_active(tid);
+}
+
+bool RODb::version_is_valid_ondisk(uint64_t const version) const
+{
+    KINET_ASSERT(impl_);
+    return impl_->aux().metadata_ctx().version_is_valid_ondisk(
+        version, impl_->tid_);
+}
+
+state_machine_kind RODb::state_machine_type() const
+{
+    KINET_ASSERT(impl_);
+    return impl_->aux().metadata_ctx().get_state_machine_kind(impl_->tid_);
+}
+
+DbError find_result_to_db_error(find_result const result) noexcept
+{
+    switch (result) {
+    case find_result::key_mismatch_failure:
+    case find_result::branch_not_exist_failure:
+    case find_result::key_ends_earlier_than_node_failure:
+        return DbError::key_not_found;
+    case find_result::root_node_is_null_failure:
+    case find_result::version_no_longer_exist:
+        return DbError::version_no_longer_exist;
+    case find_result::unknown:
+        return DbError::unknown;
+    default:
+        KINET_ASSERT_PRINTF(
+            false, "Unexpected find result: %d", static_cast<int>(result));
+        return DbError::unknown;
+    }
+}
+
+Result<NodeCursor> RODb::find(
+    NodeCursor const &node_cursor, NibblesView const key,
+    uint64_t const block_id) const
+{
+    KINET_ASSERT(impl_);
+    if (!node_cursor.is_valid()) {
+        return DbError::version_no_longer_exist;
+    }
+    if (key.empty()) {
+        return node_cursor;
+    }
+    auto [cursor, result] =
+        impl_->find_fiber_blocking(node_cursor, key, block_id);
+    if (result != find_result::success) {
+        return find_result_to_db_error(result);
+    }
+    KINET_ASSERT(cursor.is_valid());
+    KINET_ASSERT(cursor.node->has_value());
+    return cursor;
+}
+
+Result<NodeCursor>
+RODb::find(NibblesView const key, uint64_t const block_id) const
+{
+    KINET_ASSERT(impl_);
+    NodeCursor const cursor = impl_->load_root_fiber_blocking(block_id);
+    return find(cursor, key, block_id);
+}
+
+bool RODb::traverse(
+    NodeCursor const &cursor, TraverseMachine &machine, uint64_t const block_id,
+    size_t const concurrency_limit)
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(cursor.is_valid());
+    return impl_->traverse_fiber_blocking(
+        cursor.node, machine, block_id, concurrency_limit);
+}
+
+Db::Db(std::unique_ptr<StateMachine> machine)
+    : impl_{std::make_unique<InMemory>(std::move(machine))}
+{
+}
+
+Db::Db(std::unique_ptr<StateMachine> machine, OnDiskDbConfig const &config)
+    : impl_{[&] {
+        auto const machine_kind = machine->kind();
+        auto impl = std::make_unique<RWOnDisk>(
+            std::make_shared<OnDiskDbServiceThread>(config),
+            std::move(machine),
+            timeline_id::primary,
+            config.compaction);
+        impl->aux().metadata_ctx().set_state_machine_kind(
+            timeline_id::primary, machine_kind);
+        return impl;
+    }()}
+{
+    KINET_ASSERT(impl_->aux().is_on_disk());
+}
+
+Db::Db(OnDiskDbConfig const &config)
+{
+    auto worker = std::make_shared<OnDiskDbServiceThread>(config);
+    auto machine = create_state_machine(
+        worker->aux().metadata_ctx().get_state_machine_kind(
+            timeline_id::primary));
+    impl_ = std::make_unique<RWOnDisk>(
+        std::move(worker),
+        std::move(machine),
+        timeline_id::primary,
+        config.compaction);
+    KINET_ASSERT(impl_->aux().is_on_disk());
+}
+
+Db::Db(AsyncIOContext &io_ctx, timeline_id const tid)
+    : impl_{std::make_unique<ROOnDiskBlocking>(io_ctx, tid)}
+{
+}
+
+Db::Db(std::unique_ptr<Impl> impl)
+    : impl_{std::move(impl)}
+{
+    KINET_ASSERT(impl_);
+}
+
+Db::Db(Db &&) noexcept = default;
+Db &Db::operator=(Db &&) noexcept = default;
+Db::~Db() = default;
+
+Result<NodeCursor> Db::find(
+    NodeCursor const &root, NibblesView const key,
+    uint64_t const block_id) const
+{
+    KINET_ASSERT(impl_);
+    auto const [it, result] = impl_->find_fiber_blocking(root, key, block_id);
+    if (result != find_result::success) {
+        return find_result_to_db_error(result);
+    }
+    KINET_ASSERT(it.node != nullptr);
+    KINET_ASSERT(it.node->has_value());
+    return it;
+}
+
+Result<NodeCursor>
+Db::find(NibblesView const key, uint64_t const block_id) const
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(impl_->aux().is_on_disk());
+    auto const root = impl_->load_root_for_version(block_id);
+    return find(NodeCursor{root}, key, block_id);
+}
+
+Node::SharedPtr Db::load_root_for_version(uint64_t const block_id) const
+{
+    KINET_ASSERT(impl_);
+    return impl_->load_root_for_version(block_id);
+}
+
+Node::SharedPtr Db::upsert(
+    Node::SharedPtr root, UpdateList list, uint64_t const block_id,
+    bool const enable_compaction, bool const can_write_to_fast,
+    bool const write_root)
+{
+    KINET_ASSERT(impl_);
+    return impl_->upsert_fiber_blocking(
+        std::move(root),
+        std::move(list),
+        block_id,
+        enable_compaction,
+        can_write_to_fast,
+        write_root);
+}
+
+Node::SharedPtr Db::copy_trie(
+    Node::SharedPtr src_root, NibblesView const src_prefix,
+    Node::SharedPtr dest_root, NibblesView const dest_prefix,
+    uint64_t const dest_version, bool const write_root)
+{
+    KINET_ASSERT(impl_);
+    return impl_->copy_trie_fiber_blocking(
+        std::move(src_root),
+        src_prefix,
+        std::move(dest_root),
+        dest_prefix,
+        dest_version,
+        write_root);
+}
+
+void Db::move_trie_version_forward(uint64_t const src, uint64_t const dest)
+{
+    KINET_ASSERT(impl_);
+    impl_->move_trie_version_fiber_blocking(src, dest);
+    return;
+}
+
+bool Db::traverse(
+    NodeCursor const &cursor, TraverseMachine &machine, uint64_t const block_id,
+    size_t const concurrency_limit)
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(cursor.is_valid());
+    return impl_->traverse_fiber_blocking(
+        cursor.node, machine, block_id, concurrency_limit);
+}
+
+bool Db::traverse_blocking(
+    NodeCursor const &cursor, TraverseMachine &machine, uint64_t const block_id)
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(cursor.is_valid());
+    return preorder_traverse_blocking(
+        impl_->aux(), *cursor.node, machine, block_id, impl_->tid());
+}
+
+void Db::update_finalized_version(uint64_t const version)
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(!is_read_only());
+    if (is_on_disk()) {
+        impl_->aux().metadata_ctx().set_latest_finalized_version(version);
+    } // noop for in memory db
+}
+
+void Db::update_verified_version(uint64_t const version)
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(!is_read_only());
+    if (is_on_disk()) {
+        KINET_ASSERT(
+            version <=
+            impl_->aux().metadata_ctx().db_history_max_version(tid()));
+        impl_->aux().metadata_ctx().set_latest_verified_version(version);
+    } // noop for in memory db
+}
+
+void Db::update_voted_metadata(
+    uint64_t const version, bytes32_t const &block_id)
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(is_on_disk() && !is_read_only());
+    impl_->aux().metadata_ctx().set_latest_voted(version, block_id);
+}
+
+void Db::update_proposed_metadata(
+    uint64_t const version, bytes32_t const &block_id)
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(is_on_disk() && !is_read_only());
+    impl_->aux().metadata_ctx().set_latest_proposed(version, block_id);
+}
+
+uint64_t Db::get_latest_finalized_version() const
+{
+    KINET_ASSERT(impl_);
+    return is_on_disk()
+               ? impl_->aux().metadata_ctx().get_latest_finalized_version()
+               : INVALID_BLOCK_NUM;
+}
+
+uint64_t Db::get_latest_verified_version() const
+{
+    KINET_ASSERT(impl_);
+    return is_on_disk()
+               ? impl_->aux().metadata_ctx().get_latest_verified_version()
+               : INVALID_BLOCK_NUM;
+}
+
+bytes32_t Db::get_latest_voted_block_id() const
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(is_on_disk());
+    return impl_->aux().metadata_ctx().get_latest_voted_block_id();
+}
+
+uint64_t Db::get_latest_voted_version() const
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(is_on_disk());
+    return impl_->aux().metadata_ctx().get_latest_voted_version();
+}
+
+bytes32_t Db::get_latest_proposed_block_id() const
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(is_on_disk());
+    return impl_->aux().metadata_ctx().get_latest_proposed_block_id();
+}
+
+uint64_t Db::get_latest_proposed_version() const
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(is_on_disk());
+    return impl_->aux().metadata_ctx().get_latest_proposed_version();
+}
+
+uint64_t Db::get_latest_version() const
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(is_on_disk());
+    return impl_->aux().metadata_ctx().db_history_max_version(tid());
+}
+
+uint64_t Db::get_earliest_version() const
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(is_on_disk());
+    return impl_->aux().metadata_ctx().db_history_min_valid_version(tid());
+}
+
+DbStorageStats Db::get_storage_stats() const
+{
+    KINET_ASSERT(impl_);
+    if (!is_on_disk()) {
+        return {0, 0};
+    }
+    uint64_t capacity = 0;
+    uint64_t used = 0;
+    for (auto const &dev : impl_->aux().io->storage_pool().devices()) {
+        auto const [c, u] = dev.capacity();
+        capacity += c;
+        used += u;
+    }
+    return {capacity, used};
+}
+
+size_t Db::prefetch(Node::SharedPtr const &root)
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(is_on_disk());
+    if (get_latest_version() == INVALID_BLOCK_NUM) {
+        return 0;
+    }
+    return impl_->prefetch_fiber_blocking(root);
+}
+
+size_t Db::poll(bool const blocking, size_t const count)
+{
+    KINET_ASSERT(impl_);
+    return impl_->poll(blocking, count);
+}
+
+bool Db::is_on_disk() const
+{
+    KINET_ASSERT(impl_);
+    return impl_->aux().is_on_disk();
+}
+
+bool Db::is_read_only() const
+{
+    KINET_ASSERT(impl_);
+    return is_on_disk() && impl_->aux().io->is_read_only();
+}
+
+UpdateAux const &Db::aux() const
+{
+    KINET_ASSERT(impl_);
+    return impl_->aux();
+}
+
+UpdateAux &Db::aux()
+{
+    KINET_ASSERT(impl_);
+    return impl_->aux();
+}
+
+mpt::state_machine_kind Db::state_machine_type() const
+{
+    KINET_ASSERT(impl_);
+    return impl_->state_machine_type();
+}
+
+Db Db::activate_secondary_timeline(
+    std::unique_ptr<StateMachine> secondary_machine)
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(secondary_machine);
+    KINET_ASSERT(is_on_disk() && !is_read_only());
+    auto *const rw = static_cast<RWOnDisk *>(impl_.get());
+    KINET_ASSERT(rw->tid() == timeline_id::primary);
+    KINET_ASSERT(rw->worker_thread_use_count() == 1);
+    KINET_ASSERT(
+        !rw->aux().metadata_ctx().timeline_active(timeline_id::secondary),
+        "secondary timeline already active, cannot activate again");
+    rw->aux().activate_secondary_timeline();
+    rw->aux().metadata_ctx().set_state_machine_kind(
+        timeline_id::secondary, secondary_machine->kind());
+    return Db{rw->spawn_sibling(
+        std::move(secondary_machine), timeline_id::secondary)};
+}
+
+std::optional<Db>
+Db::open_secondary_timeline(std::unique_ptr<StateMachine> secondary_machine)
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(secondary_machine);
+    KINET_ASSERT(is_on_disk() && !is_read_only());
+    auto *const rw = static_cast<RWOnDisk *>(impl_.get());
+    KINET_ASSERT(rw->tid() == timeline_id::primary);
+    KINET_ASSERT(rw->worker_thread_use_count() == 1);
+    if (!rw->aux().metadata_ctx().timeline_active(timeline_id::secondary)) {
+        return std::nullopt;
+    }
+    rw->aux().metadata_ctx().set_state_machine_kind(
+        timeline_id::secondary, secondary_machine->kind());
+    return Db{rw->spawn_sibling(
+        std::move(secondary_machine), timeline_id::secondary)};
+}
+
+std::optional<Db> Db::open_secondary_timeline()
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(is_on_disk() && !is_read_only());
+    auto *const rw = static_cast<RWOnDisk *>(impl_.get());
+    KINET_ASSERT(rw->tid() == timeline_id::primary);
+    KINET_ASSERT(rw->worker_thread_use_count() == 1);
+    if (!rw->aux().metadata_ctx().timeline_active(timeline_id::secondary)) {
+        return std::nullopt;
+    }
+    auto const kind =
+        rw->aux().metadata_ctx().get_state_machine_kind(timeline_id::secondary);
+    auto machine = create_state_machine(kind); // will assert if undefined
+    return Db{rw->spawn_sibling(std::move(machine), timeline_id::secondary)};
+}
+
+void Db::promote_secondary_to_primary()
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(is_on_disk() && !is_read_only());
+    auto *const rw = static_cast<RWOnDisk *>(impl_.get());
+    KINET_ASSERT(rw->tid() == timeline_id::primary);
+    KINET_ASSERT(rw->worker_thread_use_count() == 1);
+    rw->aux().promote_secondary_to_primary();
+    // The promoted trie was written with the secondary's machine; clear
+    // this Db's binding so any stray upsert before the expected
+    // close+reopen traps instead of silently corrupting hashes.
+    rw->clear_machine();
+}
+
+void Db::deactivate_secondary_timeline()
+{
+    KINET_ASSERT(impl_);
+    KINET_ASSERT(is_on_disk() && !is_read_only());
+    auto *const rw = static_cast<RWOnDisk *>(impl_.get());
+    KINET_ASSERT(rw->tid() == timeline_id::primary);
+    KINET_ASSERT(rw->worker_thread_use_count() == 1);
+    rw->aux().deactivate_secondary_timeline();
+}
+
+bool Db::timeline_active(timeline_id const tid) const
+{
+    KINET_ASSERT(impl_);
+    return impl_->aux().metadata_ctx().timeline_active(tid);
+}
+
+timeline_id Db::tid() const
+{
+    KINET_ASSERT(impl_);
+    return impl_->tid();
+}
+
+uint64_t Db::get_history_length() const
+{
+    return is_on_disk() ? impl_->aux().metadata_ctx().version_history_length()
+                        : 1;
+}
+
+AsyncContext::AsyncContext(Db &db, size_t const node_lru_max_mem)
+    : aux(db.impl_->aux())
+    , tid(db.impl_->tid())
+    , node_cache(node_lru_max_mem)
+{
+}
+
+AsyncContextUniquePtr
+async_context_create(Db &db, size_t const node_lru_max_mem)
+{
+    return std::make_unique<AsyncContext>(db, node_lru_max_mem);
+}
+
+namespace detail
+{
+
+    // Reads root nodes from on disk, and supports other inflight async requests
+    // from the same sender.
+    template <typename T>
+    struct load_root_receiver_t
+    {
+        static constexpr bool lifetime_managed_internally = true;
+
+        chunk_offset_t offset;
+        DbGetSender<T> *sender;
+        async::erased_connected_operation *const io_state;
+        chunk_offset_t rd_offset{0, 0};
+        unsigned bytes_to_read;
+        uint16_t buffer_off;
+
+        constexpr load_root_receiver_t(
+            chunk_offset_t const offset_, DbGetSender<T> *const sender_,
+            async::erased_connected_operation *const io_state_)
+            : offset(offset_)
+            , sender(sender_)
+            , io_state(io_state_)
+        {
+            auto const num_pages_to_load_node =
+                node_disk_pages_spare_15{offset_}.to_pages();
+            bytes_to_read =
+                static_cast<unsigned>(num_pages_to_load_node << DISK_PAGE_BITS);
+            rd_offset = offset_;
+            auto const new_offset =
+                round_down_align<DISK_PAGE_BITS>(offset_.offset);
+            KINET_ASSERT(new_offset <= chunk_offset_t::max_offset);
+            rd_offset.offset = new_offset & chunk_offset_t::max_offset;
+            buffer_off = uint16_t(offset_.offset - rd_offset.offset);
+        }
+
+        template <class ResultType>
+        void set_value(
+            kinet::async::erased_connected_operation *, ResultType buffer_)
+        {
+            KINET_ASSERT(buffer_);
+
+            auto &inflights = sender->context.inflight_roots;
+            auto const it = inflights.find(sender->block_id);
+            auto const pendings = std::move(it->second);
+            inflights.erase(it);
+            std::shared_ptr<Node> root{};
+            bool const block_alive_after_read =
+                sender->context.aux.metadata_ctx().version_is_valid_ondisk(
+                    sender->block_id, sender->context.tid);
+            if (block_alive_after_read) {
+                sender->root = detail::deserialize_node_from_receiver_result(
+                    std::move(buffer_), buffer_off, io_state);
+                root = sender->root;
+                sender->res_root = {{sender->root}, find_result::success};
+                auto const virt_offset =
+                    sender->context.aux.physical_to_virtual(offset);
+                sender->context.node_cache.insert(virt_offset, sender->root);
+            }
+            else {
+                sender->res_root = {{}, find_result::version_no_longer_exist};
+            }
+
+            for (auto const &invoc : pendings) {
+                // Calling invoc() may invoke user code which deletes `sender`.
+                // It is no longer safe to rely on the `sender` lifetime
+                invoc(root);
+            }
+        }
+    };
+
+    // Processes results from find_request_sender, proxying the result back to
+    // the DbGetSender.
+    template <return_type T>
+    struct find_request_receiver_t
+    {
+        find_result_type<T> &get_result;
+        async::erased_connected_operation *const io_state;
+        uint64_t const version;
+        UpdateAux &aux;
+        timeline_id const tid;
+
+        static constexpr bool lifetime_managed_internally = true;
+
+        void set_value(
+            async::erased_connected_operation *const this_io_state,
+            find_request_sender<T>::result_type res)
+        {
+            if (!res) {
+                io_state->completed(
+                    async::result<void>(std::move(res).as_failure()));
+                delete this_io_state;
+                return;
+            }
+            get_result =
+                aux.metadata_ctx().version_is_valid_ondisk(version, tid)
+                    ? std::move(res).assume_value()
+                    : find_result_type<T>{
+                          T{}, find_result::version_no_longer_exist};
+
+            io_state->completed(async::success());
+            delete this_io_state;
+        }
+    };
+
+    template <return_type T>
+    async::result<void> DbGetSender<T>::operator()(
+        async::erased_connected_operation *const io_state)
+    {
+        switch (op_type) {
+        case op_t::op_get1:
+        case op_t::op_get_data1:
+        case op_t::op_get_node1: {
+            chunk_offset_t const offset =
+                context.aux.metadata_ctx().get_root_offset_at_version(
+                    block_id, context.tid);
+            auto const virt_offset = context.aux.physical_to_virtual(offset);
+            NodeCache::ConstAccessor acc;
+            if (context.node_cache.find(acc, virt_offset)) {
+                // found in LRU - no IO necessary
+                root = acc->second->val.first;
+                res_root = {{root}, find_result::success};
+                io_state->completed(async::success());
+                return async::success();
+            }
+            if (offset == INVALID_OFFSET) {
+                // root is no longer valid
+                res_root = {{}, find_result::version_no_longer_exist};
+                io_state->completed(async::success());
+                return async::success();
+            }
+
+            auto cont = [this, io_state](std::shared_ptr<Node> root_) {
+                if (!root_) {
+                    res_root = {{}, find_result::version_no_longer_exist};
+                }
+                else {
+                    root = root_;
+                    res_root = {{root}, find_result::success};
+                }
+                io_state->completed(async::success());
+            };
+            auto &inflights = context.inflight_roots;
+            if (auto const it = inflights.find(block_id);
+                it != inflights.end()) {
+                it->second.emplace_back(cont);
+            }
+            else {
+                inflights[block_id].emplace_back(cont);
+                async_read(
+                    context.aux, load_root_receiver_t{offset, this, io_state});
+            }
+            return async::success();
+        }
+        case op_t::op_get2:
+        case op_t::op_get_data2:
+        case op_t::op_get_node2: {
+            // verify version is valid in db history before doing anything
+            if (!context.aux.metadata_ctx().version_is_valid_ondisk(
+                    block_id, context.tid)) {
+                get_result = {T{}, find_result::version_no_longer_exist};
+                io_state->completed(async::success());
+                return async::success();
+            }
+
+            auto *state = new auto(async::connect(
+                find_request_sender<T>(
+                    context.aux,
+                    context.node_cache,
+                    context.inflight_nodes,
+                    cur,
+                    block_id,
+                    nv,
+                    op_type == op_t::op_get2,
+                    context.tid),
+                find_request_receiver_t<T>{
+                    get_result, io_state, block_id, context.aux, context.tid}));
+            state->initiate();
+            return async::success();
+        }
+        }
+        KINET_ABORT();
+    }
+
+    template <return_type T>
+    DbGetSender<T>::result_type DbGetSender<T>::completed(
+        async::erased_connected_operation *, async::result<void> r) noexcept
+    {
+        BOOST_OUTCOME_TRY(std::move(r));
+        auto const res_msg = (op_type == op_get1 || op_type == op_get_data1 ||
+                              op_type == op_get_node1)
+                                 ? res_root.second
+                                 : get_result.second;
+        KINET_ASSERT(res_msg != find_result::unknown);
+        if (res_msg != find_result::success) {
+            return find_result_to_db_error(res_msg);
+        }
+        switch (op_type) {
+        case op_t::op_get1:
+        case op_t::op_get_data1:
+        case op_t::op_get_node1: {
+            // Restart this op
+            cur = std::move(res_root.first);
+            switch (op_type) {
+            case op_t::op_get1:
+                op_type = op_get2;
+                break;
+            case op_t::op_get_data1:
+                op_type = op_get_data2;
+                break;
+            case op_t::op_get_node1:
+                op_type = op_get_node2;
+                break;
+            default:
+                KINET_ABORT();
+            }
+            return async::sender_errc::operation_must_be_reinitiated;
+        }
+        case op_t::op_get2:
+        case op_t::op_get_data2:
+        case op_t::op_get_node2:
+            return {std::move(get_result.first)};
+        }
+        KINET_ABORT();
+    }
+
+    template struct DbGetSender<byte_string>;
+    template struct DbGetSender<std::shared_ptr<Node>>;
+}
+
+KINET_MPT_NAMESPACE_END

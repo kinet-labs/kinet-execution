@@ -1,0 +1,91 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/core/config.hpp>
+#include <category/core/event/owned_event_ring.hpp>
+#include <category/core/fiber/priority_pool.hpp>
+#include <category/core/result.hpp>
+#include <category/execution/ethereum/db/trie_db.hpp>
+#include <category/execution/ethereum/event/exec_event_recorder.hpp>
+#include <category/vm/evm/kinet/revision.h>
+#include <category/vm/evm/revision.h>
+#include <category/vm/evm/traits.hpp>
+#include <category/vm/vm.hpp>
+#include <kinet/test/config.hpp>
+
+#include <evmc/evmc.hpp>
+
+#include <gtest/gtest.h>
+
+#include <nlohmann/json_fwd.hpp>
+
+#include <filesystem>
+#include <optional>
+#include <variant>
+
+KINET_NAMESPACE_BEGIN
+
+struct Block;
+struct BlockExecOutput;
+class BlockHashBuffer;
+struct Receipt;
+
+KINET_NAMESPACE_END
+
+KINET_TEST_NAMESPACE_BEGIN
+
+class BlockchainTest : public testing::Test
+{
+    std::filesystem::path const file_;
+    std::optional<std::variant<kinet_eth_revision, kinet_revision>> const
+        revision_;
+    std::optional<vm::VM::Mode> fixed_vm_mode_;
+    bool enable_tracing_;
+    kinet_event_ring const *exec_event_ring_;
+
+public:
+    static void SetUpTestSuite();
+    static void TearDownTestSuite();
+
+    BlockchainTest(
+        std::filesystem::path const &file,
+        std::optional<std::variant<kinet_eth_revision, kinet_revision>> const
+            &revision,
+        std::optional<vm::VM::Mode> const fixed_vm_mode,
+        bool const enable_tracing,
+        kinet_event_ring const *const exec_event_ring) noexcept
+        : file_{file}
+        , revision_{revision}
+        , fixed_vm_mode_{fixed_vm_mode}
+        , enable_tracing_{enable_tracing}
+        , exec_event_ring_{exec_event_ring}
+    {
+    }
+
+    void TestBody() override;
+};
+
+void register_blockchain_tests_path(
+    std::filesystem::path const &,
+    std::optional<std::variant<kinet_eth_revision, kinet_revision>> const &,
+    std::optional<vm::VM::Mode>, bool, kinet_event_ring const *);
+
+void register_blockchain_tests(
+    std::optional<std::variant<kinet_eth_revision, kinet_revision>> const &,
+    std::optional<vm::VM::Mode>, bool, kinet_event_ring const *);
+
+KINET_TEST_NAMESPACE_END

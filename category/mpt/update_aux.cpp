@@ -1,0 +1,1410 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/async/config.hpp>
+#include <category/async/storage_pool.hpp>
+#include <category/core/assert.h>
+#include <category/core/byte_string.hpp>
+#include <category/core/bytes.hpp>
+#include <category/core/log.hpp>
+#include <category/core/util/stopwatch.hpp>
+#include <category/mpt/config.hpp>
+#include <category/mpt/db_metadata_context.hpp>
+#include <category/mpt/detail/collected_stats.hpp>
+#include <category/mpt/detail/db_metadata.hpp>
+#include <category/mpt/detail/timeline.hpp>
+#include <category/mpt/detail/unsigned_20.hpp>
+#include <category/mpt/state_machine.hpp>
+#include <category/mpt/trie.hpp>
+#include <category/mpt/update.hpp>
+#include <category/mpt/util.hpp>
+
+#include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <format>
+#include <functional>
+#include <iterator>
+#include <linux/fs.h>
+#include <memory>
+#include <optional>
+#include <ranges>
+#include <string>
+#include <sys/ioctl.h>
+#include <utility>
+
+KINET_MPT_NAMESPACE_BEGIN
+
+using namespace KINET_ASYNC_NAMESPACE;
+
+namespace
+{
+    uint32_t divide_and_round(uint32_t const dividend, uint64_t const divisor)
+    {
+        double const result = dividend / static_cast<double>(divisor);
+        auto const result_floor = static_cast<uint32_t>(std::floor(result));
+        double const fractional = result - result_floor;
+        auto const r = static_cast<double>(rand()) / RAND_MAX;
+        return result_floor + static_cast<uint32_t>(r <= fractional);
+    }
+
+    constexpr double percent(uint64_t const num, uint64_t const denom)
+    {
+        return denom == 0 ? 0.0
+                          : 100.0 * static_cast<double>(num) /
+                                static_cast<double>(denom);
+    }
+
+    constexpr double to_kb(uint64_t const bytes)
+    {
+        return static_cast<double>(bytes) / 1024.0;
+    }
+}
+
+// Returns a virtual offset on successful translation; returns
+// INVALID_VIRTUAL_OFFSET if the input offset is invalid or the offset refers to
+// a chunk in the free list.
+virtual_chunk_offset_t
+UpdateAux::physical_to_virtual(chunk_offset_t const offset) const noexcept
+{
+    if (offset == INVALID_OFFSET) {
+        return INVALID_VIRTUAL_OFFSET;
+    }
+    KINET_ASSERT(offset.id < io->chunk_count());
+    auto const chunk_info = metadata_ctx_->main()->atomic_load_chunk_info(
+        offset.id, std::memory_order_acquire);
+    if (chunk_info.in_fast_list || chunk_info.in_slow_list) {
+        return virtual_chunk_offset_t{
+            uint32_t(chunk_info.insertion_count()),
+            offset.offset,
+            chunk_info.in_fast_list,
+            0};
+    }
+    // return invalid virtual offset when translate an offset from free list
+    return INVALID_VIRTUAL_OFFSET;
+}
+
+std::pair<UpdateAux::chunk_list, detail::unsigned_20>
+UpdateAux::chunk_list_and_age(uint32_t const idx) const noexcept
+{
+    KINET_ASSERT(is_on_disk());
+    auto const *ci = metadata_ctx_->main()->at(idx);
+    std::pair<chunk_list, detail::unsigned_20> ret(
+        chunk_list::free, ci->insertion_count());
+    if (ci->in_fast_list) {
+        ret.first = chunk_list::fast;
+        ret.second -=
+            metadata_ctx_->main()->fast_list_begin()->insertion_count();
+    }
+    else if (ci->in_slow_list) {
+        ret.first = chunk_list::slow;
+        ret.second -=
+            metadata_ctx_->main()->slow_list_begin()->insertion_count();
+    }
+    else {
+        ret.second -=
+            metadata_ctx_->main()->free_list_begin()->insertion_count();
+    }
+    return ret;
+}
+
+int64_t UpdateAux::calc_auto_expire_version(
+    uint64_t const upsert_version, timeline_id const tid) noexcept
+{
+    KINET_ASSERT(is_on_disk());
+    auto const max_version = metadata_ctx_->db_history_max_version(tid);
+    if (max_version == INVALID_BLOCK_NUM) {
+        return static_cast<int64_t>(upsert_version);
+    }
+    auto const min_valid_version =
+        metadata_ctx_->db_history_min_valid_version(tid);
+    auto const max_version_post_upsert = std::max(max_version, upsert_version);
+    uint64_t min_valid_version_post_upsert = min_valid_version;
+    if (max_version_post_upsert - min_valid_version + 1 >
+        metadata_ctx_->version_history_length()) {
+        min_valid_version_post_upsert =
+            max_version_post_upsert - metadata_ctx_->version_history_length() +
+            1;
+    }
+    return std::min(
+        metadata_ctx_->get_auto_expire_version_metadata(tid) + 2,
+        static_cast<int64_t>(min_valid_version_post_upsert));
+}
+
+void UpdateAux::rewind_to_match_offsets()
+{
+    KINET_ASSERT(is_on_disk());
+
+    auto const fast_offset =
+        metadata_ctx_->main()->db_offsets.start_of_wip_offset_fast;
+    KINET_ASSERT(metadata_ctx_->main()->at(fast_offset.id)->in_fast_list);
+    auto const slow_offset =
+        metadata_ctx_->main()->db_offsets.start_of_wip_offset_slow;
+    KINET_ASSERT(metadata_ctx_->main()->at(slow_offset.id)->in_slow_list);
+
+    // fast/slow list offsets should always be greater than each timeline's
+    // last written root offset.
+    auto const check_root_past_offsets = [&](chunk_offset_t const
+                                                 last_root_offset) {
+        if (last_root_offset == INVALID_OFFSET) {
+            return;
+        }
+        auto const virtual_last_root_offset =
+            physical_to_virtual(last_root_offset);
+        KINET_ASSERT(virtual_last_root_offset != INVALID_VIRTUAL_OFFSET);
+        if (metadata_ctx_->main()->at(last_root_offset.id)->in_fast_list) {
+            auto const virtual_fast_offset = physical_to_virtual(fast_offset);
+            KINET_ASSERT(virtual_fast_offset != INVALID_VIRTUAL_OFFSET);
+            KINET_ASSERT_PRINTF(
+                virtual_fast_offset > virtual_last_root_offset,
+                "Detected corruption. Last root offset (id=%d, count=%d, "
+                "offset=%d) is ahead of fast list offset (id=%d, "
+                "count=%d, offset=%d)",
+                last_root_offset.id,
+                virtual_last_root_offset.count,
+                last_root_offset.offset,
+                fast_offset.id,
+                fast_offset.offset,
+                virtual_fast_offset.count);
+        }
+        else if (metadata_ctx_->main()->at(last_root_offset.id)->in_slow_list) {
+            auto const virtual_slow_offset = physical_to_virtual(slow_offset);
+            KINET_ASSERT(virtual_slow_offset != INVALID_VIRTUAL_OFFSET);
+            KINET_ASSERT_PRINTF(
+                virtual_slow_offset > virtual_last_root_offset,
+                "Detected corruption. Last root offset (id=%d, count=%d, "
+                "offset=%d, is ahead of slow list offset (id=%d, "
+                "count=%d, offset=%d)",
+                last_root_offset.id,
+                virtual_last_root_offset.count,
+                last_root_offset.offset,
+                slow_offset.id,
+                virtual_slow_offset.count,
+                slow_offset.offset);
+        }
+        else {
+            KINET_ABORT_PRINTF(
+                "Detected corruption. Last root offset is in free list.");
+        }
+    };
+    auto const primary_ro = metadata_ctx_->root_offsets();
+    check_root_past_offsets(primary_ro[primary_ro.max_version()]);
+    if (metadata_ctx_->timeline_active(timeline_id::secondary)) {
+        auto const secondary_ro =
+            metadata_ctx_->root_offsets(timeline_id::secondary);
+        auto const sec_max = secondary_ro.max_version();
+        if (sec_max != INVALID_BLOCK_NUM) {
+            check_root_past_offsets(secondary_ro[sec_max]);
+        }
+    }
+
+    // Free all chunks after fast_offset.id
+    auto const *ci = metadata_ctx_->main()->at(fast_offset.id);
+    while (ci != metadata_ctx_->main()->fast_list_end()) {
+        auto const idx = metadata_ctx_->main()->fast_list.end;
+        metadata_ctx_->remove(idx);
+        io->storage_pool().chunk(storage_pool::seq, idx).destroy_contents();
+        metadata_ctx_->append(chunk_list::free, idx);
+    }
+    auto &fast_offset_chunk =
+        io->storage_pool().chunk(storage_pool::seq, fast_offset.id);
+    KINET_ASSERT(fast_offset_chunk.try_trim_contents(fast_offset.offset));
+
+    // Same for slow list
+    auto const *slow_ci = metadata_ctx_->main()->at(slow_offset.id);
+    while (slow_ci != metadata_ctx_->main()->slow_list_end()) {
+        auto const idx = metadata_ctx_->main()->slow_list.end;
+        metadata_ctx_->remove(idx);
+        io->storage_pool().chunk(storage_pool::seq, idx).destroy_contents();
+        metadata_ctx_->append(chunk_list::free, idx);
+    }
+    auto &slow_offset_chunk =
+        io->storage_pool().chunk(storage_pool::seq, slow_offset.id);
+    KINET_ASSERT(slow_offset_chunk.try_trim_contents(slow_offset.offset));
+
+    // Reset node_writers offset to the same offsets in db_metadata
+    reset_node_writers();
+}
+
+void UpdateAux::clear_ondisk_db()
+{
+    KINET_ASSERT(is_on_disk());
+    bool const secondary_active =
+        metadata_ctx_->timeline_active(timeline_id::secondary);
+    auto do_ = [&](unsigned const which) {
+        auto const g = metadata_ctx_->main_mutable(which)->hold_dirty();
+        metadata_ctx_->root_offsets(timeline_id::primary, which).reset_all(0);
+        if (secondary_active) {
+            metadata_ctx_->root_offsets(timeline_id::secondary, which)
+                .reset_all(0);
+        }
+    };
+    do_(0);
+    do_(1);
+    metadata_ctx_->set_latest_finalized_version(INVALID_BLOCK_NUM);
+    metadata_ctx_->set_latest_verified_version(INVALID_BLOCK_NUM);
+
+    metadata_ctx_->set_latest_voted(INVALID_BLOCK_NUM, bytes32_t{});
+    metadata_ctx_->set_latest_proposed(INVALID_BLOCK_NUM, bytes32_t{});
+    metadata_ctx_->set_auto_expire_version_metadata(timeline_id::primary, 0);
+    metadata_ctx_->set_auto_expire_version_metadata(timeline_id::secondary, 0);
+
+    metadata_ctx_->advance_db_offsets_to(
+        {metadata_ctx_->main()->fast_list.begin, 0},
+        {metadata_ctx_->main()->slow_list.begin, 0});
+    rewind_to_match_offsets();
+    return;
+}
+
+// Post-root fast-list offset for the chunk-trim cutoff. Returns nullopt if
+// the root isn't in the fast list (caller skips it from the cutoff calc).
+static std::optional<chunk_offset_t> post_root_fast_offset_(
+    detail::db_metadata const *const main, chunk_offset_t root_offset)
+{
+    if (root_offset == INVALID_OFFSET) {
+        return std::nullopt;
+    }
+    if (!main->at(root_offset.id)->in_fast_list) {
+        return std::nullopt;
+    }
+    unsigned const bytes_to_read =
+        node_disk_pages_spare_15{root_offset}.to_pages() << DISK_PAGE_BITS;
+    chunk_offset_t post = round_down_align<DISK_PAGE_BITS>(
+        root_offset.add_to_offset(bytes_to_read));
+    if (post.offset >= chunk_offset_t::max_offset) {
+        post.id = main->at(post.id)->next_chunk_id;
+        post.offset = 0;
+    }
+    return post;
+}
+
+void UpdateAux::rewind_to_version(uint64_t const version)
+{
+    KINET_ASSERT(is_on_disk());
+    KINET_ASSERT(
+        metadata_ctx_->version_is_valid_ondisk(version, timeline_id::primary) ||
+        metadata_ctx_->version_is_valid_ondisk(
+            version, timeline_id::secondary));
+
+    bool const secondary_active =
+        metadata_ctx_->timeline_active(timeline_id::secondary);
+    auto const secondary_max_before =
+        secondary_active
+            ? metadata_ctx_->db_history_max_version(timeline_id::secondary)
+            : INVALID_BLOCK_NUM;
+    bool const secondary_needs_rewind =
+        secondary_active && secondary_max_before != INVALID_BLOCK_NUM &&
+        secondary_max_before > version;
+    auto const primary_max_before = metadata_ctx_->db_history_max_version();
+    bool const primary_needs_rewind =
+        primary_max_before != INVALID_BLOCK_NUM && primary_max_before > version;
+    if (!primary_needs_rewind && !secondary_needs_rewind) {
+        return;
+    }
+
+    // Step 1: rewind each ring whose max is past the rewind target.
+    auto do_ = [&](unsigned const which) {
+        auto const g = metadata_ctx_->main_mutable(which)->hold_dirty();
+        if (primary_needs_rewind) {
+            metadata_ctx_->root_offsets(timeline_id::primary, which)
+                .rewind_to_version(version);
+        }
+        if (secondary_needs_rewind) {
+            metadata_ctx_->root_offsets(timeline_id::secondary, which)
+                .rewind_to_version(version);
+        }
+    };
+    do_(0);
+    do_(1);
+
+    // Step 2: consensus metadata.
+    if (auto const latest_finalized =
+            metadata_ctx_->get_latest_finalized_version();
+        latest_finalized != INVALID_BLOCK_NUM && latest_finalized > version) {
+        metadata_ctx_->set_latest_finalized_version(version);
+    }
+    metadata_ctx_->set_latest_verified_version(INVALID_BLOCK_NUM);
+    metadata_ctx_->set_latest_voted(INVALID_BLOCK_NUM, bytes32_t{});
+    metadata_ctx_->set_latest_proposed(INVALID_BLOCK_NUM, bytes32_t{});
+
+    // Step 3: cutoff = max of both timelines' post-root fast offsets.
+    auto const *const main = metadata_ctx_->main();
+    std::optional<chunk_offset_t> cutoff_fast;
+    auto consider = [&](std::optional<chunk_offset_t> const candidate) {
+        if (!candidate.has_value()) {
+            return;
+        }
+        if (!cutoff_fast.has_value() || physical_to_virtual(*candidate) >
+                                            physical_to_virtual(*cutoff_fast)) {
+            cutoff_fast = candidate;
+        }
+    };
+    // Range-checked lookup: a `version` outside the primary's range yields
+    // INVALID_OFFSET (raw ring indexing would return a stale slot).
+    consider(post_root_fast_offset_(
+        main, metadata_ctx_->get_root_offset_at_version(version)));
+    if (secondary_active) {
+        auto const secondary_ro =
+            metadata_ctx_->root_offsets(timeline_id::secondary);
+        auto const sec_max = secondary_ro.max_version();
+        if (sec_max != INVALID_BLOCK_NUM) {
+            auto const sec_root = secondary_ro[sec_max];
+            KINET_ASSERT(sec_root != INVALID_OFFSET);
+            consider(post_root_fast_offset_(main, sec_root));
+        }
+    }
+    if (cutoff_fast.has_value()) {
+        metadata_ctx_->advance_db_offsets_to(
+            *cutoff_fast, metadata_ctx_->get_start_of_wip_slow_offset());
+    }
+
+    // Step 4: discard chunks past the cutoff and reset node writers.
+    rewind_to_match_offsets();
+}
+
+UpdateAux::~UpdateAux()
+{
+    if (io != nullptr) {
+        node_writer_fast.reset();
+        node_writer_slow.reset();
+        io = nullptr;
+        metadata_ctx_.reset();
+    }
+}
+
+void UpdateAux::init(AsyncIO &io_, std::optional<uint64_t> const history_len)
+{
+    // Safe to call on an already-initialized instance: tear down first
+    if (io != nullptr) {
+        io = nullptr;
+        node_writer_fast.reset();
+        node_writer_slow.reset();
+        metadata_ctx_.reset();
+    }
+    io = &io_;
+
+    /* Block size validation: We keep accidentally running MPT on 4Kb min
+    granularity storage, so error out on that early to save everybody time and
+    hassle.
+
+    Linux is unique amongst major OS kernels that it'll let you do 512 byte
+    granularity i/o on a device with a higher granularity. Unfortunately, its
+    implementation is buggy, and as we've seen in production it _nearly_ works
+    but doesn't.
+
+    Therefore just point blank refuse to run on storage which isn't truly 512
+    byte addressable.
+    */
+    {
+        auto const fdr =
+            io->storage_pool().chunk(storage_pool::cnv, 0).read_fd();
+        unsigned int logical_block_size = 0;
+        unsigned int physical_block_size = 0;
+        unsigned int minimum_io_size = 0;
+        (void)ioctl(fdr.first, BLKSSZGET, &logical_block_size);
+        (void)ioctl(fdr.first, BLKPBSZGET, &physical_block_size);
+        (void)ioctl(fdr.first, BLKIOMIN, &minimum_io_size);
+        KINET_ASSERT_PRINTF(
+            logical_block_size == 0 || logical_block_size == 512,
+            "MPT requires storage to be addressable in 512 byte granularity. "
+            "This storage has %u granularity.",
+            logical_block_size);
+        if (physical_block_size != 0 && physical_block_size != 512) {
+            LOG_INFO(
+                "MPT storage has physical block size {} which is not 512 "
+                "bytes.",
+                physical_block_size);
+        }
+        if (minimum_io_size != 0 && minimum_io_size != 512) {
+            LOG_INFO(
+                "MPT storage has minimum i/o size {} which is not 512 bytes.",
+                minimum_io_size);
+        }
+    }
+
+    metadata_ctx_ = std::make_unique<DbMetadataContext>(io_);
+
+    if (metadata_ctx_->is_new_pool()) {
+        metadata_ctx_->init_new_pool(
+            history_len, initial_insertion_count_on_pool_creation_);
+        if (history_len.has_value()) {
+            enable_dynamic_history_length_ = false;
+        }
+        if (!io->is_read_only()) {
+            reset_node_writers();
+        }
+    }
+    else { // resume from an existing db and underlying storage devices
+        if (!io->is_read_only()) {
+            // Reset/init node writer's offsets, destroy contents after
+            // fast_offset.id chunck
+            rewind_to_match_offsets();
+            if (history_len.has_value()) {
+                // reset history length
+                if (history_len < metadata_ctx_->version_history_length() &&
+                    history_len <= metadata_ctx_->db_history_max_version()) {
+                    // we invalidate earlier blocks that fall outside of the
+                    // history window when shortening history length
+                    erase_versions_up_to_and_including(
+                        metadata_ctx_->db_history_max_version() - *history_len,
+                        timeline_id::primary);
+                }
+                metadata_ctx_->update_history_length_metadata(*history_len);
+                enable_dynamic_history_length_ = false;
+            }
+            else if (
+                metadata_ctx_->version_history_length() < MIN_HISTORY_LENGTH) {
+                // A db created by an older binary may have been shrunk to a
+                // floor below the current MIN_HISTORY_LENGTH. Raise the stored
+                // cap so subsequent restarts keep enough history to avoid a
+                // forced statesync. Actual on-disk history will grow back to
+                // the new floor as new blocks come in.
+                metadata_ctx_->update_history_length_metadata(
+                    MIN_HISTORY_LENGTH);
+            }
+        }
+    }
+    // If the pool has changed since we configured the metadata, this will
+    // fail
+    KINET_ASSERT(metadata_ctx_->main()->chunk_info_count == io->chunk_count());
+}
+
+void UpdateAux::reset_node_writers()
+{
+    auto init_node_writer = [&](chunk_offset_t const node_writer_offset)
+        -> node_writer_unique_ptr_type {
+        auto const &chunk =
+            io->storage_pool().chunk(storage_pool::seq, node_writer_offset.id);
+        KINET_ASSERT(chunk.size() >= node_writer_offset.offset);
+        size_t const bytes_to_write = std::min(
+            AsyncIO::WRITE_BUFFER_SIZE,
+            size_t(chunk.capacity() - node_writer_offset.offset));
+        return io ? io->make_connected(
+                        write_single_buffer_sender{
+                            node_writer_offset, bytes_to_write},
+                        write_operation_io_receiver{bytes_to_write})
+                  : node_writer_unique_ptr_type{};
+    };
+    node_writer_fast = init_node_writer(
+        metadata_ctx_->main()->db_offsets.start_of_wip_offset_fast);
+    node_writer_slow = init_node_writer(
+        metadata_ctx_->main()->db_offsets.start_of_wip_offset_slow);
+
+    last_block_end_offset_fast_ = compact_virtual_chunk_offset_t{
+        physical_to_virtual(node_writer_fast->sender().offset())};
+    last_block_end_offset_slow_ = compact_virtual_chunk_offset_t{
+        physical_to_virtual(node_writer_slow->sender().offset())};
+}
+
+/* upsert() supports both on disk and in memory db updates. User should
+always use this interface to upsert updates to db. Here are what it does:
+- if `compaction`, erase outdated history block if any, and update
+compaction offsets;
+- copy state from last version to new version if new version not yet exist;
+- upsert `updates` should include everything nested under
+version number;
+- if it's on disk, update db_metadata min max versions.
+
+Note that `version` on each call of upsert() is either the max version or max
+version + 1. However, we do not assume that the version history is continuous
+because user can move_trie_version_forward(), which can invalidate versions in
+the middle of a continuous history.
+*/
+Node::SharedPtr UpdateAux::do_update(
+    Node::SharedPtr prev_root, StateMachine &sm, UpdateList &&updates,
+    uint64_t const version, bool const compaction, bool const can_write_to_fast,
+    bool const write_root, timeline_id const tid)
+{
+
+    if (is_in_memory()) {
+        UpdateList root_updates;
+        auto root_update =
+            make_update({}, {}, false, std::move(updates), version);
+        root_updates.push_front(root_update);
+        return upsert(
+            *this,
+            version,
+            sm,
+            std::move(prev_root),
+            std::move(root_updates),
+            /*write_root=*/true,
+            timeline_id::primary);
+    }
+    KINET_ASSERT(is_on_disk());
+    set_can_write_to_fast(can_write_to_fast);
+
+    if (prev_root) {
+        // previous compaction offset
+        tl(tid).compact_offsets =
+            compact_offset_pair::deserialize(prev_root->value());
+    }
+    if (compaction) {
+        if (tid == timeline_id::primary && enable_dynamic_history_length_) {
+            // WARNING: this step may remove historical versions and free
+            // disk chunks
+            adjust_history_length_based_on_disk_usage();
+        }
+        if (!metadata_ctx_->version_is_valid_ondisk(version, tid)) {
+            // only advance compaction progress for non existent version
+            advance_compact_offsets(prev_root, tid);
+        }
+    }
+
+    tl(tid).curr_upsert_auto_expire_version =
+        calc_auto_expire_version(version, tid);
+    UpdateList root_updates;
+    byte_string const compact_offsets_bytes =
+        tl(tid).compact_offsets.serialize();
+    auto root_update = make_update(
+        {}, compact_offsets_bytes, false, std::move(updates), version);
+    root_updates.push_front(root_update);
+
+    Stopwatch<std::chrono::microseconds> const upsert_timer;
+    auto root = upsert(
+        *this,
+        version,
+        sm,
+        std::move(prev_root),
+        std::move(root_updates),
+        write_root,
+        tid);
+    metadata_ctx_->set_auto_expire_version_metadata(
+        tid, tl(tid).curr_upsert_auto_expire_version);
+
+    auto const upsert_duration = upsert_timer.elapsed();
+    // Unconditional so that an upsert run without compaction is never folded
+    // into the next compacted upsert's figures.
+    last_upsert_stats_ = stats_.delta_since(prev_upsert_stats_);
+    prev_upsert_stats_ = stats_;
+    if (compaction) {
+        update_disk_growth_data();
+        // log stats
+        print_update_stats(version, tid, last_upsert_stats_);
+    }
+    [[maybe_unused]] auto const curr_fast_writer_offset =
+        physical_to_virtual(node_writer_fast->sender().offset());
+    [[maybe_unused]] auto const curr_slow_writer_offset =
+        physical_to_virtual(node_writer_slow->sender().offset());
+    LOG_INFO(
+        "Finish upserting version {} (timeline {}). Min valid version {}. "
+        "Time elapsed: {} us. Disk usage: {:.4f}. Chunks: {} fast, {} slow, {} "
+        "free. Writer offsets: fast={{{},{}}}, slow={{{},{}}}. Compaction head "
+        "offset fast={}, slow={}",
+        version,
+        static_cast<unsigned>(tid),
+        metadata_ctx_->db_history_min_valid_version(tid),
+        upsert_duration.count(),
+        disk_usage(),
+        num_chunks(chunk_list::fast),
+        num_chunks(chunk_list::slow),
+        num_chunks(chunk_list::free),
+        curr_fast_writer_offset.count,
+        curr_fast_writer_offset.offset,
+        curr_slow_writer_offset.count,
+        curr_slow_writer_offset.offset,
+        (uint32_t)tl(tid).compact_offsets.fast,
+        (uint32_t)tl(tid).compact_offsets.slow);
+    return root;
+}
+
+void UpdateAux::release_unreferenced_chunks()
+{
+    // Compute the combined GC boundary across all active timelines.
+    // A chunk is safe to free only if its insertion_count is below the
+    // component-wise minimum of all active timelines' oldest roots'
+    // compact_offset_pair.
+    compact_offset_pair combined_min{
+        INVALID_COMPACT_VIRTUAL_OFFSET, INVALID_COMPACT_VIRTUAL_OFFSET};
+
+    for (auto const tid : {timeline_id::primary, timeline_id::secondary}) {
+        if (!metadata_ctx_->timeline_active(tid)) {
+            continue;
+        }
+        auto const min_ver = metadata_ctx_->db_history_min_valid_version(tid);
+        if (min_ver == INVALID_BLOCK_NUM) {
+            continue;
+        }
+        auto const root_offset =
+            metadata_ctx_->get_root_offset_at_version(min_ver, tid);
+        if (root_offset == INVALID_OFFSET) {
+            // Primary's min-valid-version must always resolve; an
+            // INVALID_OFFSET would mean corrupt metadata and silently
+            // disable GC. Only the secondary ring may legitimately miss.
+            KINET_ASSERT(tid != timeline_id::primary);
+            continue;
+        }
+        auto const root = read_node_blocking(*this, root_offset, min_ver, tid);
+        KINET_ASSERT(root && root->has_value());
+        auto const offsets = compact_offset_pair::deserialize(root->value());
+        if (offsets.fast < combined_min.fast) {
+            combined_min.fast = offsets.fast;
+        }
+        if (offsets.slow < combined_min.slow) {
+            combined_min.slow = offsets.slow;
+        }
+    }
+
+    if (combined_min.fast == INVALID_COMPACT_VIRTUAL_OFFSET) {
+        return;
+    }
+    KINET_ASSERT(
+        combined_min.fast != INVALID_COMPACT_VIRTUAL_OFFSET &&
+        combined_min.slow != INVALID_COMPACT_VIRTUAL_OFFSET);
+    chunks_to_remove_before_count_fast_ = combined_min.fast.get_count();
+    chunks_to_remove_before_count_slow_ = combined_min.slow.get_count();
+    LOG_INFO(
+        "Combined GC boundary: compaction offset fast={}, slow={}. Remove "
+        "chunks before count fast={}, slow={}",
+        (uint32_t)combined_min.fast,
+        (uint32_t)combined_min.slow,
+        chunks_to_remove_before_count_fast_,
+        chunks_to_remove_before_count_slow_);
+    free_compacted_chunks();
+}
+
+void UpdateAux::erase_versions_up_to_and_including(
+    uint64_t const version, timeline_id const tid)
+{
+    LOG_INFO(
+        "Erase versions up to and including {} (timeline {})",
+        version,
+        static_cast<unsigned>(tid));
+    clear_root_offsets_up_to_and_including(version, tid);
+    release_unreferenced_chunks();
+}
+
+uint64_t UpdateAux::erase_boundary(
+    uint64_t const version_to_erase, timeline_id const tid) const
+{
+    // Clamp so a timeline's newest version is never erased (a wipe would
+    // break promotion/deactivation). For the primary the clamp is inert:
+    // the caller bounds version_to_erase at MIN_HISTORY_LENGTH below the
+    // primary max. For the secondary it only bites if the timeline lags
+    // behind version_to_erase.
+    if (!metadata_ctx_->timeline_active(tid)) {
+        return INVALID_BLOCK_NUM;
+    }
+    auto const tl_max = metadata_ctx_->db_history_max_version(tid);
+    if (tl_max == INVALID_BLOCK_NUM || tl_max == 0) {
+        return INVALID_BLOCK_NUM;
+    }
+    return std::min(version_to_erase, tl_max - 1);
+}
+
+double UpdateAux::calculate_disk_usage_if_erased_up_to_and_including(
+    uint64_t const version_to_erase) const
+{
+    KINET_ASSERT(is_on_disk());
+    KINET_ASSERT(metadata_ctx_->db_history_max_version() != INVALID_BLOCK_NUM);
+
+    // The controller erases both timelines in tandem to the same boundary,
+    // so the predicted GC boundary is the component-wise min over all
+    // active timelines of the oldest root surviving that timeline's erase.
+    compact_offset_pair min_offsets{
+        INVALID_COMPACT_VIRTUAL_OFFSET, INVALID_COMPACT_VIRTUAL_OFFSET};
+    for (auto const tid : {timeline_id::primary, timeline_id::secondary}) {
+        auto const erase_up_to = erase_boundary(version_to_erase, tid);
+        if (erase_up_to == INVALID_BLOCK_NUM) {
+            // timeline inactive or holds no version
+            continue;
+        }
+        auto const tl_max = metadata_ctx_->db_history_max_version(tid);
+        uint64_t v = erase_up_to + 1;
+        while (v <= tl_max && !metadata_ctx_->version_is_valid_ondisk(v, tid)) {
+            v++;
+        }
+        if (v > tl_max) {
+            continue;
+        }
+        auto const root = read_node_blocking(
+            *this, metadata_ctx_->get_root_offset_at_version(v, tid), v, tid);
+        KINET_ASSERT(root && root->has_value());
+        auto const offsets = compact_offset_pair::deserialize(root->value());
+        min_offsets.fast = std::min(min_offsets.fast, offsets.fast);
+        min_offsets.slow = std::min(min_offsets.slow, offsets.slow);
+    }
+    // The primary always contributes: the caller bounds version_to_erase by
+    // MIN_HISTORY_LENGTH below the primary max, so a valid version survives.
+    KINET_ASSERT(
+        min_offsets.fast != INVALID_COMPACT_VIRTUAL_OFFSET &&
+        min_offsets.slow != INVALID_COMPACT_VIRTUAL_OFFSET);
+    auto const fast_list_max_count =
+        metadata_ctx_->main()->fast_list_end()->insertion_count();
+    auto const slow_list_max_count =
+        metadata_ctx_->main()->slow_list_end()->insertion_count();
+    KINET_ASSERT(fast_list_max_count >= min_offsets.fast.get_count());
+    KINET_ASSERT(slow_list_max_count >= min_offsets.slow.get_count());
+    auto const num_fast_chunks =
+        fast_list_max_count - min_offsets.fast.get_count() + 1;
+    auto const num_slow_chunks =
+        slow_list_max_count - min_offsets.slow.get_count() + 1;
+    return (num_fast_chunks + num_slow_chunks) / (double)io->chunk_count();
+}
+
+void UpdateAux::adjust_history_length_based_on_disk_usage()
+{
+    constexpr double upper_bound = 0.8;
+    constexpr double lower_bound = 0.6;
+
+    Stopwatch<std::chrono::microseconds> const timer;
+
+    // Shorten history length when disk usage is high
+    auto const max_version = metadata_ctx_->db_history_max_version();
+    if (max_version == INVALID_BLOCK_NUM) {
+        return;
+    }
+    auto const history_length_before =
+        max_version - metadata_ctx_->db_history_min_valid_version() + 1;
+    auto const current_disk_usage = disk_usage();
+    if (current_disk_usage > upper_bound &&
+        history_length_before > MIN_HISTORY_LENGTH) {
+        uint64_t const lo = metadata_ctx_->db_history_min_valid_version();
+        uint64_t const hi = max_version - MIN_HISTORY_LENGTH;
+        KINET_ASSERT(lo <= hi); // always true under the if condition
+        uint64_t best_version_to_erase = hi;
+        if (calculate_disk_usage_if_erased_up_to_and_including(hi) <
+            upper_bound) {
+            // Find the first version in range [lo, hi] where erasing up to it
+            // brings disk usage <= upper_bound
+            auto const versions = std::views::iota(lo, hi + 1);
+            auto const it = std::ranges::lower_bound(
+                versions,
+                upper_bound,
+                std::greater{},
+                [this](uint64_t const version) {
+                    return calculate_disk_usage_if_erased_up_to_and_including(
+                        version);
+                });
+
+            if (it != versions.end()) {
+                best_version_to_erase = *it;
+            }
+        }
+        // Trim both timelines in tandem so the reclaim matches the
+        // prediction; per-timeline boundaries keep each newest version.
+        for (auto const tid : {timeline_id::primary, timeline_id::secondary}) {
+            auto const erase_up_to = erase_boundary(best_version_to_erase, tid);
+            if (erase_up_to != INVALID_BLOCK_NUM) {
+                erase_versions_up_to_and_including(erase_up_to, tid);
+            }
+        }
+        metadata_ctx_->update_history_length_metadata(
+            std::max(max_version - best_version_to_erase, MIN_HISTORY_LENGTH));
+        KINET_ASSERT(
+            disk_usage() <= upper_bound ||
+            metadata_ctx_->version_history_length() == MIN_HISTORY_LENGTH);
+        LOG_INFO(
+            "Adjust db history length down from {} to {}. Current disk "
+            "usage: {:.4f}, Time elapsed: {} us",
+            history_length_before,
+            metadata_ctx_->version_history_length(),
+            disk_usage(),
+            timer.elapsed().count());
+    }
+    // Raise history length limit when disk usage falls low
+    else if (auto const offsets = metadata_ctx_->root_offsets();
+             current_disk_usage < lower_bound &&
+             metadata_ctx_->version_history_length() < offsets.capacity()) {
+        metadata_ctx_->update_history_length_metadata(offsets.capacity());
+        LOG_INFO(
+            "Adjust db history length up from {} to {}. Time elapsed: {} us",
+            history_length_before,
+            metadata_ctx_->version_history_length(),
+            timer.elapsed().count());
+    }
+}
+
+void UpdateAux::clear_root_offsets_up_to_and_including(
+    uint64_t const version, timeline_id const tid)
+{
+    for (uint64_t v = metadata_ctx_->db_history_range_lower_bound(tid);
+         v != INVALID_BLOCK_NUM && v <= version;
+         v = metadata_ctx_->db_history_range_lower_bound(tid)) {
+        metadata_ctx_->update_root_offset(v, INVALID_OFFSET, tid);
+    }
+}
+
+void UpdateAux::move_trie_version_forward(
+    uint64_t const src, uint64_t const dest, timeline_id const tid)
+{
+    KINET_ASSERT(is_on_disk());
+    KINET_ASSERT(metadata_ctx_->version_is_valid_ondisk(src, tid));
+    // only allow moving forward
+    KINET_ASSERT(
+        dest > src && dest != INVALID_BLOCK_NUM &&
+        dest >= metadata_ctx_->db_history_max_version(tid));
+    auto const offset = metadata_ctx_->get_root_offset_at_version(src, tid);
+    metadata_ctx_->update_root_offset(src, INVALID_OFFSET, tid);
+    // Must erase versions that will fall out of history range first
+    if (dest >= metadata_ctx_->version_history_length()) {
+        erase_versions_up_to_and_including(
+            dest - metadata_ctx_->version_history_length(), tid);
+    }
+    metadata_ctx_->fast_forward_next_version(dest, tid);
+    metadata_ctx_->append_root_offset(offset, tid);
+    KINET_ASSERT(dest == metadata_ctx_->db_history_max_version(tid));
+    KINET_ASSERT(metadata_ctx_->version_is_valid_ondisk(dest, tid));
+    if (metadata_ctx_->get_auto_expire_version_metadata(tid) ==
+        static_cast<int64_t>(src)) {
+        metadata_ctx_->set_auto_expire_version_metadata(
+            tid, static_cast<int64_t>(dest));
+    }
+}
+
+void UpdateAux::update_disk_growth_data()
+{
+    compact_virtual_chunk_offset_t const curr_fast_writer_offset{
+        physical_to_virtual(node_writer_fast->sender().offset())};
+    compact_virtual_chunk_offset_t const curr_slow_writer_offset{
+        physical_to_virtual(node_writer_slow->sender().offset())};
+    last_block_disk_growth_fast_ = // unused for speed control for now
+        curr_fast_writer_offset - last_block_end_offset_fast_;
+    last_block_disk_growth_slow_ =
+        curr_slow_writer_offset - last_block_end_offset_slow_;
+    last_block_end_offset_fast_ = curr_fast_writer_offset;
+    last_block_end_offset_slow_ = curr_slow_writer_offset;
+}
+
+void UpdateAux::advance_compact_offsets(
+    Node::SharedPtr const prev_root, timeline_id const tid)
+{
+    /* Note on ring based compaction:
+    Fast list compaction is steady pace based on disk growth over recent blocks,
+    and we assume no large sets of upsert work directly committed to fast list,
+    meaning no greater than per block updates, otherwise there could be large
+    amount of data compacted in one block.
+    Large set of states upsert, like snapshot loading or state sync, should be
+    written in slow ring. It is under the assumption that only small set of
+    states are updated often, majority is not going to be updated in a while, so
+    when block execution starts we don’t need to waste disk bandwidth to copy
+    them from fast to slow.
+
+    Compaction offset update algo:
+    The fast ring is compacted at a steady pace based on the average disk growth
+    across the history window (or the last block's growth if the oldest root is
+    not on the fast list). Compaction head only advances when the uncompacted
+    range exceeds min_versions_of_growth_before_compact_fast_list versions'
+    worth of growth, to prevent over-compaction when the history window shrinks.
+    Slow ring compaction begins when overall disk usage reaches
+    `usage_limit_start_compact_slow` and slow list disk usage reaches
+    `slow_usage_limit_start_compact_slow`. The slow list compaction range is
+    adjusted according to the slow ring garbage collection ratio from the last
+    block.
+    */
+    KINET_ASSERT(is_on_disk());
+
+    constexpr double fast_usage_limit_start_compaction = 0.1;
+    constexpr unsigned fast_chunk_count_limit_start_compaction = 800;
+    constexpr uint32_t max_compact_offset_range =
+        512; // 32MB, each unit of compact_virtual_chunk_offset_t represents
+             // 64KB
+    // Only advance fast compaction when the fast list contains at least this
+    // many versions' worth of average disk growth (prevents over-compaction)
+    constexpr uint32_t min_versions_of_growth_before_compact_fast_list = 5000;
+    // Small constant added to avg_disk_growth to ensure minimum progress
+    constexpr uint32_t min_compaction_progress_buffer = 8;
+
+    if (prev_root) {
+        auto const min_offsets = calc_min_offsets(*prev_root);
+        KINET_ASSERT(
+            !min_offsets.any_below(tl(tid).compact_offsets),
+            "Detected referenced offsets below compaction boundary; potential "
+            "disk corruption");
+        if (min_offsets.fast != INVALID_COMPACT_VIRTUAL_OFFSET) {
+            tl(tid).compact_offsets.fast = min_offsets.fast;
+        }
+        if (min_offsets.slow != INVALID_COMPACT_VIRTUAL_OFFSET) {
+            tl(tid).compact_offsets.slow = min_offsets.slow;
+        }
+    }
+
+    auto const fast_disk_usage =
+        num_chunks(chunk_list::fast) / (double)io->chunk_count();
+    uint64_t const max_version = metadata_ctx_->db_history_max_version(tid);
+    if ((fast_disk_usage < fast_usage_limit_start_compaction &&
+         num_chunks(chunk_list::fast) <
+             fast_chunk_count_limit_start_compaction) ||
+        max_version == INVALID_BLOCK_NUM) {
+        return;
+    }
+
+    KINET_ASSERT(
+        tl(tid).compact_offsets.fast != INVALID_COMPACT_VIRTUAL_OFFSET &&
+        tl(tid).compact_offsets.slow != INVALID_COMPACT_VIRTUAL_OFFSET);
+    /* The fast list compaction offset range is determined both by the
+    average disk growth over historical blocks, and the fast list offset
+    range of the latest version, so that fast-list usage adapts appropriately to
+    changes in history length. */
+    tl(tid).compact_offset_range_fast_ = MIN_COMPACT_VIRTUAL_OFFSET;
+
+    uint64_t const min_version =
+        metadata_ctx_->db_history_min_valid_version(tid);
+    KINET_ASSERT(min_version != INVALID_BLOCK_NUM);
+    compact_virtual_chunk_offset_t const curr_fast_writer_offset{
+        physical_to_virtual(node_writer_fast->sender().offset())};
+    // Estimate average fast-list disk growth per version. If the oldest root
+    // is on the fast list, compute from the full history range. Otherwise fall
+    // back to the last block's growth (e.g. roots from statesync may be on the
+    // slow list).
+    uint32_t avg_disk_growth_fast = last_block_disk_growth_fast_;
+    auto const min_version_root_virtual_offset = physical_to_virtual(
+        metadata_ctx_->get_root_offset_at_version(min_version, tid));
+    if (min_version_root_virtual_offset.in_fast_list() &&
+        max_version > min_version) {
+        avg_disk_growth_fast = divide_and_round(
+            curr_fast_writer_offset -
+                compact_virtual_chunk_offset_t{min_version_root_virtual_offset},
+            max_version - min_version);
+    }
+    // Only advance the fast-list compaction offset if the uncompacted range
+    // exceeds min_versions_of_growth_before_compact_fast_list (5000) versions'
+    // worth of growth, to prevent over-compaction when the history window
+    // shrinks.
+    uint32_t const latest_block_fast_uncompacted_range =
+        curr_fast_writer_offset - tl(tid).compact_offsets.fast;
+    if (latest_block_fast_uncompacted_range >
+        static_cast<uint64_t>(avg_disk_growth_fast) *
+            min_versions_of_growth_before_compact_fast_list) {
+        // Stride that would evenly spread the uncompacted range across the
+        // history window, keeping fast-list disk usage steady over time.
+        uint32_t const target_fast_compaction_stride = divide_and_round(
+            latest_block_fast_uncompacted_range, max_version - min_version + 1);
+        uint32_t to_advance = std::min(
+            target_fast_compaction_stride,
+            avg_disk_growth_fast + min_compaction_progress_buffer);
+        to_advance =
+            std::min(to_advance, max_compact_offset_range); // Cap at 32MB
+        tl(tid).compact_offset_range_fast_.set_value(to_advance);
+        tl(tid).compact_offsets.fast += tl(tid).compact_offset_range_fast_;
+    }
+    constexpr double usage_limit_start_compact_slow = 0.6;
+    constexpr double slow_usage_limit_start_compact_slow = 0.2;
+    double const slow_disk_usage =
+        num_chunks(chunk_list::slow) / (double)io->chunk_count();
+    double const total_disk_usage = fast_disk_usage + slow_disk_usage;
+    // Do not compact slow list until slow list usage and total usage are both
+    // above the thresholds
+    if (total_disk_usage > usage_limit_start_compact_slow &&
+        slow_disk_usage > slow_usage_limit_start_compact_slow) {
+        // Compact slow ring: the offset is based on slow list garbage
+        // collection ratio of the last block. We use the ratio of compacted
+        // bytes to determine how aggressively to advance the compaction head.
+        if (last_upsert_stats_.compacted_bytes_in_slow != 0 &&
+            tl(tid).compact_offset_range_slow_ != 0) {
+            uint64_t const slow_range_bytes =
+                uint64_t{tl(tid).compact_offset_range_slow_} << 16;
+            auto const gc_efficiency = static_cast<uint64_t>(std::round(
+                static_cast<double>(slow_range_bytes) /
+                static_cast<double>(
+                    last_upsert_stats_.compacted_bytes_in_slow)));
+            // Cap at last block's growth + 1 to avoid advancing too fast
+            uint64_t const growth_cap =
+                uint64_t{last_block_disk_growth_slow_} + 1;
+            tl(tid).compact_offset_range_slow_.set_value(
+                static_cast<uint32_t>(std::min(growth_cap, gc_efficiency)));
+        }
+        else {
+            // No valid data, use minimum progress
+            tl(tid).compact_offset_range_slow_.set_value(1);
+        }
+        tl(tid).compact_offsets.slow += tl(tid).compact_offset_range_slow_;
+    }
+    else {
+        tl(tid).compact_offset_range_slow_ = MIN_COMPACT_VIRTUAL_OFFSET;
+    }
+}
+
+void UpdateAux::free_compacted_chunks()
+{
+    auto free_chunks_from_ci_till_count =
+        [&](detail::db_metadata::chunk_info_t const *ci,
+            uint32_t const count_before) {
+            uint32_t idx = ci->index(metadata_ctx_->main());
+            uint32_t count =
+                (uint32_t)metadata_ctx_->main()->at(idx)->insertion_count();
+            for (; count < count_before && ci != nullptr;
+                 idx = ci->index(metadata_ctx_->main()),
+                 count = (uint32_t)metadata_ctx_->main()
+                             ->at(idx)
+                             ->insertion_count()) {
+                ci = ci->next(metadata_ctx_->main()); // must be in this order
+                Stopwatch<std::chrono::microseconds> const timer;
+                metadata_ctx_->remove(idx);
+                io->storage_pool()
+                    .chunk(kinet::async::storage_pool::seq, idx)
+                    .destroy_contents();
+                metadata_ctx_->append(
+                    UpdateAux::chunk_list::free,
+                    idx); // append not prepend
+                // NOLINTNEXTLINE(bugprone-lambda-function-name)
+                LOG_INFO(
+                    "Free compacted chunk id {}, time elapsed: {} us",
+                    idx,
+                    timer.elapsed().count());
+            }
+        };
+    KINET_ASSERT(
+        chunks_to_remove_before_count_fast_ <=
+        metadata_ctx_->main()->fast_list_end()->insertion_count());
+    KINET_ASSERT(
+        chunks_to_remove_before_count_slow_ <=
+        metadata_ctx_->main()->slow_list_end()->insertion_count());
+    free_chunks_from_ci_till_count(
+        metadata_ctx_->main()->fast_list_begin(),
+        chunks_to_remove_before_count_fast_);
+    free_chunks_from_ci_till_count(
+        metadata_ctx_->main()->slow_list_begin(),
+        chunks_to_remove_before_count_slow_);
+}
+
+uint32_t UpdateAux::num_chunks(chunk_list const list) const noexcept
+{
+    switch (list) {
+    case chunk_list::free:
+        // Triggers when out of storage
+        KINET_ASSERT(metadata_ctx_->main()->free_list_begin() != nullptr);
+        KINET_ASSERT(metadata_ctx_->main()->free_list_end() != nullptr);
+
+        return (uint32_t)(metadata_ctx_->main()
+                              ->free_list_end()
+                              ->insertion_count() -
+                          metadata_ctx_->main()
+                              ->free_list_begin()
+                              ->insertion_count()) +
+               1;
+    case chunk_list::fast:
+        // Triggers when out of storage
+        KINET_ASSERT(metadata_ctx_->main()->fast_list_begin() != nullptr);
+        KINET_ASSERT(metadata_ctx_->main()->fast_list_end() != nullptr);
+
+        return (uint32_t)(metadata_ctx_->main()
+                              ->fast_list_end()
+                              ->insertion_count() -
+                          metadata_ctx_->main()
+                              ->fast_list_begin()
+                              ->insertion_count()) +
+               1;
+    case chunk_list::slow:
+        // Triggers when out of storage
+        KINET_ASSERT(metadata_ctx_->main()->slow_list_begin() != nullptr);
+        KINET_ASSERT(metadata_ctx_->main()->slow_list_end() != nullptr);
+
+        return (uint32_t)(metadata_ctx_->main()
+                              ->slow_list_end()
+                              ->insertion_count() -
+                          metadata_ctx_->main()
+                              ->slow_list_begin()
+                              ->insertion_count()) +
+               1;
+    }
+    return 0;
+}
+
+void UpdateAux::print_update_stats(
+    uint64_t const version, timeline_id const tid,
+    detail::TrieUpdateCollectedStats const &upsert_stats)
+{
+    if (upsert_stats.nodes_updated_expire > 50'000) {
+        LOG_WARNING(
+            "The number of nodes updated for expire ({}) is excessively large",
+            upsert_stats.nodes_updated_expire);
+    }
+
+    std::string buf;
+    buf.reserve(16 << 10);
+    std::format_to(
+        std::back_inserter(buf),
+        "Version {}: nodes created or updated for upsert = {}, nodes "
+        "updated for expire = {}, nreads for expire = {}\n",
+        version,
+        upsert_stats.nodes_created_or_updated,
+        upsert_stats.nodes_updated_expire,
+        upsert_stats.nreads_expire);
+
+    if (tl(tid).compact_offset_range_fast_) {
+        uint64_t const fast_range_bytes =
+            uint64_t{tl(tid).compact_offset_range_fast_} << 16;
+        uint64_t const slow_range_bytes =
+            uint64_t{tl(tid).compact_offset_range_slow_} << 16;
+        std::format_to(
+            std::back_inserter(buf),
+            "   Fast: total growth ~ {} KB, compact range {} KB, "
+            "bytes copied fast to slow {:.2f} KB, active data ratio {:.2f}%\n",
+            last_block_disk_growth_fast_ << 6,
+            tl(tid).compact_offset_range_fast_ << 6,
+            to_kb(upsert_stats.compacted_bytes_in_fast),
+            percent(upsert_stats.compacted_bytes_in_fast, fast_range_bytes));
+        if (tl(tid).compact_offset_range_slow_) {
+            // slow list compaction range vs growth
+            auto const total_bytes_written_to_slow =
+                upsert_stats.compacted_bytes_in_fast +
+                upsert_stats.compacted_bytes_in_slow;
+            std::format_to(
+                std::back_inserter(buf),
+                "   Slow: total growth {:.2f} KB, compact range {} "
+                "KB, bytes copied slow to slow {:.2f} KB, active data ratio "
+                "{:.2f}%. other bytes copied slow to fast {:.2f} KB.\n",
+                to_kb(total_bytes_written_to_slow),
+                tl(tid).compact_offset_range_slow_ << 6,
+                to_kb(upsert_stats.compacted_bytes_in_slow),
+                percent(upsert_stats.compacted_bytes_in_slow, slow_range_bytes),
+                to_kb(upsert_stats.bytes_copied_slow_to_fast_for_slow));
+        }
+        else {
+            std::format_to(
+                std::back_inserter(buf),
+                "   Slow: no advance of compaction offset\n");
+        }
+
+        // num nodes copied:
+        auto const fast_nodes_copied =
+            upsert_stats.compacted_nodes_in_fast +
+            upsert_stats.nodes_copied_fast_to_fast_for_fast;
+        std::format_to(
+            std::back_inserter(buf),
+            "[Nodes Copied]\n"
+            "   Fast: fast to slow {} ({:.2f}%), fast to fast {} ({:.2f}%)\n",
+            upsert_stats.compacted_nodes_in_fast,
+            percent(upsert_stats.compacted_nodes_in_fast, fast_nodes_copied),
+            upsert_stats.nodes_copied_fast_to_fast_for_fast,
+            percent(
+                upsert_stats.nodes_copied_fast_to_fast_for_fast,
+                fast_nodes_copied));
+        if (tl(tid).compact_offsets.slow) {
+            auto const slow_nodes_copied =
+                upsert_stats.compacted_nodes_in_slow +
+                upsert_stats.nodes_copied_fast_to_fast_for_slow +
+                upsert_stats.nodes_copied_slow_to_fast_for_slow;
+            std::format_to(
+                std::back_inserter(buf),
+                "   Slow: active slow to slow {} ({:.2f}%), fast to fast {} "
+                "({:.2f}%), other slow to fast {} ({:.2f}%)\n",
+                upsert_stats.compacted_nodes_in_slow,
+                percent(
+                    upsert_stats.compacted_nodes_in_slow, slow_nodes_copied),
+                upsert_stats.nodes_copied_fast_to_fast_for_slow,
+                percent(
+                    upsert_stats.nodes_copied_fast_to_fast_for_slow,
+                    slow_nodes_copied),
+                upsert_stats.nodes_copied_slow_to_fast_for_slow,
+                percent(
+                    upsert_stats.nodes_copied_slow_to_fast_for_slow,
+                    slow_nodes_copied));
+        }
+
+        auto const fast_compact_reads =
+            upsert_stats.nreads_before_compact_offset[0] +
+            upsert_stats.nreads_after_compact_offset[0];
+        std::format_to(
+            std::back_inserter(buf),
+            "[Reads]\n"
+            "   Fast: compact reads within compaction range {} / "
+            "total compact reads {} = {:.2f}%\n"
+            "   Fast: bytes read within compaction range {:.2f} KB / "
+            "compaction range {} KB = {:.2f}%, bytes read out of "
+            "compaction range {:.2f} KB\n",
+            upsert_stats.nreads_before_compact_offset[0],
+            fast_compact_reads,
+            percent(
+                upsert_stats.nreads_before_compact_offset[0],
+                fast_compact_reads),
+            to_kb(upsert_stats.bytes_read_before_compact_offset[0]),
+            tl(tid).compact_offset_range_fast_ << 6,
+            percent(
+                upsert_stats.bytes_read_before_compact_offset[0],
+                fast_range_bytes),
+            to_kb(upsert_stats.bytes_read_after_compact_offset[0]));
+        if (tl(tid).compact_offset_range_slow_) {
+            auto const slow_compact_reads =
+                upsert_stats.nreads_before_compact_offset[1] +
+                upsert_stats.nreads_after_compact_offset[1];
+            std::format_to(
+                std::back_inserter(buf),
+                "   Slow: reads within compaction range {} / "
+                "total compact reads {} = {:.2f}%\n"
+                "   Slow: bytes read within compaction range {:.2f} KB / "
+                "compaction range {} KB = {:.2f}%, bytes read out of "
+                "compaction range {:.2f} KB\n",
+                upsert_stats.nreads_before_compact_offset[1],
+                slow_compact_reads,
+                percent(
+                    upsert_stats.nreads_before_compact_offset[1],
+                    slow_compact_reads),
+                to_kb(upsert_stats.bytes_read_before_compact_offset[1]),
+                tl(tid).compact_offset_range_slow_ << 6,
+                percent(
+                    upsert_stats.bytes_read_before_compact_offset[1],
+                    slow_range_bytes),
+                to_kb(upsert_stats.bytes_read_after_compact_offset[1]));
+        }
+    }
+    LOG_INFO("{}", buf);
+}
+
+detail::TrieUpdateCollectedStats detail::TrieUpdateCollectedStats::delta_since(
+    TrieUpdateCollectedStats const &base) const noexcept
+{
+    TrieUpdateCollectedStats delta;
+    delta.nodes_created_or_updated =
+        nodes_created_or_updated - base.nodes_created_or_updated;
+    delta.nreads_compaction = nreads_compaction - base.nreads_compaction;
+    for (unsigned i = 0; i < 2; ++i) {
+        delta.nreads_before_compact_offset[i] =
+            nreads_before_compact_offset[i] -
+            base.nreads_before_compact_offset[i];
+        delta.nreads_after_compact_offset[i] =
+            nreads_after_compact_offset[i] -
+            base.nreads_after_compact_offset[i];
+        delta.bytes_read_before_compact_offset[i] =
+            bytes_read_before_compact_offset[i] -
+            base.bytes_read_before_compact_offset[i];
+        delta.bytes_read_after_compact_offset[i] =
+            bytes_read_after_compact_offset[i] -
+            base.bytes_read_after_compact_offset[i];
+    }
+    delta.compacted_nodes_in_fast =
+        compacted_nodes_in_fast - base.compacted_nodes_in_fast;
+    delta.compacted_nodes_in_slow =
+        compacted_nodes_in_slow - base.compacted_nodes_in_slow;
+    delta.nodes_copied_fast_to_fast_for_fast =
+        nodes_copied_fast_to_fast_for_fast -
+        base.nodes_copied_fast_to_fast_for_fast;
+    delta.nodes_copied_fast_to_fast_for_slow =
+        nodes_copied_fast_to_fast_for_slow -
+        base.nodes_copied_fast_to_fast_for_slow;
+    delta.nodes_copied_slow_to_fast_for_slow =
+        nodes_copied_slow_to_fast_for_slow -
+        base.nodes_copied_slow_to_fast_for_slow;
+    delta.compacted_bytes_in_fast =
+        compacted_bytes_in_fast - base.compacted_bytes_in_fast;
+    delta.compacted_bytes_in_slow =
+        compacted_bytes_in_slow - base.compacted_bytes_in_slow;
+    delta.bytes_copied_slow_to_fast_for_slow =
+        bytes_copied_slow_to_fast_for_slow -
+        base.bytes_copied_slow_to_fast_for_slow;
+    delta.nodes_updated_expire =
+        nodes_updated_expire - base.nodes_updated_expire;
+    delta.nreads_expire = nreads_expire - base.nreads_expire;
+    return delta;
+}
+
+void UpdateAux::collect_number_nodes_created_stats()
+{
+    ++stats_.nodes_created_or_updated;
+}
+
+void UpdateAux::collect_compaction_read_stats(
+    chunk_offset_t const physical_node_offset, unsigned const bytes_to_read,
+    timeline_id const tid)
+{
+    auto const node_offset = physical_to_virtual(physical_node_offset);
+    if (compact_virtual_chunk_offset_t(node_offset) <
+        (node_offset.in_fast_list() ? tl(tid).compact_offsets.fast
+                                    : tl(tid).compact_offsets.slow)) {
+        // node orig offset in fast list but compact to slow list
+        ++stats_.nreads_before_compact_offset[!node_offset.in_fast_list()];
+        stats_.bytes_read_before_compact_offset[!node_offset.in_fast_list()] +=
+            bytes_to_read; // compaction bytes read
+    }
+    else {
+        ++stats_.nreads_after_compact_offset[!node_offset.in_fast_list()];
+        stats_.bytes_read_after_compact_offset[!node_offset.in_fast_list()] +=
+            bytes_to_read;
+    }
+    ++stats_.nreads_compaction; // count number of compaction reads
+}
+
+void UpdateAux::collect_expire_stats(bool const is_read)
+{
+    if (is_read) {
+        ++stats_.nreads_expire;
+    }
+    else {
+        ++stats_.nodes_updated_expire;
+    }
+}
+
+void UpdateAux::collect_compacted_nodes_stats(
+    bool const copy_node_for_fast, bool const rewrite_to_fast,
+    virtual_chunk_offset_t const node_offset, uint32_t const node_disk_size,
+    timeline_id const tid)
+{
+    if (copy_node_for_fast) {
+        if (rewrite_to_fast) {
+            ++stats_.nodes_copied_fast_to_fast_for_fast;
+        }
+        else {
+            ++stats_.compacted_nodes_in_fast;
+            stats_.compacted_bytes_in_fast += node_disk_size;
+        }
+    }
+    else { // copy node for slow
+        if (rewrite_to_fast) {
+            if (node_offset.in_fast_list()) {
+                ++stats_.nodes_copied_fast_to_fast_for_slow;
+            }
+            else {
+                ++stats_.nodes_copied_slow_to_fast_for_slow;
+                stats_.bytes_copied_slow_to_fast_for_slow += node_disk_size;
+            }
+        }
+        else { // rewrite to slow
+            KINET_ASSERT(!node_offset.in_fast_list());
+            KINET_ASSERT(
+                compact_virtual_chunk_offset_t{node_offset} <
+                tl(tid).compact_offsets.slow);
+            ++stats_.compacted_nodes_in_slow;
+            stats_.compacted_bytes_in_slow += node_disk_size;
+        }
+    }
+}
+
+// The administrative timeline operations below (activate / deactivate /
+// promote) are offline-only: the caller must guarantee no reader is attached
+// while they run. That precondition is enforced by the orchestrator, not here,
+// and is what lets the metadata layer omit reader-side synchronisation for the
+// ring shrink/grow.
+void UpdateAux::activate_secondary_timeline()
+{
+    KINET_ASSERT(is_on_disk());
+    metadata_ctx_->activate_secondary_header();
+    // The secondary timeline starts completely empty; its compaction state
+    // is initialised on the first secondary upsert from the prev_root's
+    // serialised compact_offsets.
+    tl(timeline_id::secondary) = timeline_compaction_state{};
+}
+
+void UpdateAux::deactivate_secondary_timeline()
+{
+    KINET_ASSERT(is_on_disk());
+    metadata_ctx_->deactivate_secondary_header();
+    tl(timeline_id::secondary) = timeline_compaction_state{};
+}
+
+void UpdateAux::promote_secondary_to_primary()
+{
+    KINET_ASSERT(is_on_disk());
+    metadata_ctx_->promote_secondary_to_primary_header();
+    std::swap(tl(timeline_id::primary), tl(timeline_id::secondary));
+    LOG_INFO("Promoted secondary timeline to primary");
+}
+
+KINET_MPT_NAMESPACE_END

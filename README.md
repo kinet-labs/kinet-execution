@@ -1,2 +1,141 @@
-# kinet-execution
-This repository contains the execution component of a Kinet node. 
+# Kinet Execution
+
+## Overview
+
+This repository contains the execution component of a Kinet node.
+
+## Building the source code
+
+### Package requirements
+
+Execution has two kinds of dependencies on third-party libraries:
+
+1. **Self-managed**: execution's CMake build system will checkout most of
+   its third-party dependencies as git submodules, and build them as part
+   of its own build process, as CMake subprojects; this will happen
+   automatically during the build, but you must run:
+
+   ```shell
+   git submodule update --init --recursive
+   ```
+
+   after checking out this repository.
+
+2. **System**: some dependencies are expected to already be part of the
+   system in a default location, i.e., they are expected to come from the
+   system's package manager. The primary development platform is Ubuntu.
+   The scripts `scripts/ubuntu-build/install-tools.sh`,
+   `scripts/ubuntu-build/install-deps.sh`, and
+   `scripts/ubuntu-build/install-boost.sh` install all required system
+   packages. On an Ubuntu host, first run `sudo apt-get update`, then run
+   these scripts with elevated privileges (for example, via `sudo`, or as
+   root).
+
+### Minimum development tool requirements
+
+- gcc-15 or clang-19
+- CMake 3.27
+- Even when using clang, the only standard library supported is libstdc++;
+  libc++ may work but it is not a tested platform
+
+### CPU compilation requirements
+
+a Kinet node requires a relatively recent CPU. Execution explicitly
+requires this to compile: it needs to emit machine code that is only
+supported on recent CPU models, for fast cryptographic operations.
+
+The minimum ISA support corresponds to the [x86-64-v3](https://en.wikipedia.org/wiki/X86-64#Microarchitecture_levels)
+feature level. Consequently, the minimum flag you must pass to the compiler
+is `-march=x86-64-v3`, or alternatively `-march=haswell` ("Haswell" was
+the codename of the first Intel CPU to support all of these features).
+
+You may also pass any higher architecture level if you wish, although
+the compiled binary may not work on older CPUs. The execution docker
+files use `-march=haswell` because it tries to maximize the number of
+systems the resulting binary can run on. If you are only running locally
+(i.e., the binary does not need to run anywhere else) use `-march=native`.
+
+### Compiling the execution code
+
+First, change your working directory to the root directory of the execution
+git repository root and then run:
+
+```shell
+CC=gcc-15 CXX=g++-15 CMAKE_TOOLCHAIN_FILE=category/core/toolchains/gcc-avx2.cmake \
+./scripts/configure.sh && ./scripts/build.sh
+```
+
+The above command will do several things:
+
+- Use gcc-15 instead of the system's default compiler
+
+- Emit machine code using Haswell-era CPU extensions, via the toolchain
+  file `category/core/toolchains/gcc-avx2.cmake`; the toolchain file sets
+  `-march=haswell` for C, C++, and assembly sources.
+
+- Run CMake, and generate a [ninja](https://ninja-build.org/) build
+  system in the `<path-to-execution-repo>/build` directory with
+  the [`CMAKE_BUILD_TYPE`](https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html)
+  set to `RelWithDebInfo` by default
+
+- Build the CMake `all` target, which builds everything
+
+The compiler is selected via the `CC`/`CXX` environment variables, which
+CMake reads at configuration time.  The CPU target is set via the toolchain
+file, passed through the `CMAKE_TOOLCHAIN_FILE` environment variable.  If
+you want debug binaries instead, you can also pass `CMAKE_BUILD_TYPE=Debug`
+via the environment.
+
+When finished, this will build all of the execution binaries. The main one is
+the execution daemon, `build/cmd/kinet`. This binary can provide block
+execution services for different EVM-compatible blockchains:
+
+- When used as part of a Kinet blockchain node, it behaves as the block
+  execution service for the Category Labs consensus daemon (for details, see
+  [here](docs/overview.md#how-is-execution-used)); when running in this mode,
+  Kinet EVM extensions (e.g., Kinet-style staking) are enabled
+
+- It can also replay the history of other EVM-compatible blockchains, by
+  executing their historical blocks as inputs; a common developer workflow
+  (and a good full system test) is to replay the history of the original
+  Ethereum mainnet and verify that the computed Merkle roots match after
+  each block
+
+You can also run the full test suite in parallel with:
+
+```
+CTEST_PARALLEL_LEVEL=$(nproc) ctest
+```
+
+## Compiling zkVM binary
+
+To compile kinet as a guest program for various zkVMs, such as ZisK or SP1, we need to use a riscv64 cross-compiler that includes newlib. The cmake build extracts only the needed libc objects (setjmp/longjmp) from the unmodified newlib; malloc and syscalls are weakly linked by the zkVM frameworks.
+
+The toolchain is provided by nix, which is what CI uses. Flakes must be
+enabled; see [nix/README.md](nix/README.md).
+
+```shell
+nix build ./nix#toolchainEnv
+```
+
+A [riscv-gnu-toolchain](https://github.com/riscv-collab/riscv-gnu-toolchain) build also works if you already have one; pass whichever prefix you have as `RISCV_TOOLCHAIN_DIR`.
+
+```shell
+cmake -B build-zkvm -S zkvm/guest \
+   -DCMAKE_TOOLCHAIN_FILE=$PWD/category/core/toolchains/riscv64-elf.cmake \
+   -DRISCV_TOOLCHAIN_DIR="path/to/riscv_gcc" \
+   -DCMAKE_BUILD_TYPE=Release -GNinja
+```
+
+We can then build the static library:
+
+```shell
+cmake --build build-zkvm --target kinet-zkvm --parallel
+```
+
+## A tour of execution
+
+To understand how the source code is organized, you should start by reading
+the execution [developer overview](docs/overview.md), which explains how
+execution and consensus fit together, and where in the source tree you can
+find different pieces of functionality.

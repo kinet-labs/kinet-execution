@@ -1,0 +1,84 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/core/config.hpp>
+#include <category/core/int.hpp>
+
+#include <cstdint>
+#include <optional>
+
+KINET_NAMESPACE_BEGIN
+
+struct Secp256k1Signature
+{
+    static constexpr uint256_t secp256k1_order = [] {
+        using namespace kinet::literals;
+        return 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141_u256;
+    }();
+    static constexpr uint256_t secp256k1_order_half = secp256k1_order / 2;
+
+    uint256_t r{};
+    uint256_t s{};
+    uint8_t y_parity{};
+
+    /**
+     * Returns true if the signature's r and s components are both within the
+     * range [1, secp256k1_order - 1].
+     */
+    constexpr bool has_valid_range() const
+    {
+        return r > 0 && s > 0 && r < secp256k1_order && s < secp256k1_order;
+    }
+
+    /**
+     * Returns true if the signature's s component is in the upper (malleated)
+     * range forbidden by EIP-2.
+     */
+    constexpr bool has_upper_s() const
+    {
+        return s > secp256k1_order_half;
+    }
+
+    constexpr bool is_valid() const
+    {
+        return has_valid_range() && !has_upper_s() && y_parity <= 1;
+    }
+
+    friend bool operator==(
+        Secp256k1Signature const &, Secp256k1Signature const &) = default;
+};
+
+static_assert(sizeof(Secp256k1Signature) == 72);
+static_assert(alignof(Secp256k1Signature) == 8);
+
+struct SignatureAndChain
+{
+    Secp256k1Signature signature{};
+    std::optional<uint256_t> chain_id{};
+
+    void from_v(uint256_t const &);
+
+    friend bool
+    operator==(SignatureAndChain const &, SignatureAndChain const &) = default;
+};
+
+static_assert(sizeof(SignatureAndChain) == 112);
+static_assert(alignof(SignatureAndChain) == 8);
+
+uint256_t get_v(SignatureAndChain const &);
+
+KINET_NAMESPACE_END

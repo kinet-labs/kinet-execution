@@ -1,0 +1,83 @@
+# Copyright (C) 2025 Category Labs, Inc.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+enable_language(ASM)
+
+option(KINET_VM_INTERPRETER_DEBUG "Trace instructions executed by interpreter" OFF)
+
+# This option causes any binary that runs the Kinet baseline interpreter to
+# print a CSV-formatted summary of opcode executions when it exits. This code is
+# not thread-safe and should only be enabled in appropriate benchmarking
+# contexts, never in production.
+option(KINET_VM_INTERPRETER_STATS "Print opcode statistics on program exit" OFF)
+
+add_library(kinet-vm-interpreter OBJECT)
+
+target_sources(kinet-vm-interpreter PRIVATE
+  "call_runtime.hpp"
+  "debug.hpp"
+  "entry.S"
+  "execute.cpp"
+  "execute.hpp"
+  "instruction_stats.cpp"
+  "instruction_stats.hpp"
+  "instruction_table.hpp"
+  "instructions_fwd.hpp"
+  "intercode.cpp"
+  "intercode.hpp"
+  "push.hpp"
+  "stack.hpp"
+  "trampoline.hpp"
+  "types.hpp"
+)
+
+kinet_compile_options(kinet-vm-interpreter)
+
+# This is a workaround for a change made to LLVM between versions 18 and 19:
+# https://github.com/llvm/llvm-project/pull/78582
+#
+# The change in question restricts the default maximum predecessors and
+# successors that a basic block can have if it is to be duplicated (rather than
+# being shared). This affects the dispatch table of the interpreter by causing
+# the "load next instruction, indirect jump" block tail to be emitted as a
+# single shared block rather than being inlined into each opcode's dispatch
+# block. Doing so slows the interpreter down when compiled with Clang 19.
+# Because the LLVM change in question is for _compiler_ performance rather than
+# _runtime_ performance, we can safely disable the pessimisation by setting this
+# flag to a value we know to be large enough for our dispatch table.
+target_compile_options(
+  kinet-vm-interpreter
+  PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,Clang>:-mllvm -tail-dup-pred-size=256>)
+
+if(KINET_VM_INTERPRETER_DEBUG)
+  target_compile_definitions(kinet-vm-interpreter PRIVATE KINET_VM_INTERPRETER_DEBUG)
+endif()
+
+if(KINET_VM_INTERPRETER_STATS)
+  target_compile_definitions(kinet-vm-interpreter PRIVATE KINET_VM_INTERPRETER_STATS)
+endif()
+
+target_include_directories(kinet-vm-interpreter
+    PUBLIC src/
+)
+
+target_link_libraries(kinet-vm-interpreter
+    PUBLIC evmc::evmc
+    PUBLIC kinet-vm::kinet-vm-evm
+    PUBLIC kinet-vm::kinet-vm-runtime
+    PUBLIC kinet-vm::kinet-vm-utils
+)
+
+add_library(kinet-vm::kinet-vm-interpreter ALIAS kinet-vm-interpreter)

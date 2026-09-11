@@ -1,0 +1,79 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/vm/evm/traits.hpp>
+#include <category/vm/utils/evm-as/builder.hpp>
+#include <category/vm/utils/evm-as/compiler.hpp>
+#include <category/vm/utils/evm-as/instruction.hpp>
+#include <category/vm/utils/evm-as/validator.hpp>
+
+#include <evmc/evmc.h>
+
+namespace kinet::vm::utils::evm_as
+{
+
+    inline EvmBuilder<EvmTraits<KINET_ETH_LATEST_STABLE_REVISION>> latest()
+    {
+        return EvmBuilder<EvmTraits<KINET_ETH_LATEST_STABLE_REVISION>>{};
+    }
+
+    inline EvmBuilder<EvmTraits<constants::EARLIEST_SUPPORTED_EVM_FORK>>
+    earliest()
+    {
+        return EvmBuilder<EvmTraits<constants::EARLIEST_SUPPORTED_EVM_FORK>>{};
+    }
+
+    inline EvmBuilder<EvmTraits<KINET_ETH_BERLIN>> berlin()
+    {
+        return EvmBuilder<EvmTraits<KINET_ETH_BERLIN>>{};
+    }
+
+    inline EvmBuilder<EvmTraits<KINET_ETH_LONDON>> london()
+    {
+        return EvmBuilder<EvmTraits<KINET_ETH_LONDON>>{};
+    }
+
+    inline EvmBuilder<EvmTraits<KINET_ETH_PARIS>> paris()
+    {
+        return EvmBuilder<EvmTraits<KINET_ETH_PARIS>>{};
+    }
+
+    inline EvmBuilder<EvmTraits<KINET_ETH_SHANGHAI>> shanghai()
+    {
+        return EvmBuilder<EvmTraits<KINET_ETH_SHANGHAI>>{};
+    }
+
+    inline EvmBuilder<EvmTraits<KINET_ETH_CANCUN>> cancun()
+    {
+        return EvmBuilder<EvmTraits<KINET_ETH_CANCUN>>{};
+    }
+
+    inline EvmBuilder<EvmTraits<KINET_ETH_PRAGUE>> prague()
+    {
+        return EvmBuilder<EvmTraits<KINET_ETH_PRAGUE>>{};
+    }
+
+    inline EvmBuilder<EvmTraits<KINET_ETH_OSAKA>> osaka()
+    {
+        return EvmBuilder<EvmTraits<KINET_ETH_OSAKA>>{};
+    }
+
+    inline EvmBuilder<EvmTraits<KINET_ETH_AMSTERDAM>> amsterdam()
+    {
+        return EvmBuilder<EvmTraits<KINET_ETH_AMSTERDAM>>{};
+    }
+}

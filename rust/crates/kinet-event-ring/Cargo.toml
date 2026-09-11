@@ -1,0 +1,22 @@
+[package]
+name = "kinet-event-ring"
+description = "Rust API for kinet event rings"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+clap = { workspace = true, features = ["derive"] }
+criterion = { workspace = true }
+itertools = { workspace = true }
+
+[build-dependencies]
+kinet-build = { workspace = true, features = ["bindgen-static", "cmake", "metadata"] }
+
+build-rs = { workspace = true }
+
+[[bench]]
+name = "snapshot_raw"
+harness = false

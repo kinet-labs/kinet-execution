@@ -1,0 +1,315 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/core/address.hpp>
+#include <category/core/assert.h>
+#include <category/core/cases.hpp>
+#include <category/core/runtime/uint256.hpp>
+#include <category/vm/evm/opcodes.hpp>
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <type_traits>
+#include <variant>
+
+namespace kinet::vm::utils::evm_as
+{
+    struct PlainI
+    {
+        constexpr explicit PlainI(compiler::EvmOpCode const opcode)
+            : opcode(opcode)
+        {
+        }
+
+        compiler::EvmOpCode opcode;
+    };
+
+    struct PushI
+    {
+
+        constexpr explicit PushI(
+            compiler::EvmOpCode const opcode, uint256_t const &imm)
+            : opcode(opcode)
+            , imm(imm)
+        {
+        }
+
+        size_t n() const
+        {
+            return static_cast<size_t>(opcode - compiler::EvmOpCode::PUSH0);
+        }
+
+        compiler::EvmOpCode opcode;
+        uint256_t imm;
+    };
+
+    // NOTE: Below PushLabelI, PushAddressI, JumpdestI, CommentI, InvalidI have
+    // explicit rule of five implementations rather than the default
+    // compiler generated ones. The reason being that there is a
+    // false-positive `maybe-uninitialized` memory error in libstdc++
+    // which triggers for some configurations of gcc-{14,15,16}. See my
+    // comment on the PR for further details:
+    // https://github.com/category-labs/kinet-compiler/pull/363#issuecomment-2931405074
+
+    struct PushLabelI
+    {
+        constexpr explicit PushLabelI(std::string const &label)
+            : label(label)
+        {
+        }
+
+        ~PushLabelI() = default;
+
+        PushLabelI(PushLabelI const &other)
+
+            = default;
+
+        PushLabelI(PushLabelI &&other) noexcept
+        {
+            label = std::move(other.label);
+        }
+
+        PushLabelI &operator=(PushLabelI const &other)
+        {
+            return *this = PushLabelI(other);
+        }
+
+        PushLabelI &operator=(PushLabelI &&other) noexcept
+        {
+            std::swap(label, other.label);
+            return *this;
+        }
+
+        std::string label;
+    };
+
+    struct PushAddressI
+    {
+        constexpr explicit PushAddressI(Address const &address)
+            : address(address)
+        {
+        }
+
+        ~PushAddressI() = default;
+
+        PushAddressI(PushAddressI const &other)
+
+            = default;
+
+        PushAddressI(PushAddressI &&other) noexcept
+        {
+            address = std::move(other.address);
+        }
+
+        PushAddressI &operator=(PushAddressI const &other)
+        {
+            return *this = PushAddressI(other);
+        }
+
+        PushAddressI &operator=(PushAddressI &&other) noexcept
+        {
+            std::swap(address, other.address);
+            return *this;
+        }
+
+        Address address;
+    };
+
+    struct JumpdestI
+
+    {
+        constexpr explicit JumpdestI(std::string const &label)
+            : label(label)
+        {
+        }
+
+        ~JumpdestI() = default;
+
+        JumpdestI(JumpdestI const &other)
+
+            = default;
+
+        JumpdestI(JumpdestI &&other) noexcept
+        {
+            label = std::move(other.label);
+        }
+
+        JumpdestI &operator=(JumpdestI const &other)
+        {
+            return *this = JumpdestI(other);
+        }
+
+        JumpdestI &operator=(JumpdestI &&other) noexcept
+        {
+            std::swap(label, other.label);
+            return *this;
+        }
+
+        std::string label;
+    };
+
+    struct CommentI
+    {
+        constexpr explicit CommentI(std::string const &msg)
+            : msg(msg)
+        {
+        }
+
+        ~CommentI() = default;
+
+        CommentI(CommentI const &other)
+
+            = default;
+
+        CommentI(CommentI &&other) noexcept
+        {
+            msg = std::move(other.msg);
+        }
+
+        CommentI &operator=(CommentI const &other)
+        {
+            return *this = CommentI(other);
+        }
+
+        CommentI &operator=(CommentI &&other) noexcept
+        {
+            std::swap(msg, other.msg);
+            return *this;
+        }
+
+        std::string msg;
+    };
+
+    struct InvalidI
+    {
+        constexpr explicit InvalidI(std::string const &name)
+            : name(name)
+        {
+        }
+
+        constexpr explicit InvalidI()
+            : name("")
+        {
+        }
+
+        ~InvalidI() = default;
+
+        InvalidI(InvalidI const &other)
+
+            = default;
+
+        InvalidI(InvalidI &&other) noexcept
+        {
+            name = std::move(other.name);
+        }
+
+        InvalidI &operator=(InvalidI const &other)
+        {
+            return *this = InvalidI(other);
+        }
+
+        InvalidI &operator=(InvalidI &&other) noexcept
+        {
+            std::swap(name, other.name);
+            return *this;
+        }
+
+        std::string name{};
+
+        bool has_name() const
+        {
+            return !name.empty();
+        }
+    };
+
+    template <typename T>
+    concept instruction_type =
+        std::is_same_v<T, PlainI> || std::is_same_v<T, PushI> ||
+        std::is_same_v<T, PushLabelI> || std::is_same_v<T, PushAddressI> ||
+        std::is_same_v<T, JumpdestI> || std::is_same_v<T, CommentI> ||
+        std::is_same_v<T, InvalidI>;
+
+    struct Instruction
+    {
+        using T = std::variant<
+            PlainI, PushI, JumpdestI, PushLabelI, PushAddressI, CommentI,
+            InvalidI>;
+
+        static bool is_jumpdest(T const ins)
+        {
+            return std::holds_alternative<JumpdestI>(ins);
+        }
+
+        static bool is_comment(T const ins)
+        {
+            return std::holds_alternative<CommentI>(ins);
+        }
+
+        static bool is_plain(T const ins)
+        {
+            return std::holds_alternative<PlainI>(ins);
+        }
+
+        static bool is_push(T const ins)
+        {
+            return std::holds_alternative<PushI>(ins);
+        }
+
+        static bool is_push_label(T const ins)
+        {
+            return std::holds_alternative<PushLabelI>(ins);
+        }
+
+        static bool is_push_address(T const ins)
+        {
+            return std::holds_alternative<PushAddressI>(ins);
+        }
+
+        static bool is_invalid(T const ins)
+        {
+            return std::holds_alternative<InvalidI>(ins);
+        }
+
+        static PushI as_push(T const ins)
+        {
+            return std::get<PushI>(ins);
+        }
+
+        static PlainI as_plain(T const ins)
+        {
+            return std::get<PlainI>(ins);
+        }
+
+        static PushLabelI as_push_label(T const ins)
+        {
+            return std::get<PushLabelI>(ins);
+        }
+
+        static PushAddressI as_push_address(T const ins)
+        {
+            return std::get<PushAddressI>(ins);
+        }
+
+        static InvalidI as_invalid(T const ins)
+        {
+            return std::get<InvalidI>(ins);
+        }
+    };
+
+    using Instructions = std::vector<Instruction::T>;
+}

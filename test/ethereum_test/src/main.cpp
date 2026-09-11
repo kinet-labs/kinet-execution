@@ -1,0 +1,168 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/config.hpp>
+#include <category/core/event/owned_event_ring.hpp>
+#include <category/core/log.hpp>
+#include <category/execution/ethereum/core/log_level_map.hpp>
+#include <category/execution/ethereum/trace/call_tracer.hpp>
+#include <category/execution/ethereum/trace/event_trace.hpp>
+#include <category/vm/evm/kinet/revision.h>
+#include <category/vm/evm/revision.h>
+
+#include <blockchain_test.hpp>
+#include <event.hpp>
+#include <kinet/test/config.hpp>
+#include <revision_map.hpp>
+#include <transaction_test.hpp>
+
+#include <evmc/evmc.h>
+
+#include <quill/Frontend.h>
+#include <quill/sinks/NullSink.h>
+
+#include <CLI/CLI.hpp>
+
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <cstddef>
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <variant>
+#include <vector>
+
+KINET_NAMESPACE_BEGIN
+
+quill::Logger *event_tracer = nullptr;
+
+KINET_NAMESPACE_END
+
+int main(int argc, char *argv[])
+{
+    using namespace kinet;
+    testing::InitGoogleTest(&argc, argv); // Process GoogleTest flags.
+
+    auto log_level = quill::LogLevel::None;
+    std::optional<std::string> fork_name;
+    std::optional<std::string> vm_mode_name;
+    std::optional<std::variant<kinet_eth_revision, kinet_revision>> revision =
+        std::nullopt;
+    std::optional<size_t> txn_index = std::nullopt;
+    std::string record_exec_events_path;
+    std::unique_ptr<OwnedEventRing> exec_event_ring;
+    std::vector<std::filesystem::path> blockchain_tests_paths;
+    std::optional<std::filesystem::path> transaction_tests_path;
+    bool trace_calls = false;
+    unsigned sleep_seconds = 0;
+
+    CLI::App app{"kinet ethereum tests runner"};
+    app.add_option("--log_level", log_level, "Logging level")
+        ->transform(CLI::CheckedTransformer(log_level_map, CLI::ignore_case));
+    app.add_option("--fork", fork_name, "Fork to run unit tests for")
+        ->transform(CLI::IsMember(
+            std::views::keys(test::revision_map) | std::ranges::to<std::set>(),
+            CLI::ignore_case));
+    app.add_option("--vm_mode", vm_mode_name, "Restrict to given VM mode")
+        ->transform(CLI::IsMember(
+            vm::VM::all_mode_names | std::ranges::to<std::set<std::string>>(),
+            CLI::ignore_case));
+
+    app.callback([&]() {
+        if (fork_name) {
+            revision = test::revision_map.at(*fork_name);
+        }
+    });
+
+    app.add_option("--txn", txn_index, "Index of transaction to run");
+    app.add_flag("--trace_calls", trace_calls, "Enable call tracing");
+    app.add_option(
+           "--blockchain-tests",
+           blockchain_tests_paths,
+           "Path to blockchain tests, overrides the hard-coded tests path. May "
+           "be given multiple times to register several test directories.")
+        ->check(CLI::ExistingPath);
+    app.add_option(
+           "--transaction-tests",
+           transaction_tests_path,
+           "Path to transaction tests, overrides the hard-coded tests path.")
+        ->check(CLI::ExistingPath);
+    CLI::Option const *const record_exec_events =
+        app.add_option(
+               "--record-exec-events",
+               record_exec_events_path,
+               "Record execution events")
+            ->expected(0, 1)
+            ->type_name("<file-path> (leave empty for anonymous memfd)");
+    app.add_option(
+        "--sleep", sleep_seconds, "Sleep for the specified number of seconds");
+    CLI11_PARSE(app, argc, argv);
+
+    std::optional<vm::VM::Mode> vm_mode;
+    if (vm_mode_name.has_value()) {
+        vm_mode = vm::VM::mode_from_string(vm_mode_name.value());
+    }
+
+#ifdef ENABLE_EVENT_TRACING
+    event_tracer = quill::Frontend::create_or_get_logger(
+        "event_trace",
+        quill::Frontend::create_or_get_sink<quill::NullSink>("null_sink"));
+#endif
+    init_root_logger(log_level);
+
+    if (record_exec_events->count() > 0) {
+        exec_event_ring = test::init_exec_event_ring(record_exec_events_path);
+    }
+
+    std::this_thread::sleep_for(std::chrono::seconds{sleep_seconds});
+
+    if (!blockchain_tests_paths.empty() || transaction_tests_path) {
+        for (auto const &blockchain_tests_path : blockchain_tests_paths) {
+            test::register_blockchain_tests_path(
+                blockchain_tests_path,
+                revision,
+                vm_mode,
+                trace_calls,
+                exec_event_ring ? exec_event_ring->get_event_ring() : nullptr);
+        }
+        if (transaction_tests_path) {
+            test::register_transaction_tests_path(
+                *transaction_tests_path, revision);
+        }
+    }
+    else {
+        test::register_blockchain_tests(
+            revision,
+            vm_mode,
+            trace_calls,
+            exec_event_ring ? exec_event_ring->get_event_ring() : nullptr);
+        test::register_transaction_tests(revision);
+    }
+
+    int return_code = RUN_ALL_TESTS();
+
+    if (::testing::UnitTest::GetInstance()->test_to_run_count() == 0) {
+        LOG_ERROR("No tests were run.");
+        return_code = -1;
+    }
+
+    flush_logger();
+
+    return return_code;
+}

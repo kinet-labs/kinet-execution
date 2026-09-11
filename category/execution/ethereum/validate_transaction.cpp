@@ -1,0 +1,206 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/address.hpp>
+#include <category/core/assert.h>
+#include <category/core/bytes.hpp>
+#include <category/core/config.hpp>
+#include <category/core/int.hpp>
+#include <category/core/likely.h>
+#include <category/core/result.hpp>
+#include <category/execution/ethereum/core/transaction.hpp>
+#include <category/execution/ethereum/state3/state.hpp>
+#include <category/execution/ethereum/transaction_gas.hpp>
+#include <category/execution/ethereum/validate_transaction.hpp>
+#include <category/vm/evm/delegation.hpp>
+#include <category/vm/evm/explicit_traits.hpp>
+#include <category/vm/evm/switch_traits.hpp>
+#include <category/vm/evm/traits.hpp>
+
+#include <evmc/evmc.h>
+
+#include <boost/outcome/config.hpp>
+#include <boost/outcome/success_failure.hpp>
+
+#include <cstdint>
+#include <limits>
+#include <optional>
+
+KINET_NAMESPACE_BEGIN
+
+using BOOST_OUTCOME_V2_NAMESPACE::success;
+
+template <Traits traits>
+Result<void> static_validate_transaction(
+    Transaction const &tx, std::optional<uint256_t> const &base_fee_per_gas,
+    std::optional<uint64_t> const &excess_blob_gas, uint256_t const &chain_id,
+    BlobSchedule const &blob_schedule)
+{
+    static_assert(traits::evm_rev() >= KINET_ETH_BERLIN);
+
+    // EIP-155
+    if (KINET_LIKELY(tx.sc.chain_id.has_value())) {
+        if (KINET_UNLIKELY(tx.sc.chain_id.value() != chain_id)) {
+            return TransactionError::WrongChainId;
+        }
+    }
+
+    // EIP-4844
+    if constexpr (!traits::eip_4844_active()) {
+        if (KINET_UNLIKELY(tx.type == TransactionType::eip4844)) {
+            return TransactionError::TypeNotSupported;
+        }
+    }
+
+    // TODO: remove the below logic once we fully migrate over to traits
+    // EIP-1559
+    if constexpr (traits::evm_rev() < KINET_ETH_LONDON) {
+        if (KINET_UNLIKELY(
+                tx.type != TransactionType::legacy &&
+                tx.type != TransactionType::eip2930)) {
+            return TransactionError::TypeNotSupported;
+        }
+    }
+    else if constexpr (traits::evm_rev() < KINET_ETH_CANCUN) {
+        if (KINET_UNLIKELY(
+                tx.type != TransactionType::legacy &&
+                tx.type != TransactionType::eip2930 &&
+                tx.type != TransactionType::eip1559)) {
+            return TransactionError::TypeNotSupported;
+        }
+    }
+    else if constexpr (traits::evm_rev() < KINET_ETH_PRAGUE) {
+        if (KINET_UNLIKELY(
+                tx.type != TransactionType::legacy &&
+                tx.type != TransactionType::eip2930 &&
+                tx.type != TransactionType::eip1559 &&
+                tx.type != TransactionType::eip4844)) {
+            return TransactionError::TypeNotSupported;
+        }
+    }
+    else if (KINET_UNLIKELY(
+                 tx.type != TransactionType::legacy &&
+                 tx.type != TransactionType::eip2930 &&
+                 tx.type != TransactionType::eip1559 &&
+                 tx.type != TransactionType::eip4844 &&
+                 tx.type != TransactionType::eip7702)) {
+        return TransactionError::TypeNotSupported;
+    }
+
+    // EIP-1559
+    if (KINET_UNLIKELY(tx.max_fee_per_gas < base_fee_per_gas.value_or(0))) {
+        return TransactionError::MaxFeeLessThanBase;
+    }
+
+    // EIP-1559
+    if (KINET_UNLIKELY(tx.max_priority_fee_per_gas > tx.max_fee_per_gas)) {
+        return TransactionError::PriorityFeeGreaterThanMax;
+    }
+
+    // EIP-3860
+    if constexpr (traits::evm_rev() >= KINET_ETH_SHANGHAI) {
+        // In `KINET_TWO`, the maximum code size for contracts was increased
+        // without explicitly changing every corresponding check on initcode
+        // size. This meant that in some places, the maximum initcode size was
+        // twice the maximum code size, but in others it differed.
+        //
+        // We introduced the trait parameter `max_initcode_size` to handle the
+        // case where the effective max initcode size differed from twice the
+        // max code size. At this call site, however, the effective max initcode
+        // size has always been twice the max code size, and so it's not
+        // appropriate to use `traits::max_initcode_size()` instead.
+        if (KINET_UNLIKELY(
+                !tx.to.has_value() &&
+                tx.data.size() > 2 * traits::max_code_size())) {
+            return TransactionError::InitCodeLimitExceeded;
+        }
+    }
+
+    // YP eq. 62
+    if (KINET_UNLIKELY(intrinsic_gas<traits>(tx) > tx.gas_limit)) {
+        return TransactionError::IntrinsicGasGreaterThanLimit;
+    }
+
+    if constexpr (traits::evm_rev() >= KINET_ETH_PRAGUE) {
+        // EIP-7623
+        if (KINET_UNLIKELY(floor_data_gas<traits>(tx) > tx.gas_limit)) {
+            return TransactionError::IntrinsicGasGreaterThanLimit;
+        }
+
+        // EIP-7702
+        if (tx.type == TransactionType::eip7702) {
+            if (KINET_UNLIKELY(tx.authorization_list.empty())) {
+                return TransactionError::EmptyAuthorizationList;
+            }
+        }
+    }
+
+    // EIP-2681
+    if (KINET_UNLIKELY(tx.nonce >= std::numeric_limits<uint64_t>::max())) {
+        return TransactionError::NonceExceedsMax;
+    }
+
+    // EIP-1559: check gas_limit * max_fee_per_gas doesn't overflow uint256
+    if (KINET_UNLIKELY(!max_gas_cost(tx.gas_limit, tx.max_fee_per_gas))) {
+        return TransactionError::GasLimitOverflow;
+    }
+
+    // EIP-2
+    if (KINET_UNLIKELY(!tx.sc.signature.is_valid())) {
+        return TransactionError::InvalidSignature;
+    }
+
+    if constexpr (traits::evm_rev() >= KINET_ETH_CANCUN) {
+        if (tx.type == TransactionType::eip4844) {
+            if (KINET_UNLIKELY(tx.blob_versioned_hashes.empty())) {
+                return TransactionError::InvalidBlobHash;
+            }
+
+            constexpr uint8_t VERSIONED_HASH_VERSION_KZG = 0x01;
+            for (auto const &h : tx.blob_versioned_hashes) {
+                if (KINET_UNLIKELY(h.bytes[0] != VERSIONED_HASH_VERSION_KZG)) {
+                    return TransactionError::InvalidBlobHash;
+                }
+            }
+
+            if (KINET_UNLIKELY(
+                    tx.max_fee_per_blob_gas <
+                    get_base_fee_per_blob_gas(
+                        excess_blob_gas.value_or(0), blob_schedule))) {
+                return TransactionError::GasLimitOverflow;
+            }
+        }
+    }
+
+    return success();
+}
+
+EXPLICIT_TRAITS(static_validate_transaction);
+
+template <Traits traits>
+Result<void> validate_transaction(
+    Transaction const &tx, Address const &sender, State &state,
+    uint256_t const & /*base_fee_per_gas*/,
+    std::span<std::optional<Address> const> const /*authorities*/,
+    trace::StateTracer &state_tracer)
+{
+    static_assert(is_evm_trait_v<traits>);
+    return validate_ethereum_transaction<traits>(
+        tx, sender, state, state_tracer);
+}
+
+EXPLICIT_EVM_TRAITS(validate_transaction);
+
+KINET_NAMESPACE_END

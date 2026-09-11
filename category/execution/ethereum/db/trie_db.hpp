@@ -1,0 +1,144 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/core/bytes.hpp>
+#include <category/core/config.hpp>
+#include <category/core/keccak.hpp>
+#include <category/execution/ethereum/core/block.hpp>
+#include <category/execution/ethereum/core/receipt.hpp>
+#include <category/execution/ethereum/core/transaction.hpp>
+#include <category/execution/ethereum/db/commit_builder.hpp>
+#include <category/execution/ethereum/db/db.hpp>
+#include <category/execution/ethereum/db/db_cache.hpp>
+#include <category/execution/ethereum/db/util.hpp>
+#include <category/execution/ethereum/trace/call_frame.hpp>
+#include <category/mpt/compute.hpp>
+#include <category/mpt/db.hpp>
+#include <category/mpt/ondisk_db_config.hpp>
+#include <category/mpt/state_machine.hpp>
+#include <category/vm/vm.hpp>
+
+#include <nlohmann/json_fwd.hpp>
+
+#include <deque>
+#include <istream>
+#include <memory>
+#include <optional>
+#include <utility>
+#include <vector>
+
+KINET_NAMESPACE_BEGIN
+
+class TrieDb final : public ::kinet::Db
+{
+    ::kinet::mpt::Db &db_;
+    uint64_t block_number_;
+    // bytes32_t{} represent finalized
+    bytes32_t proposal_block_id_;
+    ::kinet::mpt::Nibbles prefix_;
+    ::kinet::mpt::Node::SharedPtr curr_root_;
+    // DbCache default constructor initializes two massive mempools.
+    // We only want to pay that price when the cache is enabled, hence
+    // the need for unique_ptr.
+    std::unique_ptr<DbCache> cache_;
+    // True iff this trie reads / writes page-encoded storage (MIP-8).
+    // Set at construction; immutable. Exposed via is_page_encoded().
+    bool const page_encoded_;
+
+public:
+    explicit TrieDb(mpt::Db &, bool enable_multiblock_cache = false);
+    ~TrieDb();
+
+    bool is_page_encoded() const override
+    {
+        return page_encoded_;
+    }
+
+    void reset_root(::kinet::mpt::Node::SharedPtr root, uint64_t block_number);
+    ::kinet::mpt::Node::SharedPtr const &get_root() const;
+
+    virtual std::optional<Account> read_account(Address const &) override;
+    virtual bytes32_t
+    read_storage(Address const &, Incarnation, bytes32_t const &key) override;
+    virtual storage_page_t read_storage_page(
+        Address const &, Incarnation, bytes32_t const &page_key) override;
+    virtual vm::SharedIntercode read_code(bytes32_t const &) override;
+    virtual void set_block_and_prefix(
+        uint64_t block_number,
+        bytes32_t const &block_id = bytes32_t{}) override;
+
+    virtual void commit(
+        bytes32_t const &block_id, CommitBuilder &builder,
+        BlockHeader const &header, StateDeltas const &state_deltas,
+        std::function<void(BlockHeader &)> populate_header_fn) override;
+
+    virtual void
+    finalize(uint64_t block_number, bytes32_t const &block_id) override;
+    virtual void update_verified_block(uint64_t block_number) override;
+    virtual void update_voted_metadata(
+        uint64_t block_number, bytes32_t const &block_id) override;
+    virtual void update_proposed_metadata(
+        uint64_t block_number, bytes32_t const &block_id) override;
+
+    virtual BlockHeader read_eth_header() override;
+    virtual bytes32_t state_root() override;
+    virtual bytes32_t receipts_root() override;
+    virtual bytes32_t transactions_root() override;
+    virtual std::optional<bytes32_t> withdrawals_root() override;
+    virtual std::string print_stats() override;
+    virtual uint64_t get_block_number() const override;
+
+    nlohmann::json to_json(size_t concurrency_limit = 4096);
+    uint64_t get_history_length() const;
+
+private:
+    /// STATS
+    std::atomic<uint64_t> n_account_no_value_{0};
+    std::atomic<uint64_t> n_account_value_{0};
+    std::atomic<uint64_t> n_storage_no_value_{0};
+    std::atomic<uint64_t> n_storage_value_{0};
+
+    void stats_account_no_value()
+    {
+        n_account_no_value_.fetch_add(1, std::memory_order_release);
+    }
+
+    void stats_account_value()
+    {
+        n_account_value_.fetch_add(1, std::memory_order_release);
+    }
+
+    void stats_storage_no_value()
+    {
+        n_storage_no_value_.fetch_add(1, std::memory_order_release);
+    }
+
+    void stats_storage_value()
+    {
+        n_storage_value_.fetch_add(1, std::memory_order_release);
+    }
+
+    bytes32_t merkle_root(mpt::Nibbles const &);
+
+    // read the storage page from disk, inserting into the cache on a resolved
+    // miss
+    storage_page_t load_storage_page(
+        Address const &, Incarnation, bytes32_t const &lookup_key,
+        CacheReadStatus);
+};
+
+KINET_NAMESPACE_END

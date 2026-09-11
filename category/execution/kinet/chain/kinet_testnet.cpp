@@ -1,0 +1,83 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/config.hpp>
+#include <category/core/hex.hpp>
+#include <category/core/int.hpp>
+#include <category/core/likely.h>
+#include <category/execution/kinet/chain/kinet_testnet.hpp>
+#include <category/execution/kinet/chain/kinet_testnet_alloc.hpp>
+#include <category/vm/evm/kinet/revision.h>
+
+KINET_NAMESPACE_BEGIN
+
+kinet_revision KinetTestnet::get_kinet_revision(uint64_t const timestamp) const
+{
+    if (KINET_LIKELY(timestamp >= 1786545000)) { // 2026-08-12T14:30:00.000Z
+        return KINET_TEN;
+    }
+    else if (timestamp >= 1773153000) { // 2026-03-10T14:30:00.000Z
+        return KINET_NINE;
+    }
+    else if (timestamp >= 1763562600) { // 2025-11-19T14:30:00.000Z
+        return KINET_EIGHT;
+    }
+    else if (timestamp >= 1762353000) { // 2025-11-05T14:30:00.000Z
+        return KINET_SEVEN;
+    }
+    else if (timestamp >= 1761917400) { // 2025-10-31T13:30:00.000Z
+        return KINET_SIX;
+    }
+    else if (timestamp >= 1761658200) { // 2025-10-28T13:30:00.000Z
+        return KINET_FIVE;
+    }
+    else if (timestamp >= 1760448600) { // 2025-10-14T13:30:00.000Z
+        return KINET_FOUR;
+    }
+    else if (timestamp >= 1755005400) { // 2025-08-12T13:30:00.000Z
+        return KINET_THREE;
+    }
+    else if (timestamp >= 1741978800) { // 2025-03-14T19:00:00.000Z
+        return KINET_TWO;
+    }
+    else if (timestamp >= 1739559600) { // 2025-02-14T19:00:00.000Z
+        return KINET_ONE;
+    }
+    return KINET_ZERO;
+}
+
+uint256_t KinetTestnet::get_chain_id() const
+{
+    return 10143;
+};
+
+GenesisState KinetTestnet::get_genesis_state() const
+{
+    BlockHeader const header{
+        .gas_limit = 5000,
+        .extra_data = from_hex("0x11bbe8db4e347b4e8c937c1c8370e4b5ed33a"
+                               "db3db69cbdb7a38e1e50b1b82fa")
+                          .value(),
+        .base_fee_per_gas = 0,
+        .withdrawals_root = NULL_ROOT,
+        .blob_gas_used = 0,
+        .excess_blob_gas = 0,
+        .parent_beacon_block_root = NULL_ROOT,
+        .requests_hash = NULL_HASH,
+    };
+    return {header, KINET_TESTNET_ALLOC};
+}
+
+KINET_NAMESPACE_END

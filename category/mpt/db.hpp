@@ -1,0 +1,419 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/async/concepts.hpp>
+#include <category/async/config.hpp>
+#include <category/async/io.hpp>
+#include <category/async/storage_pool.hpp>
+#include <category/core/bytes.hpp>
+#include <category/core/io/buffers.hpp>
+#include <category/core/io/ring.hpp>
+#include <category/core/lru/static_lru_cache.hpp>
+#include <category/core/result.hpp>
+#include <category/mpt/config.hpp>
+#include <category/mpt/find_request_sender.hpp>
+#include <category/mpt/nibbles_view.hpp>
+#include <category/mpt/node.hpp>
+#include <category/mpt/state_machine_kind.hpp>
+#include <category/mpt/traverse.hpp>
+#include <category/mpt/trie.hpp>
+#include <category/mpt/update.hpp>
+
+#include <memory>
+#include <optional>
+
+KINET_MPT_NAMESPACE_BEGIN
+
+struct OnDiskDbConfig;
+struct ReadOnlyOnDiskDbConfig;
+struct StateMachine;
+struct TraverseMachine;
+struct AsyncContext;
+
+namespace test
+{
+    struct DbAccessor;
+}
+
+struct AsyncIOContext
+{
+    async::storage_pool pool;
+    io::Ring read_ring;
+    std::optional<io::Ring> write_ring;
+    io::Buffers buffers;
+    async::AsyncIO io;
+
+    explicit AsyncIOContext(ReadOnlyOnDiskDbConfig const &options);
+    explicit AsyncIOContext(OnDiskDbConfig const &options);
+};
+
+// A read-only db handle bound to one timeline. The constructor opens the
+// primary; a secondary handle comes from open_secondary_timeline and shares
+// the primary's service thread and node cache. During the dual-timeline
+// migration the timelines differ in encoding and, once post-fork commits go
+// to the page-encoded timeline only, in which versions they have on file.
+class RODb
+{
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+
+    explicit RODb(std::unique_ptr<Impl>);
+
+public:
+    explicit RODb(ReadOnlyOnDiskDbConfig const &);
+    ~RODb();
+
+    RODb(RODb const &) = delete;
+    RODb(RODb &&) = delete;
+    RODb &operator=(RODb const &) = delete;
+    RODb &operator=(RODb &&) = delete;
+
+    Result<NodeCursor>
+    find(NodeCursor const &, NibblesView, uint64_t block_id) const;
+    Result<NodeCursor> find(NibblesView prefix, uint64_t block_id) const;
+
+    uint64_t get_latest_version() const;
+    uint64_t get_earliest_version() const;
+    bool timeline_active(timeline_id) const;
+    bool version_is_valid_ondisk(uint64_t version) const;
+    bool traverse(
+        NodeCursor const &, TraverseMachine &, uint64_t block_id,
+        size_t concurrency_limit = 4096);
+
+    state_machine_kind state_machine_type() const;
+
+    // Handle on the secondary timeline sharing this (primary) handle's
+    // service thread and node cache; nullptr when no secondary is active.
+    [[nodiscard]] std::unique_ptr<RODb> open_secondary_timeline() const;
+};
+
+struct DbStorageStats
+{
+    // Both summed across all storage-pool devices.
+    uint64_t disk_capacity_bytes;
+    uint64_t disk_used_bytes;
+};
+
+// A Db is bound to one timeline. The constructors below produce a primary
+// Db; a secondary Db is obtained from activate_secondary_timeline /
+// open_secondary_timeline. Both instances share the underlying UpdateAux
+// and worker thread via the on-disk service thread held inside the Impl.
+class Db
+{
+private:
+    friend struct AsyncContext;
+
+    struct Impl;
+    class RWOnDisk;
+    class ROOnDiskBlocking;
+    class InMemory;
+
+    std::unique_ptr<Impl> impl_;
+
+    explicit Db(std::unique_ptr<Impl> impl);
+
+public:
+    explicit Db(std::unique_ptr<StateMachine>); // in-memory
+    Db(std::unique_ptr<StateMachine>, OnDiskDbConfig const &); // on-disk RW
+    // Production on-disk RW: reads the primary timeline's state_machine_kind
+    // from db_metadata (routed via primary_ring_idx, so it follows the role
+    // label across promote, not a fixed physical ring), constructs the
+    // StateMachine via the registry in category/mpt/state_machine_kind.hpp,
+    // and owns the SM internally. Caller must have registered the relevant
+    // kinds at process start (e.g. kinet::register_ethereum_state_machines()).
+    explicit Db(OnDiskDbConfig const &);
+    explicit Db(
+        AsyncIOContext &,
+        timeline_id tid = timeline_id::primary); // on-disk RO blocking
+
+    Db(Db const &) = delete;
+    Db(Db &&) noexcept;
+    Db &operator=(Db const &) = delete;
+    Db &operator=(Db &&) noexcept;
+    ~Db();
+
+    // `block_id` is both the version to read and the validity check.
+    // These calls may block on a fiber future and read from this Db's
+    // bound timeline.
+    Result<NodeCursor>
+    find(NodeCursor const &, NibblesView, uint64_t block_id) const;
+    Result<NodeCursor> find(NibblesView prefix, uint64_t block_id) const;
+
+    Node::SharedPtr load_root_for_version(uint64_t block_id) const;
+
+    Node::SharedPtr copy_trie(
+        Node::SharedPtr src_root, NibblesView src_prefix,
+        Node::SharedPtr dest_root, NibblesView dest_prefix,
+        uint64_t dest_version, bool write_root = true);
+
+    Node::SharedPtr upsert(
+        Node::SharedPtr root, UpdateList, uint64_t block_id,
+        bool enable_compaction = true, bool can_write_to_fast = true,
+        bool write_root = true);
+
+    void update_finalized_version(uint64_t version);
+    void update_verified_version(uint64_t version);
+    void update_voted_metadata(uint64_t version, bytes32_t const &block_id);
+    void update_proposed_metadata(uint64_t version, bytes32_t const &block_id);
+    uint64_t get_latest_finalized_version() const;
+    uint64_t get_latest_verified_version() const;
+    bytes32_t get_latest_voted_block_id() const;
+    uint64_t get_latest_voted_version() const;
+    bytes32_t get_latest_proposed_block_id() const;
+    uint64_t get_latest_proposed_version() const;
+
+    // Traverse APIs: return value indicates if we have finished the full
+    // traversal or not.
+    // Parallel traversal is a single threaded out of order traverse using async
+    // i/o. Note that RWDb impl waits on a fiber future, therefore any parallel
+    // traverse run on RWDb should not do any blocking i/o because that will
+    // block the fiber and hang. If you have to do blocking i/o during the
+    // traversal on RWDb, use the `traverse_blocking` api below.
+    bool traverse(
+        NodeCursor const &, TraverseMachine &, uint64_t block_id,
+        size_t concurrency_limit = 4096);
+    // Blocking traverse never wait on a fiber future.
+    bool
+    traverse_blocking(NodeCursor const &, TraverseMachine &, uint64_t block_id);
+
+    // Variant that lets the caller supply a `children_of(mask) -> range`
+    // factory controlling the order in which a node's children are visited.
+    // The factory is invoked once per node; its returned range must own its
+    // storage so the recursive descent below cannot clobber it.
+    template <class ChildrenVisitRange>
+    bool traverse_blocking(
+        NodeCursor const &cursor, TraverseMachine &machine,
+        uint64_t const block_id, ChildrenVisitRange children_of)
+    {
+        KINET_ASSERT(cursor.is_valid());
+        return preorder_traverse_blocking(
+            aux(),
+            *cursor.node,
+            machine,
+            block_id,
+            tid(),
+            std::move(children_of));
+    }
+
+    uint64_t get_latest_version() const;
+    uint64_t get_earliest_version() const;
+    uint64_t get_history_length() const;
+    // This function moves trie from source to destination version in db
+    // history. Only the RWDb can call this API for state sync purposes.
+    void move_trie_version_forward(uint64_t src, uint64_t dest);
+
+    // Load the tree of nodes in the current DB root as far as the caching
+    // policy allows. RW only.
+    size_t prefetch(Node::SharedPtr const &root);
+    // Pump any async DB operations. RO only.
+    size_t poll(bool blocking, size_t count = 1);
+
+    bool is_on_disk() const;
+    bool is_read_only() const;
+
+    // Storage-pool device accounting for on-disk Dbs; zeros when not on disk.
+    // Safe on a read-only handle while the writer is live.
+    DbStorageStats get_storage_stats() const;
+
+    // Timeline lifecycle (callable on the primary Db only).
+    //
+    // All three require the secondary Db (if one was issued) to be
+    // destroyed first; that invariant is asserted via the worker
+    // thread's shared_ptr refcount.
+
+    // Activate the secondary ring and return a Db bound to it. The
+    // secondary timeline starts empty; its compaction state and version
+    // bounds are seeded by the first secondary upsert.
+    [[nodiscard]] Db activate_secondary_timeline(
+        std::unique_ptr<StateMachine> secondary_machine);
+
+    // Attach to a secondary ring that was activated in a prior process
+    // and persisted on disk. Returns nullopt if no secondary is active.
+    [[nodiscard]] std::optional<Db>
+    open_secondary_timeline(std::unique_ptr<StateMachine> secondary_machine);
+
+    // Production variant: read the secondary timeline's persisted
+    // state_machine_kind from db_metadata (routed via primary_ring_idx ^ 1,
+    // so it tracks the secondary role across promote, not a fixed physical
+    // ring) and construct the StateMachine via the registry. Returns nullopt
+    // if no secondary is active. Stamping the kind is the operator's job
+    // (kinet-mpt --activate-secondary --state-machine <kind>).
+    [[nodiscard]] std::optional<Db> open_secondary_timeline();
+
+    // Swap primary and secondary slots. Clears the primary Db's
+    // StateMachine binding so a missed close+reopen (the expected next
+    // step) traps on the next upsert instead of silently using the old
+    // machine on the promoted trie.
+    void promote_secondary_to_primary();
+
+    void deactivate_secondary_timeline();
+
+    bool timeline_active(timeline_id tid) const;
+
+    // The timeline this Db is bound to (primary for ctor-constructed
+    // and in-memory Dbs; secondary for Dbs returned by the activate /
+    // open_secondary_timeline factories).
+    timeline_id tid() const;
+
+    // Returns the state_machine_kind stamped on this Db's bound timeline
+    // in db_metadata. On-disk Dbs read it from the metadata superblock;
+    // in-memory Dbs return the kind() of the StateMachine they were
+    // constructed with.
+    state_machine_kind state_machine_type() const;
+
+private:
+    friend struct test::DbAccessor;
+    UpdateAux const &aux() const;
+    UpdateAux &aux();
+};
+
+// The following are not threadsafe. Please use async get from the RODb owning
+// thread.
+
+struct AsyncContext
+{
+    using inflight_root_t = ankerl::unordered_dense::segmented_map<
+        uint64_t, std::vector<std::function<void(std::shared_ptr<Node>)>>>;
+
+    UpdateAux &aux;
+    // Timeline of the Db this context was created from; the async senders
+    // route root lookups and version-validity checks through it.
+    timeline_id const tid;
+    NodeCache node_cache;
+    inflight_root_t inflight_roots;
+    AsyncInflightNodes inflight_nodes;
+
+    explicit AsyncContext(Db &db, size_t node_lru_max_mem = 16ul << 20);
+    ~AsyncContext() noexcept = default;
+};
+
+using AsyncContextUniquePtr = std::unique_ptr<AsyncContext>;
+AsyncContextUniquePtr
+async_context_create(Db &db, size_t node_lru_max_mem = 16ul << 20);
+
+namespace detail
+{
+    template <return_type T>
+    struct DbGetSender
+    {
+        using result_type = async::result<T>;
+
+        AsyncContext &context;
+
+        enum op_t : uint8_t
+        {
+            op_get1,
+            op_get2,
+            op_get_data1,
+            op_get_data2,
+            op_get_node1,
+            op_get_node2
+        } op_type;
+
+        std::shared_ptr<Node> root;
+        NodeCursor cur;
+        Nibbles const nv;
+        uint64_t const block_id;
+
+        find_result_type<NodeCursor> res_root;
+        find_result_type<T> get_result;
+
+        constexpr DbGetSender(
+            AsyncContext &context_, op_t const op_type_, NibblesView const n,
+            uint64_t const block_id_)
+            : context(context_)
+            , op_type(op_type_)
+            , nv(n)
+            , block_id(block_id_)
+        {
+            if constexpr (std::same_as<T, std::shared_ptr<Node>>) {
+                KINET_ASSERT(op_type == op_t::op_get_node1);
+            }
+        }
+
+        constexpr DbGetSender(
+            AsyncContext &context_, op_t const op_type_, NodeCursor const cur_,
+            NibblesView const n, uint64_t const block_id_)
+            : context(context_)
+            , op_type(op_type_)
+            , cur(cur_)
+            , nv(n)
+            , block_id(block_id_)
+        {
+            if constexpr (std::same_as<T, std::shared_ptr<Node>>) {
+                KINET_ASSERT(op_type == op_t::op_get_node1);
+            }
+        }
+
+        async::result<void>
+        operator()(async::erased_connected_operation *io_state);
+
+        result_type completed(
+            async::erased_connected_operation *,
+            async::result<void> res) noexcept;
+    };
+}
+
+inline detail::TraverseSender make_traverse_sender(
+    AsyncContext *const context, Node::SharedPtr traverse_root,
+    std::unique_ptr<TraverseMachine> machine, uint64_t const block_id,
+    size_t const concurrency_limit = 4096)
+{
+    KINET_ASSERT(context);
+    return {
+        context->aux,
+        std::move(traverse_root),
+        std::move(machine),
+        block_id,
+        context->tid,
+        concurrency_limit};
+}
+
+inline detail::DbGetSender<byte_string> make_get_sender(
+    AsyncContext *const context, NibblesView const nv, uint64_t const block_id)
+{
+    KINET_ASSERT(context);
+    return {
+        *context,
+        detail::DbGetSender<byte_string>::op_t::op_get1,
+        nv,
+        block_id};
+}
+
+inline detail::DbGetSender<byte_string> make_get_data_sender(
+    AsyncContext *const context, NibblesView const nv, uint64_t const block_id)
+{
+    KINET_ASSERT(context);
+    return {
+        *context,
+        detail::DbGetSender<byte_string>::op_t::op_get_data1,
+        nv,
+        block_id};
+}
+
+inline detail::DbGetSender<std::shared_ptr<Node>> make_get_node_sender(
+    AsyncContext *const context, NibblesView const nv, uint64_t const block_id)
+{
+    KINET_ASSERT(context);
+    return {
+        *context,
+        detail::DbGetSender<std::shared_ptr<Node>>::op_t::op_get_node1,
+        nv,
+        block_id};
+}
+
+KINET_MPT_NAMESPACE_END

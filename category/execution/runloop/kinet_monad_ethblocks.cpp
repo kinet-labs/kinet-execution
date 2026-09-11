@@ -1,0 +1,507 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include "runloop_kinet_ethblocks.hpp"
+
+#include <category/core/assert.h>
+#include <category/core/bytes.hpp>
+#include <category/core/config.hpp>
+#include <category/core/fiber/priority_pool.hpp>
+#include <category/core/keccak.hpp>
+#include <category/core/log.hpp>
+#include <category/core/procfs/statm.h>
+#include <category/execution/ethereum/block_hash_buffer.hpp>
+#include <category/execution/ethereum/core/block.hpp>
+#include <category/execution/ethereum/core/fmt/bytes_fmt.hpp>
+#include <category/execution/ethereum/core/rlp/block_rlp.hpp>
+#include <category/execution/ethereum/db/block_db.hpp>
+#include <category/execution/ethereum/db/commit_builder.hpp>
+#include <category/execution/ethereum/db/db.hpp>
+#include <category/execution/ethereum/event/exec_event_ctypes.h>
+#include <category/execution/ethereum/event/exec_event_recorder.hpp>
+#include <category/execution/ethereum/event/record_block_events.hpp>
+#include <category/execution/ethereum/event/record_consensus_events.hpp>
+#include <category/execution/ethereum/execute_block.hpp>
+#include <category/execution/ethereum/execute_transaction.hpp>
+#include <category/execution/ethereum/metrics/block_metrics.hpp>
+#include <category/execution/ethereum/state2/block_state.hpp>
+#include <category/execution/ethereum/trace/call_tracer.hpp>
+#include <category/execution/ethereum/validate_block.hpp>
+#include <category/execution/ethereum/validate_transaction.hpp>
+#include <category/execution/kinet/chain/kinet_chain.hpp>
+#include <category/execution/kinet/db/commit_block_migration.hpp>
+#include <category/execution/kinet/reserve_balance.hpp>
+#include <category/execution/kinet/validate_kinet_block.hpp>
+#include <category/vm/evm/switch_traits.hpp>
+#include <category/vm/evm/traits.hpp>
+
+#include <ankerl/unordered_dense.h>
+
+#include <boost/outcome/try.hpp>
+
+#include <quill/std/Chrono.h>
+
+#include <algorithm>
+#include <chrono>
+#include <memory>
+#include <optional>
+#include <thread>
+#include <vector>
+
+KINET_ANONYMOUS_NAMESPACE_BEGIN
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+
+void log_tps(
+    uint64_t const block_num, uint64_t const nblocks, uint64_t const ntxs,
+    uint64_t const gas, std::chrono::steady_clock::time_point const begin)
+{
+    auto const now = std::chrono::steady_clock::now();
+    auto const elapsed = std::max(
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(now - begin)
+                .count()),
+        1UL); // for the unlikely case that elapsed < 1 mic
+    uint64_t const tps = (ntxs) * 1'000'000 / elapsed;
+    uint64_t const gps = gas / elapsed;
+
+    LOG_INFO(
+        "Run {:4d} blocks to {:8d}, number of transactions {:6d}, "
+        "tps = {:5d}, gps = {:4d} M, rss = {:6d} MB",
+        nblocks,
+        block_num,
+        ntxs,
+        tps,
+        gps,
+        kinet_procfs_self_resident() / (1L << 20));
+};
+
+void get_block_with_retry(
+    BlockDb &block_db, uint64_t const block_num, Block &block,
+    std::chrono::seconds const timeout)
+{
+    constexpr auto RETRY_INTERVAL = std::chrono::milliseconds(100);
+
+    auto const start_time = std::chrono::steady_clock::now();
+
+    while (true) {
+        if (block_db.get(block_num, block)) {
+            return;
+        }
+
+        if (timeout == std::chrono::seconds::zero() ||
+            std::chrono::steady_clock::now() - start_time >= timeout) {
+            KINET_ABORT_PRINTF(
+                "Could not read block %lu from blockdb", block_num);
+        }
+
+        std::this_thread::sleep_for(RETRY_INTERVAL);
+    }
+}
+
+#pragma GCC diagnostic pop
+
+// Process a single Kinet block stored in Ethereum format
+template <Traits traits>
+    requires is_kinet_trait_v<traits>
+Result<void> process_kinet_block(
+    KinetChain const &chain, Db &db, Db *const mirror_db, vm::VM &vm,
+    BlockHashBufferFinalized &block_hash_buffer,
+    fiber::PriorityPool &priority_pool, Block &block, bytes32_t const &block_id,
+    bytes32_t const &parent_block_id, bool const enable_tracing,
+    ankerl::unordered_dense::segmented_set<Address> const
+        &grandparent_senders_and_authorities,
+    ankerl::unordered_dense::segmented_set<Address> const
+        &parent_senders_and_authorities,
+    ankerl::unordered_dense::segmented_set<Address>
+        &senders_and_authorities_out,
+    ExecutionEventRecorder *const exec_recorder)
+{
+    [[maybe_unused]] auto const block_start = std::chrono::system_clock::now();
+    auto const block_begin = std::chrono::steady_clock::now();
+
+    // This is exactly the same as the recording call in runloop_ethereum.cpp;
+    // even though these are historical Kinet block inputs, we don't have the
+    // additional information from the consensus header here (the consensus
+    // timestamp, the `kinet_c_native_block_input` protocol extensions, etc.),
+    // so there are a few std::nullopt values, and the timestamp is approximate
+    record_block_start(
+        exec_recorder,
+        block_id,
+        chain.get_chain_id(),
+        block.header,
+        block.header.parent_hash,
+        block.header.number,
+        0,
+        block.header.timestamp * 1'000'000'000UL,
+        block.transactions.size(),
+        std::nullopt,
+        std::nullopt);
+
+    // Block input validation
+    BOOST_OUTCOME_TRY(static_validate_block<traits>(chain, block));
+
+    // Sender and authority recovery
+    auto const sender_recovery_begin = std::chrono::steady_clock::now();
+    auto const recovered_senders =
+        recover_senders(block.transactions, priority_pool);
+    auto const recovered_authorities =
+        recover_authorities(block.transactions, priority_pool);
+    [[maybe_unused]] auto const sender_recovery_time =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - sender_recovery_begin);
+    std::vector<Address> senders(block.transactions.size());
+    for (unsigned i = 0; i < recovered_senders.size(); ++i) {
+        if (recovered_senders[i].has_value()) {
+            senders[i] = recovered_senders[i].value();
+        }
+        else {
+            return TransactionError::MissingSender;
+        }
+    }
+    auto const senders_and_authorities =
+        combine_senders_and_authorities(senders, recovered_authorities);
+
+    BOOST_OUTCOME_TRY(
+        static_validate_kinet_body<traits>(senders, block.transactions));
+
+    // Call tracer initialization
+    std::vector<std::vector<CallFrame>> call_frames{block.transactions.size()};
+    std::vector<std::unique_ptr<CallTracerBase>> call_tracers{
+        block.transactions.size()};
+    std::vector<std::unique_ptr<trace::StateTracer>> state_tracers(
+        block.transactions.size());
+    trace::StateTracer system_call_state_tracer{std::monostate{}};
+    for (unsigned i = 0; i < block.transactions.size(); ++i) {
+        call_tracers[i] =
+            enable_tracing
+                ? std::unique_ptr<CallTracerBase>{std::make_unique<CallTracer>(
+                      block.transactions[i], call_frames[i])}
+                : std::unique_ptr<CallTracerBase>{
+                      std::make_unique<NoopCallTracer>()};
+        state_tracers[i] =
+            std::make_unique<trace::StateTracer>(std::monostate{});
+    }
+
+    senders_and_authorities_out = senders_and_authorities;
+
+    ChainContext<traits> const chain_context{
+        .grandparent_senders_and_authorities =
+            grandparent_senders_and_authorities,
+        .parent_senders_and_authorities = parent_senders_and_authorities,
+        .senders_and_authorities = senders_and_authorities,
+        .senders = senders,
+        .authorities = recovered_authorities};
+
+    // Core execution: transaction-level EVM execution that tracks state
+    // changes but does not commit them
+    for_each_db(db, mirror_db, [&](Db &d) {
+        d.set_block_and_prefix(block.header.number - 1, parent_block_id);
+    });
+    block.header.parent_hash =
+        to_bytes(keccak256(rlp::encode_block_header(db.read_eth_header())));
+
+    BlockMetrics block_metrics;
+    BlockState block_state(db, vm, mirror_db);
+    record_block_marker_event(exec_recorder, KINET_EXEC_BLOCK_PERF_EVM_ENTER);
+    BOOST_OUTCOME_TRY(
+        auto const receipts,
+        execute_block<traits>(
+            chain,
+            block,
+            senders,
+            recovered_authorities,
+            block_state,
+            block_hash_buffer,
+            priority_pool.fiber_group(),
+            block_metrics,
+            call_tracers,
+            state_tracers,
+            system_call_state_tracer,
+            chain_context,
+            exec_recorder));
+    record_block_marker_event(exec_recorder, KINET_EXEC_BLOCK_PERF_EVM_EXIT);
+
+    // Database commit of state changes (incl. Merkle root calculations)
+    block_state.log_debug();
+    auto const commit_begin = std::chrono::steady_clock::now();
+    auto [state, code, _] = std::move(block_state).release();
+
+    BlockCommitAncillaries const anc{
+        .code = code,
+        .receipts = receipts,
+        .transactions = block.transactions,
+        .senders = senders,
+        .call_frames = call_frames,
+        .ommers = block.ommers,
+        .withdrawals = block.withdrawals};
+    commit_block<traits>(db, mirror_db, block_id, block.header, *state, anc);
+
+    [[maybe_unused]] auto const commit_time =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - commit_begin);
+    if (commit_time > std::chrono::milliseconds(500)) {
+        LOG_WARNING(
+            "Slow block commit detected - block {}: {}",
+            block.header.number,
+            commit_time);
+    }
+    // Post-commit validation of header, with Merkle root fields filled in
+    BlockExecOutput exec_output;
+    exec_output.eth_header = db.read_eth_header();
+    BOOST_OUTCOME_TRY(
+        validate_output_header(block.header, exec_output.eth_header));
+
+    // Commit prologue: database finalization, computation of the Ethereum
+    // block hash to append to the circular hash buffer
+    for_each_db(db, mirror_db, [&](Db &d) {
+        d.finalize(block.header.number, block_id);
+        d.update_verified_block(block.header.number);
+    });
+    exec_output.eth_block_hash =
+        to_bytes(keccak256(rlp::encode_block_header(exec_output.eth_header)));
+    block_hash_buffer.set(
+        exec_output.eth_header.number, exec_output.eth_block_hash);
+    (void)record_block_result(exec_recorder, exec_output);
+
+    LOG_INFO(
+        "block={}, block_id={} state_root {}={}{}",
+        block.header.number,
+        block_id,
+        db.is_page_encoded() ? "page" : "slot",
+        db.state_root(),
+        mirror_db != nullptr
+            ? fmt::format(
+                  " mirror_{}={}",
+                  mirror_db->is_page_encoded() ? "page" : "slot",
+                  mirror_db->state_root())
+            : std::string{});
+
+    // Emit the block metrics log line
+    [[maybe_unused]] auto const block_time =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - block_begin);
+    LOG_INFO(
+        "__exec_block,bl={:8},ts={}"
+        ",tx={:5},rt={:4},rtp={:5.2f}%"
+        ",sr={:>7},txe={:>8},cmt={:>8},tot={:>8},tpse={:5},tps={:5}"
+        ",gas={:9},gpse={:4},gps={:3}{}{}{}",
+        block.header.number,
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            block_start.time_since_epoch())
+            .count(),
+        block.transactions.size(),
+        block_metrics.num_retries,
+        100.0 * (double)block_metrics.num_retries /
+            std::max(1.0, (double)block.transactions.size()),
+        sender_recovery_time,
+        block_metrics.tx_exec_time,
+        commit_time,
+        block_time,
+        block.transactions.size() * 1'000'000 /
+            (uint64_t)std::max(1L, block_metrics.tx_exec_time.count()),
+        block.transactions.size() * 1'000'000 /
+            (uint64_t)std::max(1L, block_time.count()),
+        exec_output.eth_header.gas_used,
+        exec_output.eth_header.gas_used /
+            (uint64_t)std::max(1L, block_metrics.tx_exec_time.count()),
+        exec_output.eth_header.gas_used /
+            (uint64_t)std::max(1L, block_time.count()),
+        db.print_stats(),
+        vm.print_and_reset_block_counts(),
+        vm.print_compiler_stats());
+
+    return outcome_e::success();
+}
+
+KINET_ANONYMOUS_NAMESPACE_END
+
+KINET_NAMESPACE_BEGIN
+
+Result<std::pair<uint64_t, uint64_t>> runloop_kinet_ethblocks(
+    KinetChain const &chain, std::filesystem::path const &ledger_dir, Db &db,
+    Db *const secondary_db, vm::VM &vm,
+    BlockHashBufferFinalized &block_hash_buffer,
+    fiber::PriorityPool &priority_pool, uint64_t &finalized_block_num,
+    uint64_t const end_block_num, sig_atomic_t const volatile &stop,
+    bool const enable_tracing, std::chrono::seconds const block_db_timeout,
+    ExecutionEventRecorder *const exec_recorder)
+{
+    uint64_t const batch_size =
+        end_block_num == std::numeric_limits<uint64_t>::max() ? 1 : 1000;
+    uint64_t batch_num_blocks = 0;
+    uint64_t batch_num_txs = 0;
+    uint64_t total_gas = 0;
+    uint64_t batch_gas = 0;
+    auto batch_begin = std::chrono::steady_clock::now();
+    uint64_t ntxs = 0;
+
+    BlockDb block_db(ledger_dir);
+    bytes32_t parent_block_id{};
+    uint64_t block_num = finalized_block_num;
+
+    ankerl::unordered_dense::segmented_set<Address>
+        grandparent_senders_and_authorities;
+    ankerl::unordered_dense::segmented_set<Address>
+        parent_senders_and_authorities;
+
+    if (block_num > 1) {
+        Block parent_block;
+        get_block_with_retry(
+            block_db, block_num - 1, parent_block, block_db_timeout);
+        auto const recovered_senders =
+            recover_senders(parent_block.transactions, priority_pool);
+        auto const recovered_authorities =
+            recover_authorities(parent_block.transactions, priority_pool);
+        std::vector<Address> senders(parent_block.transactions.size());
+        for (unsigned j = 0; j < recovered_senders.size(); ++j) {
+            if (recovered_senders[j].has_value()) {
+                senders[j] = recovered_senders[j].value();
+            }
+        }
+        ankerl::unordered_dense::segmented_set<Address> parent_set;
+        for (Address const &sender : senders) {
+            parent_set.insert(sender);
+        }
+        for (std::vector<std::optional<Address>> const &authorities :
+             recovered_authorities) {
+            for (std::optional<Address> const &authority : authorities) {
+                if (authority.has_value()) {
+                    parent_set.insert(authority.value());
+                }
+            }
+        }
+        parent_senders_and_authorities = std::move(parent_set);
+
+        if (block_num > 2) {
+            Block grandparent_block;
+            get_block_with_retry(
+                block_db, block_num - 2, grandparent_block, block_db_timeout);
+            auto const grandparent_recovered_senders =
+                recover_senders(grandparent_block.transactions, priority_pool);
+            auto const grandparent_recovered_authorities = recover_authorities(
+                grandparent_block.transactions, priority_pool);
+            std::vector<Address> grandparent_senders(
+                grandparent_block.transactions.size());
+            for (unsigned j = 0; j < grandparent_recovered_senders.size();
+                 ++j) {
+                if (grandparent_recovered_senders[j].has_value()) {
+                    grandparent_senders[j] =
+                        grandparent_recovered_senders[j].value();
+                }
+            }
+            ankerl::unordered_dense::segmented_set<Address> grandparent_set;
+            for (Address const &sender : grandparent_senders) {
+                grandparent_set.insert(sender);
+            }
+            for (std::vector<std::optional<Address>> const &authorities :
+                 grandparent_recovered_authorities) {
+                for (std::optional<Address> const &authority : authorities) {
+                    if (authority.has_value()) {
+                        grandparent_set.insert(authority.value());
+                    }
+                }
+            }
+            grandparent_senders_and_authorities = std::move(grandparent_set);
+        }
+    }
+
+    while (block_num <= end_block_num && stop == 0) {
+        Block block;
+        get_block_with_retry(block_db, block_num, block, block_db_timeout);
+
+        bytes32_t const block_id = bytes32_t{block.header.number};
+        kinet_revision const rev =
+            chain.get_kinet_revision(block.header.timestamp);
+
+        // Blocks always execute on and commit to the primary; the primary's
+        // encoding must match the block's revision. Before the mip-8 cutoff
+        // the primary is the slot db and a page-encoded secondary, when
+        // open, is mirrored so it can be promoted at the cutoff (offline,
+        // via kinet-mpt). After the promote the primary is the page db and
+        // the slot secondary is frozen history that takes no writes.
+        KINET_ASSERT_PRINTF(
+            db.is_page_encoded() == mip_8_active(rev),
+            "kinet revision %d at block %lu needs a %s-encoded primary "
+            "(found %s); %s",
+            rev,
+            block.header.number,
+            mip_8_active(rev) ? "page" : "slot",
+            db.is_page_encoded() ? "page" : "slot",
+            mip_8_active(rev)
+                ? "run kinet-mpt --promote-secondary offline"
+                : "pre MIP-8 blocks cannot replay on a promoted db");
+
+        Db *const mirror_db = !mip_8_active(rev) ? secondary_db : nullptr;
+
+        ankerl::unordered_dense::segmented_set<Address> senders_and_authorities;
+        BOOST_OUTCOME_TRY([&] {
+            SWITCH_KINET_TRAITS(
+                process_kinet_block,
+                chain,
+                db,
+                mirror_db,
+                vm,
+                block_hash_buffer,
+                priority_pool,
+                block,
+                block_id,
+                parent_block_id,
+                enable_tracing,
+                grandparent_senders_and_authorities,
+                parent_senders_and_authorities,
+                senders_and_authorities,
+                exec_recorder);
+            KINET_ABORT_PRINTF("unhandled rev switch case: %d", rev);
+        }());
+
+        record_mock_consensus_events(exec_recorder, block_id, block_num);
+        ntxs += block.transactions.size();
+        batch_num_txs += block.transactions.size();
+        total_gas += block.header.gas_used;
+        batch_gas += block.header.gas_used;
+        ++batch_num_blocks;
+
+        if (block_num % batch_size == 0) {
+            log_tps(
+                block_num,
+                batch_num_blocks,
+                batch_num_txs,
+                batch_gas,
+                batch_begin);
+            batch_num_blocks = 0;
+            batch_num_txs = 0;
+            batch_gas = 0;
+            batch_begin = std::chrono::steady_clock::now();
+        }
+
+        grandparent_senders_and_authorities =
+            std::move(parent_senders_and_authorities);
+        parent_senders_and_authorities = std::move(senders_and_authorities);
+
+        parent_block_id = block_id;
+        ++block_num;
+    }
+    if (batch_num_blocks > 0) {
+        log_tps(
+            block_num, batch_num_blocks, batch_num_txs, batch_gas, batch_begin);
+    }
+    finalized_block_num = block_num;
+    return {ntxs, total_gas};
+}
+
+KINET_NAMESPACE_END

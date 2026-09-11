@@ -1,0 +1,228 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/core/address.hpp>
+#include <category/core/byte_string.hpp>
+#include <category/core/config.hpp>
+#include <category/core/int.hpp>
+#include <category/vm/evm/status_code.h>
+#include <category/vm/evm/traits.hpp>
+
+#include <evmc/evmc.h>
+#include <evmc/evmc.hpp>
+
+#include <bit>
+#include <cstring>
+#include <optional>
+#include <span>
+
+KINET_NAMESPACE_BEGIN
+
+class State;
+struct CallTracerBase;
+
+bool init_trusted_setup();
+
+inline constexpr Address ripemd_address{3};
+
+template <Traits traits>
+bool is_eth_precompile(Address const &);
+
+template <Traits traits>
+bool is_precompile(Address const &);
+
+template <Traits traits>
+std::optional<evmc::Result> check_call_eth_precompile(evmc_message const &);
+
+template <Traits traits>
+std::optional<evmc::Result>
+check_call_precompile(State &, CallTracerBase &, evmc_message const &);
+
+using precompiled_gas_cost_fn = std::optional<uint64_t>(byte_string_view);
+
+template <Traits traits>
+uint64_t ecrecover_gas_cost(byte_string_view);
+
+uint64_t sha256_gas_cost(byte_string_view);
+
+uint64_t ripemd160_gas_cost(byte_string_view);
+
+uint64_t identity_gas_cost(byte_string_view);
+
+template <Traits traits>
+std::optional<uint64_t> expmod_gas_cost(byte_string_view);
+
+template <Traits traits>
+uint64_t ecadd_gas_cost(byte_string_view);
+
+template <Traits traits>
+uint64_t ecmul_gas_cost(byte_string_view);
+
+template <kinet_eth_revision Rev>
+[[gnu::always_inline]] inline uint64_t
+snarkv_gas_cost_ethereum(byte_string_view const input)
+{
+    static_assert(Rev >= KINET_ETH_ISTANBUL);
+
+    uint64_t const k{input.size() / 192};
+    return 34'000 * k + 45'000; // EIP-1108
+}
+
+template <Traits traits>
+uint64_t snarkv_gas_cost(byte_string_view);
+
+[[gnu::always_inline]] inline std::optional<uint64_t>
+blake2bf_gas_cost_ethereum(byte_string_view const input)
+{
+    if (input.size() < 4) {
+        return std::nullopt;
+    }
+    uint32_t rounds{0};
+    std::memcpy(&rounds, input.data(), sizeof(uint32_t));
+    static_assert(
+        std::endian::native == std::endian::little,
+        "blake2bf_gas_cost_ethereum only works on little-endian platforms");
+    return bswap(rounds);
+}
+
+template <Traits traits>
+std::optional<uint64_t> blake2bf_gas_cost(byte_string_view);
+
+template <Traits traits>
+uint64_t point_evaluation_gas_cost(byte_string_view);
+
+uint64_t bls12_g1_add_gas_cost(byte_string_view);
+
+uint64_t bls12_g1_msm_gas_cost(byte_string_view);
+
+uint64_t bls12_g2_add_gas_cost(byte_string_view);
+
+uint64_t bls12_g2_msm_gas_cost(byte_string_view);
+
+uint64_t bls12_pairing_check_gas_cost(byte_string_view);
+
+uint64_t bls12_map_fp_to_g1_gas_cost(byte_string_view);
+
+uint64_t bls12_map_fp2_to_g2_gas_cost(byte_string_view);
+
+// Rollup precompiles
+uint64_t p256_verify_gas_cost(byte_string_view);
+
+struct PrecompileResult
+{
+    kinet_status_code status_code;
+    uint8_t *obuf;
+    size_t output_size;
+
+    static constexpr PrecompileResult failure() noexcept
+    {
+        return {
+            .status_code = KINET_STATUS_PRECOMPILE_FAILURE,
+            .obuf = nullptr,
+            .output_size = 0,
+        };
+    }
+};
+
+using precompiled_execute_fn = PrecompileResult(byte_string_view);
+
+PrecompileResult ecrecover_execute(byte_string_view);
+PrecompileResult sha256_execute(byte_string_view);
+PrecompileResult ripemd160_execute(byte_string_view);
+PrecompileResult expmod_execute(byte_string_view);
+PrecompileResult ecadd_execute(byte_string_view);
+PrecompileResult ecmul_execute(byte_string_view);
+PrecompileResult snarkv_execute(byte_string_view);
+PrecompileResult blake2bf_execute(byte_string_view);
+PrecompileResult point_evaluation_execute(byte_string_view);
+PrecompileResult bls12_g1_add_execute(byte_string_view);
+PrecompileResult bls12_g1_msm_execute(byte_string_view);
+PrecompileResult bls12_g2_add_execute(byte_string_view);
+PrecompileResult bls12_g2_msm_execute(byte_string_view);
+PrecompileResult bls12_pairing_check_execute(byte_string_view);
+PrecompileResult bls12_map_fp_to_g1_execute(byte_string_view);
+PrecompileResult bls12_map_fp2_to_g2_execute(byte_string_view);
+PrecompileResult p256_verify_execute(byte_string_view);
+PrecompileResult identity_execute(byte_string_view);
+
+struct PrecompileImplResult
+{
+    uint8_t *data;
+    size_t size;
+
+    static constexpr PrecompileImplResult failure() noexcept
+    {
+        return {
+            .data = nullptr,
+            .size = 0,
+        };
+    }
+};
+
+PrecompileImplResult
+sha256_impl(byte_string_view input, std::span<uint8_t, 32> const out);
+
+PrecompileImplResult
+ripemd160_impl(byte_string_view input, std::span<uint8_t, 32> const out);
+
+PrecompileImplResult expmod_impl(
+    std::span<uint8_t> const base, std::span<uint8_t> const exp,
+    std::span<uint8_t> const modulus, std::span<uint8_t> out);
+
+PrecompileImplResult
+ecadd_impl(byte_string_view input, std::span<uint8_t, 64> const out);
+
+PrecompileImplResult
+ecmul_impl(byte_string_view input, std::span<uint8_t, 64> const out);
+
+PrecompileImplResult
+snarkv_impl(byte_string_view input, std::span<uint8_t, 32> const out);
+
+PrecompileImplResult
+blake2bf_impl(byte_string_view input, std::span<uint8_t, 64> const out);
+
+PrecompileImplResult
+point_evaluation_impl(byte_string_view input, std::span<uint8_t, 64> const out);
+
+PrecompileImplResult
+bls12_g1_add_impl(byte_string_view input, std::span<uint8_t, 128> const out);
+
+PrecompileImplResult
+bls12_g1_msm_impl(byte_string_view input, std::span<uint8_t, 128> const out);
+
+PrecompileImplResult
+bls12_g2_add_impl(byte_string_view input, std::span<uint8_t, 256> const out);
+
+PrecompileImplResult
+bls12_g2_msm_impl(byte_string_view input, std::span<uint8_t, 256> const out);
+
+PrecompileImplResult bls12_pairing_check_impl(
+    byte_string_view input, std::span<uint8_t, 32> const out);
+
+PrecompileImplResult bls12_map_fp_to_g1_impl(
+    byte_string_view input, std::span<uint8_t, 128> const out);
+
+PrecompileImplResult bls12_map_fp2_to_g2_impl(
+    byte_string_view input, std::span<uint8_t, 256> const out);
+
+PrecompileImplResult
+p256_verify_impl(byte_string_view input, std::span<uint8_t, 32> const out);
+
+PrecompileImplResult
+identity_impl(byte_string_view input, std::span<uint8_t> const out);
+
+KINET_NAMESPACE_END

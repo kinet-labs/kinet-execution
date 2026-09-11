@@ -1,0 +1,696 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/core/assert.h>
+#include <category/core/small_prng.hpp>
+#include <category/mpt/compute.hpp>
+#include <category/mpt/trie.hpp>
+
+#include <array>
+#include <vector>
+
+namespace kinet::test
+{
+    using namespace kinet::mpt;
+    using namespace kinet::literals;
+
+    constexpr uint64_t MPT_TEST_HISTORY_LENGTH = 1000;
+
+    struct DummyComputeLeafData
+    {
+        // TEMPORARY for POC
+        // compute leaf data as - concat(input_leaf, hash);
+        static byte_string process(Node const &node)
+        {
+            return byte_string{node.value()} + byte_string{node.data()};
+        }
+    };
+
+    using MerkleCompute = ::kinet::mpt::MerkleComputeBase<DummyComputeLeafData>;
+
+    struct RootMerkleCompute : public MerkleCompute
+    {
+        virtual unsigned compute(unsigned char *const, Node const &) override
+        {
+            return 0;
+        }
+    };
+
+    template <int prefix_len = 2>
+    class StateMachineMerkleWithPrefix final : public StateMachine
+    {
+    private:
+        static constexpr auto cache_depth = prefix_len + 6;
+        static constexpr auto max_depth = prefix_len + 64 + 64;
+        size_t depth{0};
+
+    public:
+        virtual std::unique_ptr<StateMachine> clone() const override
+        {
+            return std::make_unique<StateMachineMerkleWithPrefix>(*this);
+        }
+
+        virtual void down(unsigned char) override
+        {
+            ++depth;
+        }
+
+        virtual void up(size_t const n) override
+        {
+            KINET_ASSERT(n <= depth);
+            depth -= n;
+        }
+
+        virtual Compute &get_compute() const override
+        {
+            static MerkleCompute m{};
+            static RootMerkleCompute rm{};
+            static EmptyCompute e{};
+            if (KINET_LIKELY(depth > prefix_len)) {
+                return m;
+            }
+            else if (depth < prefix_len) {
+                return e;
+            }
+            return rm;
+        }
+
+        virtual constexpr bool cache() const override
+        {
+            KINET_ASSERT(depth <= max_depth);
+            return depth < cache_depth;
+        }
+
+        virtual constexpr bool compact() const override
+        {
+            return true;
+        }
+
+        virtual bool is_variable_length() const override
+        {
+            return false;
+        }
+    };
+
+    static_assert(sizeof(StateMachineMerkleWithPrefix<>) == 16);
+    static_assert(alignof(StateMachineMerkleWithPrefix<>) == 8);
+
+    template <int prefix_len = 2>
+    class StateMachineVarLenTrieWithPrefix final : public StateMachine
+    {
+    private:
+        static constexpr auto cache_depth = prefix_len + 6;
+        static constexpr auto max_depth = prefix_len + 65;
+        size_t depth{0};
+
+    public:
+        virtual std::unique_ptr<StateMachine> clone() const override
+        {
+            return std::make_unique<StateMachineVarLenTrieWithPrefix>(*this);
+        }
+
+        virtual void down(unsigned char) override
+        {
+            ++depth;
+        }
+
+        virtual void up(size_t const n) override
+        {
+            KINET_ASSERT(n <= depth);
+            depth -= n;
+        }
+
+        virtual Compute &get_compute() const override
+        {
+            static VarLenMerkleCompute m{};
+            static RootVarLenMerkleCompute rm{};
+            static EmptyCompute e{};
+            if (KINET_LIKELY(depth > prefix_len)) {
+                return m;
+            }
+            else if (depth < prefix_len) {
+                return e;
+            }
+            return rm;
+        }
+
+        virtual constexpr bool cache() const override
+        {
+            KINET_ASSERT(depth <= max_depth);
+            return depth < cache_depth;
+        }
+
+        virtual constexpr bool compact() const override
+        {
+            return true;
+        }
+
+        virtual bool is_variable_length() const override
+        {
+            return depth > prefix_len;
+        }
+    };
+
+    static_assert(sizeof(StateMachineVarLenTrieWithPrefix<>) == 16);
+    static_assert(alignof(StateMachineVarLenTrieWithPrefix<>) == 8);
+
+    struct StateMachineConfig
+    {
+        bool expire{false};
+        size_t cache_depth{6};
+        size_t variable_length_start_depth{size_t(-1)};
+    };
+
+    template <class Compute, StateMachineConfig config = StateMachineConfig{}>
+    class StateMachineAlways final : public StateMachine
+    {
+    private:
+        size_t depth{0};
+
+    public:
+        StateMachineAlways() = default;
+
+        virtual std::unique_ptr<StateMachine> clone() const override
+        {
+            return std::make_unique<StateMachineAlways<Compute, config>>(*this);
+        }
+
+        virtual void down(unsigned char) override
+        {
+            ++depth;
+        }
+
+        virtual void up(size_t const n) override
+        {
+            KINET_ASSERT(n <= depth);
+            depth -= n;
+        }
+
+        virtual Compute &get_compute() const override
+        {
+            static Compute c{};
+            return c;
+        }
+
+        virtual constexpr bool cache() const override
+        {
+            return depth < config.cache_depth;
+        }
+
+        virtual constexpr bool compact() const override
+        {
+            return true;
+        }
+
+        virtual constexpr bool auto_expire() const override
+        {
+            return config.expire;
+        }
+
+        virtual constexpr bool is_variable_length() const override
+        {
+            return depth > config.variable_length_start_depth;
+        }
+    };
+
+    using StateMachineAlwaysEmpty = StateMachineAlways<EmptyCompute>;
+    using StateMachineAlwaysMerkle = StateMachineAlways<MerkleCompute>;
+    using StateMachineAlwaysVarLen = StateMachineAlways<
+        VarLenMerkleCompute<>,
+        StateMachineConfig{.variable_length_start_depth = 0}>;
+    using StateMachinePlainVarLen = StateMachineAlways<
+        EmptyCompute, StateMachineConfig{.variable_length_start_depth = 0}>;
+
+    inline Node::SharedPtr upsert_vector(
+        UpdateAux &aux, StateMachine &sm, Node::SharedPtr old,
+        std::vector<Update> &&update_vec, uint64_t const version = 0)
+    {
+        UpdateList update_ls;
+        for (auto &it : update_vec) {
+            update_ls.push_front(it);
+        }
+        return upsert(
+            aux,
+            version,
+            sm,
+            std::move(old),
+            std::move(update_ls),
+            /*write_root=*/true,
+            timeline_id::primary);
+    }
+
+    template <class... Updates>
+    [[nodiscard]] constexpr Node::SharedPtr upsert_updates_with_version(
+        UpdateAux &aux, StateMachine &sm, Node::SharedPtr old,
+        uint64_t const version, Updates... updates)
+    {
+        UpdateList update_ls;
+        (update_ls.push_front(updates), ...);
+        return upsert(
+            aux,
+            version,
+            sm,
+            std::move(old),
+            std::move(update_ls),
+            /*write_root=*/true,
+            timeline_id::primary);
+    }
+
+    template <class... Updates>
+    [[nodiscard]] constexpr Node::SharedPtr upsert_updates(
+        UpdateAux &aux, StateMachine &sm, Node::SharedPtr old,
+        Updates... updates)
+    {
+        return upsert_updates_with_version(
+            aux, sm, std::move(old), 0, std::forward<Updates>(updates)...);
+    }
+
+    namespace fixed_updates
+    {
+        std::vector<std::pair<kinet::byte_string, kinet::byte_string>> const kv{
+            {0x1234567812345678123456781234567812345678123456781234567812345678_bytes,
+             0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef_bytes},
+            {0x1234567822345678123456781234567812345678123456781234567812345678_bytes,
+             0xdeadbeefcafebabedeadbeefcafebabedeadbeefcafebabedeadbeefcafebabe_bytes},
+            {0x1234567832345678123456781234567812345678123456781234567812345671_bytes,
+             0xdeadcafedeadcafedeadcafedeadcafedeadcafedeadcafedeadcafedeadcafe_bytes},
+            {0x1234567832345678123456781234567812345678123456781234567812345678_bytes,
+             0xdeadbabedeadbabedeadbabedeadbabedeadbabedeadbabedeadbabedeadbabe_bytes}};
+    };
+
+    namespace unrelated_leaves
+    {
+        std::vector<std::pair<kinet::byte_string, kinet::byte_string>> const kv{
+            {0x0234567812345678123456781234567812345678123456781234567812345678_bytes,
+             0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef_bytes},
+            {0x1234567812345678123456781234567812345678123456781234567812345678_bytes,
+             0xdeadbeefcafebabedeadbeefcafebabedeadbeefcafebabedeadbeefcafebabe_bytes},
+            {0x2234567812345678123456781234567812345678123456781234567812345678_bytes,
+             0xdeadcafedeadcafedeadcafedeadcafedeadcafedeadcafedeadcafedeadcafe_bytes},
+            {0x3234567812345678123456781234567812345678123456781234567812345678_bytes,
+             0xdeadbabedeadbabedeadbabedeadbabedeadbabedeadbabedeadbabedeadbabe_bytes}};
+    };
+
+    namespace var_len_values
+    {
+        std::vector<std::pair<kinet::byte_string, kinet::byte_string>> const kv{
+            {0x0234567812345678123456781234567812345678123456781234567812345678_bytes,
+             0xdead_bytes}, // 0
+            {0x1234567812345678123456781234567812345678123456781234567812345678_bytes,
+             0xbeef_bytes}, // 1
+            {0x2234567812345678123456781234567812345678123456781234567812345678_bytes,
+             0xba_bytes}, // 2
+            {0x3234567812345678123456781234567812345678123456781234567812345678_bytes,
+             0xdeadbeef_bytes}, // 3
+            {0x1234567822345678123456781234567812345678123456781234567812345678_bytes,
+             0xdeadbeefcafe_bytes}, // 4
+            {0x1234567832345678123456781234567812345678123456781234567812345671_bytes,
+             0xdeadcafedeadcafedeadcafedeadcafedead_bytes}, // 5
+            {0x1234567832345678123456781234567812345678123456781234567812345678_bytes,
+             0xdeadbabedeadbabedeadbabedead_bytes}}; // 6
+    };
+
+    // merkle tries
+    template <class Base>
+    class InMemoryTrieBase : public Base
+    {
+    public:
+        Node::SharedPtr root;
+        UpdateAux aux;
+
+        InMemoryTrieBase()
+            : root()
+            , aux()
+        {
+        }
+
+        void reset()
+        {
+            root.reset();
+        }
+
+        constexpr bool on_disk() const
+        {
+            return aux.is_on_disk();
+        }
+
+        constexpr KINET_ASYNC_NAMESPACE::storage_pool *get_storage_pool() const
+        {
+            return nullptr;
+        }
+    };
+
+    template <class Base>
+    class OnDiskTrieBase : public Base
+    {
+    private:
+        kinet::async::storage_pool pool{
+            kinet::async::use_anonymous_inode_tag{}};
+        kinet::io::Ring ring1, ring2;
+        kinet::io::Buffers rwbuf;
+        KINET_ASYNC_NAMESPACE::AsyncIO io;
+
+    public:
+        Node::SharedPtr root;
+        UpdateAux aux;
+
+        OnDiskTrieBase()
+            : ring1(kinet::io::RingConfig{2})
+            , ring2(kinet::io::RingConfig{4})
+            , rwbuf(kinet::io::make_buffers_for_segregated_read_write(
+                  ring1, ring2, 2, 4,
+                  KINET_ASYNC_NAMESPACE::AsyncIO::KINET_IO_BUFFERS_READ_SIZE,
+                  KINET_ASYNC_NAMESPACE::AsyncIO::KINET_IO_BUFFERS_WRITE_SIZE))
+            , io(pool, rwbuf)
+            , root()
+            , aux(io, MPT_TEST_HISTORY_LENGTH)
+        {
+        }
+
+        void reset()
+        {
+            root.reset();
+        }
+
+        constexpr bool on_disk() const
+        {
+            return aux.is_on_disk();
+        }
+
+        constexpr KINET_ASYNC_NAMESPACE::storage_pool *get_storage_pool()
+        {
+            return &io.storage_pool();
+        }
+    };
+
+    template <class Base>
+    class MerkleTrie : public Base
+    {
+    public:
+        std::unique_ptr<StateMachine> sm =
+            std::make_unique<StateMachineAlwaysMerkle>();
+
+        kinet::byte_string root_hash()
+        {
+            if (this->root.get()) {
+                kinet::byte_string res(32, 0);
+                auto const len =
+                    this->sm->get_compute().compute(res.data(), *this->root);
+                if (len < KECCAK256_SIZE) {
+                    kinet_keccak256(res.data(), len, res.data());
+                }
+                return res;
+            }
+            return empty_trie_hash;
+        }
+    };
+
+    template <class Base>
+    class PlainTrie : public Base
+    {
+    public:
+        std::unique_ptr<StateMachine> sm =
+            std::make_unique<StateMachineAlwaysEmpty>();
+    };
+
+    template <typename BaseTrie>
+    class EraseFixture : public BaseTrie
+    {
+    public:
+        EraseFixture()
+            : BaseTrie()
+        {
+            auto const &kv = fixed_updates::kv;
+
+            std::vector<Update> update_vec;
+            std::ranges::transform(
+                kv, std::back_inserter(update_vec), [](auto &su) -> Update {
+                    auto &[k, v] = su;
+                    return make_update(k, v);
+                });
+            this->root = upsert_vector(
+                this->aux, *this->sm, nullptr, std::move(update_vec));
+        }
+    };
+
+    struct FillDBWithChunksConfig
+    {
+        size_t chunks_to_fill;
+        size_t chunks_max{64};
+        size_t history_len{MPT_TEST_HISTORY_LENGTH};
+        size_t updates_per_block{1000};
+        bool alternate_slow_fast_writer{false};
+        bool use_anonymous_inode{true};
+    };
+
+    template <FillDBWithChunksConfig Config, class Base>
+    struct FillDBWithChunks : public Base
+    {
+        struct state_t
+        {
+            KINET_ASYNC_NAMESPACE::storage_pool pool{[] {
+                KINET_ASYNC_NAMESPACE::storage_pool::creation_flags flags;
+                auto const bitpos =
+                    std::countr_zero(KINET_ASYNC_NAMESPACE::AsyncIO::
+                                         KINET_IO_BUFFERS_WRITE_SIZE);
+                flags.chunk_capacity = bitpos;
+                if constexpr (Config.use_anonymous_inode) {
+                    return KINET_ASYNC_NAMESPACE::storage_pool(
+                        KINET_ASYNC_NAMESPACE::use_anonymous_inode_tag{},
+                        flags);
+                }
+                char temppath[] = "kinet_test_fixture_XXXXXX";
+                int const fd = mkstemp(temppath);
+                if (-1 == fd) {
+                    abort();
+                }
+                if (-1 == ftruncate(
+                              fd,
+                              (3 + Config.chunks_max) *
+                                      KINET_ASYNC_NAMESPACE::AsyncIO::
+                                          KINET_IO_BUFFERS_WRITE_SIZE +
+                                  24576)) {
+                    abort();
+                }
+                ::close(fd);
+                std::filesystem::path temppath2(temppath);
+                return KINET_ASYNC_NAMESPACE::storage_pool(
+                    {&temppath2, 1},
+                    KINET_ASYNC_NAMESPACE::storage_pool::mode::create_if_needed,
+                    flags);
+            }()};
+            kinet::io::Ring ring1{kinet::io::RingConfig{2}};
+            kinet::io::Ring ring2{kinet::io::RingConfig{4}};
+            kinet::io::Buffers rwbuf{
+                kinet::io::make_buffers_for_segregated_read_write(
+                    ring1, ring2, 2, 4,
+                    KINET_ASYNC_NAMESPACE::AsyncIO::KINET_IO_BUFFERS_READ_SIZE,
+                    KINET_ASYNC_NAMESPACE::AsyncIO::
+                        KINET_IO_BUFFERS_WRITE_SIZE)};
+            KINET_ASYNC_NAMESPACE::AsyncIO io{pool, rwbuf};
+            MerkleCompute comp;
+            Node::SharedPtr root;
+            StateMachineAlwaysMerkle sm;
+            UpdateAux aux{
+                io, Config.history_len}; // trie section starts from account
+            kinet::small_prng rand;
+            std::vector<std::pair<kinet::byte_string, size_t>> keys;
+            uint64_t version{0};
+
+            state_t()
+            {
+                aux.alternate_slow_fast_node_writer_unit_testing_only(
+                    Config.alternate_slow_fast_writer);
+                ensure_total_chunks(Config.chunks_to_fill);
+                std::cout << "After suite set up before testing:";
+                print(std::cout);
+            }
+
+            ~state_t()
+            {
+                for (auto const &device : pool.devices()) {
+                    auto const path = device.current_path();
+                    if (std::filesystem::exists(path)) {
+                        std::filesystem::remove(path);
+                    }
+                }
+            }
+
+            std::ostream &print(std::ostream &s)
+            {
+                auto const v = pool.devices().front().capacity();
+                std::cout << "\n   Storage pool capacity = " << v.first
+                          << " consumed = " << v.second
+                          << " chunks = " << pool.chunks(pool.seq);
+                auto const diff =
+                    (int64_t(aux.metadata_ctx().get_lower_bound_free_space()) -
+                     int64_t(v.first - v.second));
+                std::cout << "\n   DB thinks there is a lower bound of "
+                          << aux.metadata_ctx().get_lower_bound_free_space()
+                          << " bytes free whereas the syscall thinks there is "
+                          << (v.first - v.second)
+                          << " bytes free, which is a difference of " << diff
+                          << ".\n";
+                std::cout << "   Fast list:";
+                for (auto const *ci =
+                         aux.metadata_ctx().main()->fast_list_begin();
+                     ci != nullptr;
+                     ci = ci->next(aux.metadata_ctx().main())) {
+                    auto const idx = ci->index(aux.metadata_ctx().main());
+                    auto const &chunk = pool.chunk(pool.seq, idx);
+                    std::cout << "\n      Chunk " << idx
+                              << " has capacity = " << chunk.capacity()
+                              << " consumed = " << chunk.size();
+                }
+                std::cout << "\n\n   Slow list:";
+                for (auto const *ci =
+                         aux.metadata_ctx().main()->slow_list_begin();
+                     ci != nullptr;
+                     ci = ci->next(aux.metadata_ctx().main())) {
+                    auto const idx = ci->index(aux.metadata_ctx().main());
+                    auto const chunk = pool.chunk(pool.seq, idx);
+                    std::cout << "\n      Chunk " << idx
+                              << " has capacity = " << chunk.capacity()
+                              << " consumed = " << chunk.size();
+                }
+                std::cout << "\n\n   Free list: "
+                          << aux.metadata_ctx().main()->capacity_in_free_list
+                          << " bytes.";
+                auto const ro = aux.metadata_ctx().root_offsets();
+                auto const most_recent_offset = ro[ro.max_version()];
+                std::cout << "\n\n   DB version history is "
+                          << aux.metadata_ctx().db_history_min_valid_version()
+                          << " - "
+                          << aux.metadata_ctx().db_history_max_version()
+                          << ". Most recent DB history is id "
+                          << most_recent_offset.id << " offset "
+                          << most_recent_offset.offset;
+                std::cout << std::endl;
+                return s;
+            }
+
+            void ensure_total_chunks(size_t const chunks)
+            {
+                std::vector<Update> updates;
+                updates.reserve(Config.updates_per_block);
+                for (;;) {
+                    UpdateList update_ls;
+                    updates.clear();
+                    for (size_t n = 0; n < Config.updates_per_block; n++) {
+                        {
+                            kinet::byte_string key(
+                                0x1234567812345678123456781234567812345678123456781234567812345678_bytes);
+                            for (size_t n = 0; n < key.size(); n += 4) {
+                                *(uint32_t *)(key.data() + n) = rand();
+                            }
+                            keys.emplace_back(
+                                std::move(key),
+                                aux.metadata_ctx().get_latest_root_offset().id);
+                        }
+                        updates.push_back(make_update(
+                            keys.back().first, keys.back().first, false));
+                        update_ls.push_front(updates.back());
+                    }
+                    root = aux.do_update(
+                        std::move(root),
+                        sm,
+                        std::move(update_ls),
+                        version++,
+                        /*compaction=*/true,
+                        /*can_write_to_fast=*/true,
+                        /*write_root=*/true,
+                        timeline_id::primary);
+                    size_t count = 0;
+                    for (auto const *ci =
+                             aux.metadata_ctx().main()->fast_list_begin();
+                         ci != nullptr;
+                         count++, ci = ci->next(aux.metadata_ctx().main())) {
+                    }
+                    if (count >= chunks) {
+                        break;
+                    }
+                }
+            }
+
+            std::vector<
+                std::pair<uint32_t, KINET_MPT_NAMESPACE::detail::unsigned_20>>
+            fast_list_ids() const
+            {
+                std::vector<std::pair<
+                    uint32_t,
+                    KINET_MPT_NAMESPACE::detail::unsigned_20>>
+                    ret;
+                ret.reserve(4);
+                for (auto const *ci =
+                         aux.metadata_ctx().main()->fast_list_begin();
+                     ci != nullptr;
+                     ci = ci->next(aux.metadata_ctx().main())) {
+                    ret.emplace_back(
+                        ci->index(aux.metadata_ctx().main()),
+                        ci->insertion_count());
+                }
+                return ret;
+            }
+
+            std::vector<
+                std::pair<uint32_t, KINET_MPT_NAMESPACE::detail::unsigned_20>>
+            slow_list_ids() const
+            {
+                std::vector<std::pair<
+                    uint32_t,
+                    KINET_MPT_NAMESPACE::detail::unsigned_20>>
+                    ret;
+                ret.reserve(4);
+                for (auto const *ci =
+                         aux.metadata_ctx().main()->slow_list_begin();
+                     ci != nullptr;
+                     ci = ci->next(aux.metadata_ctx().main())) {
+                    ret.emplace_back(
+                        ci->index(aux.metadata_ctx().main()),
+                        ci->insertion_count());
+                }
+                return ret;
+            }
+
+            kinet::byte_string root_hash()
+            {
+                if (this->root.get()) {
+                    kinet::byte_string res(32, 0);
+                    this->sm.get_compute().compute(res.data(), *this->root);
+                    return res;
+                }
+                return empty_trie_hash;
+            }
+        };
+
+        static state_t *&state()
+        {
+            static state_t *v;
+            return v;
+        }
+
+        static void SetUpTestSuite()
+        {
+            state() = new state_t;
+        }
+
+        static void TearDownTestSuite()
+        {
+            delete state();
+        }
+    };
+}

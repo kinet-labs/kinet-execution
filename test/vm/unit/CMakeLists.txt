@@ -1,0 +1,87 @@
+# Copyright (C) 2025 Category Labs, Inc.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+enable_language(ASM)
+
+add_executable(vm-unit-tests)
+
+target_sources(vm-unit-tests PRIVATE
+    async_compile_tests.cpp
+    bin_tests.cpp
+    compiler_tests.cpp
+    evm-as_tests.cpp
+    kinet_vm_interface_tests.cpp
+    kinet_vm_memory_pool_tests.cpp
+    utils_tests.cpp
+    uint256_tests.cpp
+    uint128_tests.cpp
+    non_temporal_memory_tests.cpp
+    rc_ptr_tests.cpp
+    transactional_unordered_map_tests.cpp
+    stack_tests.cpp
+    emitter_tests.cpp
+    interpreter_tests.cpp
+    lru_weight_cache_tests.cpp
+    status_code_tests.cpp
+    test_params.cpp
+    runtime/fixture.cpp
+    runtime/fixture.S
+    runtime/transmute_tests.cpp
+    runtime/math_tests.cpp
+    runtime/memory_tests.cpp
+    runtime/keccak_tests.cpp
+    runtime/environment_tests.cpp
+    runtime/storage_tests.cpp
+    runtime/call_tests.cpp
+    runtime/data_tests.cpp
+    runtime/create_tests.cpp
+    main.cpp
+)
+
+if(KINET_COMPILER_TESTING)
+    target_sources(vm-unit-tests PRIVATE
+        evm_fixture.hpp
+        evm_tests.cpp
+    )
+endif()
+
+if(KINET_COMPILER_COVERAGE)
+    target_compile_options(vm-unit-tests PRIVATE -coverage)
+    target_link_options(vm-unit-tests PRIVATE -coverage)
+endif()
+
+kinet_compile_options(vm-unit-tests)
+target_link_libraries(vm-unit-tests
+    PRIVATE kinet-vm::kinet-vm-test-utils
+    PRIVATE kinet-vm::kinet-vm-fuzzing
+    PRIVATE kinet-vm::kinet-vm-interpreter
+    PRIVATE kinet-vm::kinet-vm-utils
+    PRIVATE GTest::gtest
+    PRIVATE evmc::mocked_host
+    PRIVATE kinet_execution
+    PRIVATE kinet_core
+    PRIVATE quill::quill
+)
+
+if(KINET_COMPILER_TESTING)
+    target_link_libraries(vm-unit-tests
+        PRIVATE kinetml-evm
+    )
+endif()
+
+target_include_directories(vm-unit-tests
+    PRIVATE "${TOP_CURRENT_BINARY_DIR}/test"
+    PRIVATE "${TEST_DATA_DIR}/unit/common/include"
+)

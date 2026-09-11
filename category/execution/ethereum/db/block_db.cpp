@@ -1,0 +1,157 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/assert.h>
+#include <category/core/byte_string.hpp>
+#include <category/core/config.hpp>
+#include <category/execution/ethereum/core/block.hpp>
+#include <category/execution/ethereum/core/rlp/block_rlp.hpp>
+#include <category/execution/ethereum/db/block_db.hpp>
+
+#include <brotli/decode.h>
+#include <brotli/types.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <string_view>
+
+KINET_NAMESPACE_BEGIN
+
+BlockDb::BlockDb(std::filesystem::path const &dir)
+    : db_{dir.c_str()}
+{
+}
+
+bool BlockDb::get(uint64_t const num, Block &block) const
+{
+    auto const key = std::to_string(num);
+    auto result = db_.get(key.c_str());
+    if (!result.has_value()) {
+        auto const folder = std::to_string(num / 1000000) + 'M';
+        auto const key = folder + '/' + std::to_string(num);
+        result = db_.get(key.c_str());
+    }
+    if (!result.has_value()) {
+        return false;
+    }
+    auto const view = to_byte_string_view(result.value());
+
+    BrotliDecoderState *const state =
+        BrotliDecoderCreateInstance(nullptr, nullptr, nullptr);
+    KINET_ASSERT(state != nullptr);
+
+    constexpr size_t INC_SIZE = 1ul << 20;
+
+    uint8_t const *next_in = view.data();
+    size_t available_in = view.size();
+
+    byte_string out{};
+    size_t available_out = INC_SIZE;
+    out.resize_and_overwrite(
+        available_out, [](auto *, size_t const count) { return count; });
+    size_t total_out = 0;
+
+    while (true) {
+        uint8_t *next_out = out.data() + total_out;
+        auto const result = BrotliDecoderDecompressStream(
+            state,
+            &available_in,
+            &next_in,
+            &available_out,
+            &next_out,
+            &total_out);
+
+        KINET_ASSERT(
+            (result != BROTLI_DECODER_RESULT_ERROR) &&
+            (result != BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT));
+
+        if (result == BROTLI_DECODER_RESULT_SUCCESS) {
+            break;
+        }
+
+        if (result == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
+            out.resize_and_overwrite(
+                out.size() + INC_SIZE,
+                [](auto *, size_t const count) { return count; });
+            available_out += INC_SIZE;
+        }
+    }
+    out.resize(total_out);
+
+    BrotliDecoderDestroyInstance(state);
+    byte_string_view out_view{out};
+    auto const decoded_block = rlp::decode_block(out_view);
+    KINET_ASSERT(!decoded_block.has_error());
+    KINET_ASSERT(out_view.size() == 0);
+    block = decoded_block.value();
+    return true;
+}
+
+RlpBlockDb::RlpBlockDb(
+    std::filesystem::path const &dir, std::filesystem::path const &rlp_path)
+    : BlockDb{dir}
+{
+    import_rlp(rlp_path);
+}
+
+void RlpBlockDb::import_rlp(std::filesystem::path const &rlp_path)
+{
+    std::ifstream file(rlp_path, std::ios::binary);
+    KINET_ASSERT_PRINTF(
+        file.is_open(), "Failed to open RLP file: %s", rlp_path.c_str());
+    std::vector<uint8_t> data(
+        (std::istreambuf_iterator<char>(file)),
+        std::istreambuf_iterator<char>());
+
+    byte_string_view view{data.data(), data.size()};
+    while (!view.empty()) {
+        auto result = rlp::decode_block(view);
+        KINET_ASSERT_PRINTF(
+            !result.has_error(),
+            "Failed to decode RLP block at offset %zu in %s",
+            data.size() - view.size(),
+            rlp_path.c_str());
+        rlp_blocks_.emplace_back(std::move(result.value()));
+    }
+}
+
+bool RlpBlockDb::get(uint64_t const num, Block &block) const
+{
+    if (!rlp_blocks_.empty()) {
+        auto const first_block_num = rlp_blocks_.front().header.number;
+
+        if (num >= first_block_num) {
+            uint64_t const idx = num - first_block_num;
+
+            if (idx < rlp_blocks_.size()) {
+                KINET_ASSERT_PRINTF(
+                    rlp_blocks_[idx].header.number == num,
+                    "RLP block number mismatch: expected %lu, got %lu "
+                    "(non-contiguous blocks?)",
+                    num,
+                    rlp_blocks_[idx].header.number);
+                block = rlp_blocks_[idx];
+                return true;
+            }
+        }
+    }
+
+    return BlockDb::get(num, block);
+}
+
+KINET_NAMESPACE_END

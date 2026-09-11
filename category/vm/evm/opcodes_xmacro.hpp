@@ -1,0 +1,284 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#ifdef KINET_COMPILER_ON_EVM_OPCODE
+static_assert(
+    false, "KINET_COMPILER_ON_EVM_OPCODE macro predefined when including EVM "
+           "opcode xmacro");
+#endif
+
+#ifdef KINET_COMPILER_EVM_ALL_OPCODES
+static_assert(false, "KINET_COMPILER_EVM_ALL_OPCODES macro already defined");
+#endif
+
+#define KINET_COMPILER_EVM_ALL_OPCODES                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x00)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x01)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x02)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x03)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x04)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x05)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x06)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x07)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x08)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x09)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x0A)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x0B)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x0C)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x0D)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x0E)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x0F)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x10)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x11)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x12)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x13)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x14)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x15)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x16)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x17)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x18)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x19)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x1A)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x1B)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x1C)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x1D)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x1E)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x1F)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x20)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x21)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x22)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x23)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x24)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x25)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x26)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x27)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x28)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x29)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x2A)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x2B)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x2C)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x2D)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x2E)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x2F)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x30)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x31)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x32)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x33)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x34)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x35)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x36)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x37)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x38)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x39)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x3A)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x3B)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x3C)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x3D)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x3E)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x3F)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x40)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x41)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x42)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x43)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x44)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x45)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x46)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x47)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x48)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x49)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x4A)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x4B)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x4C)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x4D)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x4E)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x4F)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x50)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x51)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x52)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x53)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x54)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x55)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x56)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x57)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x58)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x59)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x5A)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x5B)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x5C)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x5D)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x5E)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x5F)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x60)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x61)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x62)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x63)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x64)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x65)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x66)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x67)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x68)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x69)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x6A)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x6B)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x6C)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x6D)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x6E)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x6F)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x70)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x71)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x72)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x73)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x74)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x75)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x76)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x77)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x78)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x79)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x7A)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x7B)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x7C)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x7D)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x7E)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x7F)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x80)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x81)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x82)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x83)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x84)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x85)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x86)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x87)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x88)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x89)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x8A)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x8B)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x8C)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x8D)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x8E)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x8F)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x90)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x91)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x92)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x93)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x94)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x95)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x96)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x97)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x98)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x99)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x9A)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x9B)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x9C)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x9D)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x9E)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0x9F)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xA0)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xA1)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xA2)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xA3)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xA4)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xA5)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xA6)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xA7)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xA8)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xA9)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xAA)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xAB)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xAC)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xAD)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xAE)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xAF)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xB0)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xB1)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xB2)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xB3)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xB4)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xB5)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xB6)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xB7)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xB8)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xB9)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xBA)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xBB)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xBC)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xBD)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xBE)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xBF)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xC0)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xC1)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xC2)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xC3)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xC4)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xC5)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xC6)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xC7)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xC8)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xC9)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xCA)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xCB)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xCC)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xCD)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xCE)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xCF)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xD0)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xD1)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xD2)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xD3)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xD4)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xD5)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xD6)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xD7)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xD8)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xD9)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xDA)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xDB)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xDC)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xDD)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xDE)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xDF)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xE0)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xE1)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xE2)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xE3)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xE4)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xE5)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xE6)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xE7)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xE8)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xE9)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xEA)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xEB)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xEC)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xED)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xEE)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xEF)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xF0)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xF1)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xF2)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xF3)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xF4)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xF5)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xF6)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xF7)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xF8)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xF9)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xFA)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xFB)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xFC)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xFD)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xFE)                                         \
+    KINET_COMPILER_ON_EVM_OPCODE(0xFF)

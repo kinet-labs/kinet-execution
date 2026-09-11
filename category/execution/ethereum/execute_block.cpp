@@ -1,0 +1,356 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/address.hpp>
+#include <category/core/assert.h>
+#include <category/core/bytes.hpp>
+#include <category/core/config.hpp>
+#include <category/core/fiber/fiber_group.hpp>
+#include <category/core/fiber/priority_pool.hpp>
+#include <category/core/int.hpp>
+#include <category/core/likely.h>
+#include <category/core/kinet_exception.hpp>
+#include <category/core/result.hpp>
+#include <category/execution/ethereum/block_hash_buffer.hpp>
+#include <category/execution/ethereum/block_reward.hpp>
+#include <category/execution/ethereum/chain/chain.hpp>
+#include <category/execution/ethereum/core/block.hpp>
+#include <category/execution/ethereum/core/fmt/transaction_fmt.hpp>
+#include <category/execution/ethereum/core/receipt.hpp>
+#include <category/execution/ethereum/core/transaction.hpp>
+#include <category/execution/ethereum/core/units.hpp>
+#include <category/execution/ethereum/core/withdrawal.hpp>
+#include <category/execution/ethereum/dispatch_transaction.hpp>
+#include <category/execution/ethereum/event/exec_event_ctypes.h>
+#include <category/execution/ethereum/event/exec_event_recorder.hpp>
+#include <category/execution/ethereum/event/record_txn_events.hpp>
+#include <category/execution/ethereum/execute_block.hpp>
+#include <category/execution/ethereum/execute_block_header.hpp>
+#include <category/execution/ethereum/execute_transaction.hpp>
+#include <category/execution/ethereum/metrics/block_metrics.hpp>
+#include <category/execution/ethereum/process_requests.hpp>
+#include <category/execution/ethereum/state2/block_state.hpp>
+#include <category/execution/ethereum/state3/state.hpp>
+#include <category/execution/ethereum/trace/call_tracer.hpp>
+#include <category/execution/ethereum/trace/event_trace.hpp>
+#include <category/execution/ethereum/trace/state_tracer.hpp>
+#include <category/execution/ethereum/validate_block.hpp>
+#include <category/execution/kinet/staking/priority_fee.hpp>
+#include <category/vm/evm/explicit_traits.hpp>
+#include <category/vm/evm/traits.hpp>
+
+#include <boost/fiber/future/promise.hpp>
+#include <boost/outcome/try.hpp>
+#include <evmc/evmc.h>
+#include <evmc/evmc.hpp>
+
+#include <quill/std/Optional.h>
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <memory>
+#include <optional>
+#include <span>
+#include <utility>
+#include <vector>
+
+KINET_ANONYMOUS_NAMESPACE_BEGIN
+
+using namespace kinet::literals;
+
+// EIP-4895
+void process_withdrawal(
+    State &state, std::optional<std::vector<Withdrawal>> const &withdrawals)
+{
+    if (withdrawals.has_value()) {
+        for (auto const &withdrawal : withdrawals.value()) {
+            state.add_to_balance(
+                withdrawal.recipient, uint256_t{withdrawal.amount} * GWEI);
+        }
+    }
+}
+
+KINET_ANONYMOUS_NAMESPACE_END
+
+KINET_NAMESPACE_BEGIN
+
+std::vector<std::optional<Address>> recover_senders(
+    std::span<Transaction const> const transactions,
+    fiber::PriorityPool &priority_pool)
+{
+    std::vector<std::optional<Address>> senders{transactions.size()};
+
+    std::shared_ptr<boost::fibers::promise<void>[]> promises{
+        new boost::fibers::promise<void>[transactions.size()]};
+
+    for (unsigned i = 0; i < transactions.size(); ++i) {
+        priority_pool.submit(
+            i,
+            [i = i,
+             promises = promises,
+             &sender = senders[i],
+             &transaction = transactions[i]] {
+                sender = recover_sender(transaction);
+                promises[i].set_value();
+            });
+    }
+
+    for (unsigned i = 0; i < transactions.size(); ++i) {
+        promises[i].get_future().wait();
+    }
+
+    return senders;
+}
+
+std::vector<std::vector<std::optional<Address>>> recover_authorities(
+    std::span<Transaction const> const transactions,
+    fiber::PriorityPool &priority_pool)
+{
+    std::vector<std::vector<std::optional<Address>>> authorities{
+        transactions.size()};
+    std::vector<std::shared_ptr<boost::fibers::promise<void>[]>> promises{
+        transactions.size()};
+
+    for (auto i = 0u; i < transactions.size(); ++i) {
+        authorities[i] = std::vector<std::optional<Address>>{
+            transactions[i].authorization_list.size()};
+        promises[i] = std::shared_ptr<boost::fibers::promise<void>[]>{
+            new boost::fibers::promise<void>[authorities[i].size()]};
+
+        for (auto j = 0u; j < authorities[i].size(); ++j) {
+            priority_pool.submit(
+                i,
+                [j = j,
+                 auth_promises = promises[i],
+                 &auth = authorities[i][j],
+                 &auth_entry = transactions[i].authorization_list[j]]() {
+                    auth = recover_authority(auth_entry);
+                    auth_promises[j].set_value();
+                });
+        }
+    }
+
+    for (auto i = 0u; i < transactions.size(); ++i) {
+        for (auto j = 0u; j < transactions[i].authorization_list.size(); ++j) {
+            promises[i][j].get_future().wait();
+        }
+    }
+
+    return authorities;
+}
+
+template <Traits traits>
+Result<std::vector<Receipt>> execute_block_transactions(
+    Chain const &chain, BlockHeader const &header,
+    std::span<Transaction const> const transactions,
+    std::span<Address const> const senders,
+    std::span<std::vector<std::optional<Address>> const> const authorities,
+    BlockState &block_state, BlockHashBuffer const &block_hash_buffer,
+    fiber::FiberGroup &priority_pool, BlockMetrics &block_metrics,
+    std::span<std::unique_ptr<CallTracerBase>> const call_tracers,
+    std::span<std::unique_ptr<trace::StateTracer>> const state_tracers,
+    ChainContext<traits> const &chain_ctx,
+    ExecutionEventRecorder *const exec_recorder, bool const trace_transfers)
+{
+    KINET_ASSERT(senders.size() == transactions.size());
+    KINET_ASSERT(senders.size() == call_tracers.size());
+    KINET_ASSERT(senders.size() == state_tracers.size());
+
+    std::shared_ptr<boost::fibers::promise<void>[]> promises{
+        new boost::fibers::promise<void>[transactions.size() + 1]};
+    promises[0].set_value();
+
+    std::shared_ptr<std::optional<Result<Receipt>>[]> const results{
+        new std::optional<Result<Receipt>>[transactions.size()]};
+    size_t const txn_count = transactions.size();
+
+    auto const tx_exec_begin = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < txn_count; ++i) {
+        priority_pool.submit(
+            i,
+            [&chain = chain,
+             i = i,
+             results = results,
+             promises = promises,
+             &transaction = transactions[i],
+             &sender = senders[i],
+             &authorities = authorities[i],
+             &header = header,
+             &block_hash_buffer = block_hash_buffer,
+             &block_state,
+             &block_metrics,
+             &call_tracer = *call_tracers[i],
+             &state_tracer = *state_tracers[i],
+             &chain_ctx = chain_ctx,
+             exec_recorder = exec_recorder,
+             trace_transfers = trace_transfers] {
+                record_txn_marker_event(
+                    exec_recorder, KINET_EXEC_TXN_PERF_EVM_ENTER, i);
+                try {
+                    results[i] = dispatch_transaction<traits>(
+                        chain,
+                        i,
+                        transaction,
+                        sender,
+                        authorities,
+                        header,
+                        block_hash_buffer,
+                        block_state,
+                        block_metrics,
+                        promises[i],
+                        call_tracer,
+                        state_tracer,
+                        chain_ctx,
+                        exec_recorder,
+                        trace_transfers);
+                    if (results[i]->has_error()) {
+                        record_txn_error_event(
+                            exec_recorder, i, results[i]->error());
+                    }
+                    record_txn_marker_event(
+                        exec_recorder, KINET_EXEC_TXN_PERF_EVM_EXIT, i);
+                    // Call promise.set_value/set_exception the last thing,
+                    // because this signals that the transaction is finished.
+                    promises[i + 1].set_value();
+                }
+                catch (...) {
+                    promises[i + 1].set_exception(std::current_exception());
+                }
+            });
+    }
+
+    auto const last = static_cast<ptrdiff_t>(transactions.size());
+    promises[last].get_future().get();
+    block_metrics.tx_exec_time =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - tx_exec_begin);
+
+    std::vector<Receipt> retvals;
+    for (unsigned i = 0; i < transactions.size(); ++i) {
+        KINET_ASSERT_THROW(
+            results[i].has_value(), "missing transaction result");
+        if (KINET_UNLIKELY(results[i].value().has_error())) {
+            LOG_ERROR(
+                "tx {} {} validation failed: {}",
+                i,
+                transactions[i],
+                results[i].value().assume_error().message().c_str());
+        }
+        BOOST_OUTCOME_TRY(auto retval, std::move(results[i].value()));
+        retvals.push_back(std::move(retval));
+    }
+
+    // YP eq. 22
+    uint64_t cumulative_gas_used = 0;
+    for (auto &receipt : retvals) {
+        cumulative_gas_used += receipt.gas_used;
+        receipt.gas_used = cumulative_gas_used;
+    }
+
+    return retvals;
+}
+
+template <Traits traits>
+Result<std::vector<Receipt>> execute_block(
+    Chain const &chain, Block const &block,
+    std::span<Address const> const senders,
+    std::span<std::vector<std::optional<Address>> const> const authorities,
+    BlockState &block_state, BlockHashBuffer const &block_hash_buffer,
+    fiber::FiberGroup &priority_pool, BlockMetrics &block_metrics,
+    std::span<std::unique_ptr<CallTracerBase>> const call_tracers,
+    std::span<std::unique_ptr<trace::StateTracer>> const state_tracers,
+    trace::StateTracer &system_call_state_tracer,
+    ChainContext<traits> const &chain_ctx,
+    ExecutionEventRecorder *const exec_recorder, bool const trace_transfers)
+{
+    static_assert(traits::evm_rev() >= KINET_ETH_SPURIOUS_DRAGON);
+
+    TRACE_BLOCK_EVENT(StartBlock);
+
+    KINET_ASSERT(senders.size() == block.transactions.size());
+    KINET_ASSERT(senders.size() == call_tracers.size());
+    KINET_ASSERT(senders.size() == state_tracers.size());
+
+    execute_block_header<traits>(block_state, block.header, exec_recorder);
+
+    BOOST_OUTCOME_TRY(
+        auto const retvals,
+        execute_block_transactions<traits>(
+            chain,
+            block.header,
+            block.transactions,
+            senders,
+            authorities,
+            block_state,
+            block_hash_buffer,
+            priority_pool,
+            block_metrics,
+            call_tracers,
+            state_tracers,
+            chain_ctx,
+            exec_recorder,
+            trace_transfers));
+
+    State state{
+        block_state, Incarnation{block.header.number, Incarnation::LAST_TX}};
+
+    if constexpr (traits::evm_rev() >= KINET_ETH_SHANGHAI) {
+        process_withdrawal(state, block.withdrawals);
+    }
+
+    if constexpr (traits::eip_7685_active()) {
+        KINET_ASSERT_THROW(
+            block.header.requests_hash.has_value(),
+            "block header must have requests hash when EIP-7685 is active");
+        BOOST_OUTCOME_TRY(
+            auto const computed_requests_hash,
+            process_requests<traits>(
+                chain,
+                state,
+                block_hash_buffer,
+                block.header,
+                system_call_state_tracer,
+                chain_ctx,
+                retvals));
+        if (KINET_UNLIKELY(
+                computed_requests_hash != block.header.requests_hash.value())) {
+            return BlockError::InvalidRequestsHash;
+        }
+    }
+
+    apply_block_reward<traits>(state, block);
+
+    // TODO: move to execute_kinet_block
+    if constexpr (traits::mip_11_active()) {
+        staking::distribute_priority_fees(state);
+    }
+
+    state.destruct_touched_dead();
+
+    KINET_ASSERT(block_state.can_merge(state));
+    block_state.merge(state);
+    record_account_access_events(
+        exec_recorder, KINET_ACCT_ACCESS_BLOCK_EPILOGUE, state);
+
+    return retvals;
+}
+
+// Explicit instantiations using EXPLICIT_TRAITS macro
+EXPLICIT_TRAITS(execute_block_transactions);
+EXPLICIT_TRAITS(execute_block);
+
+KINET_NAMESPACE_END

@@ -1,0 +1,668 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/hex.hpp>
+#include <category/core/int.hpp>
+#include <category/core/runtime/uint256.hpp>
+#include <category/execution/ethereum/block_hash_buffer.hpp>
+#include <category/execution/ethereum/chain/chain.hpp>
+#include <category/execution/ethereum/chain/ethereum_mainnet.hpp>
+#include <category/execution/ethereum/core/block.hpp>
+#include <category/execution/ethereum/core/transaction.hpp>
+#include <category/execution/ethereum/core/units.hpp>
+#include <category/execution/ethereum/db/trie_db.hpp>
+#include <category/execution/ethereum/db/util.hpp>
+#include <category/execution/ethereum/execute_transaction.hpp>
+#include <category/execution/ethereum/metrics/block_metrics.hpp>
+#include <category/execution/ethereum/state2/block_state.hpp>
+#include <category/execution/ethereum/state3/state.hpp>
+#include <category/execution/ethereum/trace/call_tracer.hpp>
+#include <category/execution/ethereum/trace/state_tracer.hpp>
+#include <category/execution/ethereum/tx_context.hpp>
+#include <category/execution/ethereum/validate_transaction.hpp>
+#include <category/execution/kinet/chain/kinet_devnet.hpp>
+#include <category/execution/kinet/chain/kinet_testnet.hpp>
+#include <category/vm/evm/kinet/revision.h>
+#include <category/vm/vm.hpp>
+#include <kinet/test/traits_test.hpp>
+
+#include <evmc/evmc.h>
+#include <evmc/evmc.hpp>
+
+#include <boost/fiber/future/promise.hpp>
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <variant>
+
+using namespace kinet;
+
+using db_t = TrieDb;
+
+TYPED_TEST(TraitsTest, irrevocable_gas_and_refund_new_contract)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_HOMESTEAD);
+
+    static constexpr auto from{
+        0xf8636377b7a998b51a3cf2bd711b870b3ab0ad56_address};
+    static constexpr auto bene{
+        0x5353535353535353535353535353535353535353_address};
+
+    static constexpr auto initial_balance = 56'000'000'000'000'000;
+    static constexpr auto actual_gas_cost = 53'000;
+    static constexpr auto gas_limit = actual_gas_cost + 2'000;
+    static constexpr auto max_fee_per_gas = 10;
+
+    mpt::Db db{std::make_unique<InMemoryMachine>()};
+    db_t tdb{db};
+    vm::VM vm;
+    BlockState bs{tdb, vm};
+    BlockMetrics metrics;
+
+    {
+        State state{bs, Incarnation{0, 0}};
+        state.add_to_balance(from, initial_balance);
+        state.set_nonce(from, 25);
+        bs.merge(state);
+    }
+
+    Transaction const tx{
+        .sc =
+            {
+                .signature =
+                    {
+                        .r =
+                            0x5fd883bb01a10915ebc06621b925bd6d624cb6768976b73c0d468b31f657d15b_u256,
+                        .s =
+                            0x121d855c539a23aadf6f06ac21165db1ad5efd261842e82a719c9863ca4ac04c_u256,
+                    },
+            },
+        .nonce = 25,
+        .max_fee_per_gas = max_fee_per_gas,
+        .gas_limit = gas_limit,
+    };
+
+    BlockHeader const header{
+        .number = constants::EARLIEST_SUPPORTED_ETH_BLOCK_NUMBER,
+        .beneficiary = bene};
+    BlockHashBufferFinalized const block_hash_buffer;
+
+    boost::fibers::promise<void> prev{};
+    prev.set_value();
+
+    NoopCallTracer noop_call_tracer;
+    trace::StateTracer noop_state_tracer = std::monostate{};
+    auto const chain_ctx =
+        ChainContext<typename TestFixture::Trait>::debug_empty();
+
+    auto const receipt = ExecuteTransaction<typename TestFixture::Trait>(
+        EthereumMainnet{},
+        0,
+        tx,
+        from,
+        {},
+        header,
+        block_hash_buffer,
+        bs,
+        metrics,
+        prev,
+        noop_call_tracer,
+        noop_state_tracer,
+        chain_ctx,
+        /*exec_recorder=*/nullptr)();
+
+    ASSERT_TRUE(!receipt.has_error());
+
+    EXPECT_EQ(receipt.value().status, 1u);
+    {
+        State state{bs, Incarnation{0, 0}};
+        uint256_t const final_balance_uint256 = state.get_balance(from);
+        ASSERT_TRUE(
+            final_balance_uint256 < std::numeric_limits<uint64_t>::max());
+        auto const final_balance = static_cast<uint64_t>(final_balance_uint256);
+        if constexpr (TestFixture::is_kinet_trait()) {
+            if constexpr (TestFixture::Trait::kinet_rev() == KINET_ZERO) {
+                EXPECT_EQ(
+                    final_balance,
+
+                    initial_balance - actual_gas_cost * max_fee_per_gas);
+            }
+            else {
+                EXPECT_EQ(
+                    final_balance,
+                    initial_balance - gas_limit * max_fee_per_gas);
+            }
+        }
+        else {
+            EXPECT_EQ(
+                final_balance,
+                initial_balance - actual_gas_cost * max_fee_per_gas);
+        }
+
+        EXPECT_EQ(state.get_nonce(from), 26); // EVMC will inc for creation
+    }
+    // check if miner gets the right reward
+    if constexpr (TestFixture::is_kinet_trait()) {
+        if constexpr (TestFixture::Trait::kinet_rev() == KINET_ZERO) {
+            EXPECT_EQ(receipt.value().gas_used, actual_gas_cost);
+        }
+        else {
+            EXPECT_EQ(receipt.value().gas_used, gas_limit);
+        }
+    }
+    else {
+        EXPECT_EQ(receipt.value().gas_used, actual_gas_cost);
+    }
+}
+
+TYPED_TEST(TraitsTest, TopLevelCreate)
+{
+
+    static constexpr auto from{
+        0xf8636377b7a998b51a3cf2bd711b870b3ab0ad56_address};
+    static constexpr auto bene{
+        0x5353535353535353535353535353535353535353_address};
+
+    mpt::Db db{std::make_unique<InMemoryMachine>()};
+    db_t tdb{db};
+    vm::VM vm;
+    BlockState bs{tdb, vm};
+    BlockMetrics metrics;
+
+    {
+        State state{bs, Incarnation{0, 0}};
+        state.add_to_balance(from, 20_ether);
+        state.set_nonce(from, 25);
+        bs.merge(state);
+    }
+
+    auto const data = byte_string(154'776, '\x60');
+
+    Transaction const tx{
+        .sc =
+            {
+                .signature =
+                    {
+                        .r =
+                            0x5fd883bb01a10915ebc06621b925bd6d624cb6768976b73c0d468b31f657d15b_u256,
+                        .s =
+                            0x121d855c539a23aadf6f06ac21165db1ad5efd261842e82a719c9863ca4ac04c_u256,
+                    },
+            },
+        .nonce = 25,
+        .max_fee_per_gas = 100'000'000'000,
+        .gas_limit = 68'491'176,
+        .value = 0,
+        .to = std::nullopt,
+        .data = data,
+    };
+
+    BlockHeader const header{.beneficiary = bene};
+    BlockHashBufferFinalized const block_hash_buffer;
+
+    NoopCallTracer noop_call_tracer;
+    trace::StateTracer noop_state_tracer = std::monostate{};
+
+    boost::fibers::promise<void> prev{};
+    prev.set_value();
+
+    auto const chain_ctx =
+        ChainContext<typename TestFixture::Trait>::debug_empty();
+
+    auto const receipt = ExecuteTransaction<typename TestFixture::Trait>(
+        KinetTestnet{},
+        0,
+        tx,
+        from,
+        {},
+        header,
+        block_hash_buffer,
+        bs,
+        metrics,
+        prev,
+        noop_call_tracer,
+        noop_state_tracer,
+        chain_ctx,
+        /*exec_recorder=*/nullptr)();
+
+    if constexpr (TestFixture::is_kinet_trait()) {
+        if constexpr (TestFixture::Trait::kinet_rev() >= KINET_TWO) {
+            ASSERT_TRUE(receipt.has_value());
+        }
+        else {
+            ASSERT_TRUE(receipt.has_error());
+        }
+    }
+    else {
+        if constexpr (TestFixture::Trait::evm_rev() >= KINET_ETH_SHANGHAI) {
+            ASSERT_TRUE(receipt.has_error());
+        }
+        else {
+            ASSERT_TRUE(receipt.has_value());
+        }
+    }
+}
+
+TYPED_TEST(TraitsTest, refunds_delete)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_BERLIN);
+
+    static constexpr auto from{
+        0xf8636377b7a998b51a3cf2bd711b870b3ab0ad56_address};
+    static constexpr auto contract{
+        0x00000000000000000000000000000000cccccccc_address};
+    static constexpr auto bene{
+        0x5353535353535353535353535353535353535353_address};
+
+    static constexpr auto initial_balance = 56'000'000'000'000'000;
+    static constexpr auto max_fee_per_gas = 100'000'000'000;
+    static constexpr auto gas_limit_tx1 = 200'000;
+    static constexpr auto gas_limit_tx2 = 50'000;
+
+    static constexpr auto gas_charged_tx1 = [] {
+        if constexpr (TestFixture::is_kinet_trait()) {
+            if constexpr (TestFixture::Trait::kinet_rev() > KINET_ZERO) {
+                // Since KINET_ONE full gas_limit is charged
+                return gas_limit_tx1;
+            }
+        }
+
+        // Gas increased due to storage repricing in Berlin
+        return 43'140;
+    }();
+
+    static constexpr auto gas_charged_tx2 = [] {
+        if constexpr (TestFixture::is_kinet_trait()) {
+            if constexpr (TestFixture::Trait::kinet_rev() > KINET_ZERO) {
+                // Since KINET_ONE full gas_limit is charged
+                return gas_limit_tx2;
+            }
+        }
+        return 26'025;
+    }();
+
+    // X -> X -> 0
+    static constexpr auto storage_refund_tx2_evm_uncapped = [] {
+        if constexpr (TestFixture::Trait::evm_rev() >= KINET_ETH_LONDON) {
+            return 4'800;
+        }
+        else {
+            return 15'000;
+        }
+    }();
+    static constexpr auto storage_refund_tx2 = [=] {
+        if constexpr (TestFixture::is_kinet_trait()) {
+            if constexpr (TestFixture::Trait::kinet_rev() > KINET_ZERO) {
+                return 0;
+            }
+        }
+        if constexpr (TestFixture::Trait::evm_rev() >= KINET_ETH_LONDON) {
+            // due to EIP-3529 introduced in London revision
+            return std::min(
+                gas_charged_tx2 / 5, storage_refund_tx2_evm_uncapped);
+        }
+        else {
+            return std::min(
+                gas_charged_tx2 / 2, storage_refund_tx2_evm_uncapped);
+        }
+    }();
+
+    mpt::Db db{std::make_unique<InMemoryMachine>()};
+    db_t tdb{db};
+    vm::VM vm;
+    BlockState bs{tdb, vm};
+    BlockMetrics metrics;
+
+    // Sets s[0] = 1 if passed any data, clears s[0] if data is empty.
+    auto const contract_code =
+        from_hex("0x3615600b576001600055005b6000600055").value();
+
+    {
+        State state{bs, Incarnation{0, 0}};
+
+        state.add_to_balance(from, initial_balance);
+        state.set_nonce(from, 25);
+
+        state.create_contract(contract);
+        state.set_code(contract, contract_code);
+
+        bs.merge(state);
+    }
+
+    // 0 -> 0 -> Z
+    {
+        Transaction const set_tx{
+            .sc =
+                {
+                    .signature =
+                        {
+                            .r =
+                                0x5fd883bb01a10915ebc06621b925bd6d624cb6768976b73c0d468b31f657d15b_u256,
+                            .s =
+                                0x121d855c539a23aadf6f06ac21165db1ad5efd261842e82a719c9863ca4ac04c_u256,
+                        },
+                },
+            .nonce = 25,
+            .max_fee_per_gas = max_fee_per_gas,
+            .gas_limit = gas_limit_tx1,
+            .to = contract,
+            .data = from_hex("0x01").value(),
+        };
+
+        BlockHeader const header{.beneficiary = bene};
+        BlockHashBufferFinalized const block_hash_buffer;
+
+        boost::fibers::promise<void> prev{};
+        prev.set_value();
+
+        NoopCallTracer noop_call_tracer;
+        trace::StateTracer noop_state_tracer = std::monostate{};
+
+        auto const chain_ctx =
+            ChainContext<typename TestFixture::Trait>::debug_empty();
+
+        auto const receipt = ExecuteTransaction<typename TestFixture::Trait>(
+            KinetDevnet{},
+            0,
+            set_tx,
+            from,
+            {},
+            header,
+            block_hash_buffer,
+            bs,
+            metrics,
+            prev,
+            noop_call_tracer,
+            noop_state_tracer,
+            chain_ctx,
+            /*exec_recorder=*/nullptr)();
+
+        ASSERT_TRUE(receipt.has_value());
+        EXPECT_EQ(receipt.value().status, 1u);
+
+        {
+            State state{bs, Incarnation{0, 0}};
+            auto const final_balance_uint256 = state.get_balance(from);
+            ASSERT_TRUE(
+                final_balance_uint256 < std::numeric_limits<uint64_t>::max());
+            auto const final_balance =
+                static_cast<uint64_t>(final_balance_uint256);
+
+            EXPECT_EQ(
+                final_balance,
+                initial_balance - (gas_charged_tx1 * max_fee_per_gas));
+        }
+    }
+
+    // X -> X -> 0
+    {
+        Transaction const zero_tx{
+            .sc =
+                {
+                    .signature =
+                        {
+                            .r =
+                                0x5fd883bb01a10915ebc06621b925bd6d624cb6768976b73c0d468b31f657d15b_u256,
+                            .s =
+                                0x121d855c539a23aadf6f06ac21165db1ad5efd261842e82a719c9863ca4ac04c_u256,
+                        },
+                },
+            .nonce = 26,
+            .max_fee_per_gas = max_fee_per_gas,
+            .gas_limit = gas_limit_tx2,
+            .to = contract,
+        };
+
+        BlockHeader const header{.beneficiary = bene};
+        BlockHashBufferFinalized const block_hash_buffer;
+
+        boost::fibers::promise<void> prev{};
+        prev.set_value();
+
+        NoopCallTracer noop_call_tracer;
+        trace::StateTracer noop_state_tracer = std::monostate{};
+
+        auto const chain_ctx =
+            ChainContext<typename TestFixture::Trait>::debug_empty();
+
+        auto const receipt = ExecuteTransaction<typename TestFixture::Trait>(
+            KinetDevnet{},
+            0,
+            zero_tx,
+            from,
+            {},
+            header,
+            block_hash_buffer,
+            bs,
+            metrics,
+            prev,
+            noop_call_tracer,
+            noop_state_tracer,
+            chain_ctx,
+            /*exec_recorder=*/nullptr)();
+
+        ASSERT_TRUE(!receipt.has_error());
+        EXPECT_EQ(receipt.value().status, 1u);
+
+        {
+            State state{bs, Incarnation{0, 0}};
+            auto const final_balance_uint256 = state.get_balance(from);
+            ASSERT_TRUE(
+                final_balance_uint256 < std::numeric_limits<uint64_t>::max());
+            auto const final_balance =
+                static_cast<uint64_t>(final_balance_uint256);
+
+            EXPECT_EQ(
+                final_balance,
+                initial_balance -
+                    ((gas_charged_tx1 + gas_charged_tx2) * max_fee_per_gas) +
+                    (storage_refund_tx2 * max_fee_per_gas));
+        }
+    }
+}
+
+TYPED_TEST(TraitsTest, refunds_delete_then_set)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_BERLIN);
+
+    static constexpr auto from{
+        0xf8636377b7a998b51a3cf2bd711b870b3ab0ad56_address};
+    static constexpr auto contract{
+        0x00000000000000000000000000000000cccccccc_address};
+    static constexpr auto bene{
+        0x5353535353535353535353535353535353535353_address};
+
+    static constexpr auto initial_balance = 56'000'000'000'000'000;
+    static constexpr auto max_fee_per_gas = 100'000'000'000;
+
+    static constexpr auto slot = bytes32_t{};
+    auto const initial_value = store_be_as<bytes32_t>(uint256_t{1});
+
+    mpt::Db db{std::make_unique<InMemoryMachine>()};
+    db_t tdb{db};
+    vm::VM vm;
+    BlockState bs{tdb, vm};
+    BlockMetrics metrics;
+
+    // s[0] = 0; s[0] = 1
+    auto const contract_code = from_hex("0x60006000556001600055").value();
+
+    {
+        State state{bs, Incarnation{0, 0}};
+
+        state.add_to_balance(from, initial_balance);
+        state.set_nonce(from, 25);
+
+        state.create_contract(contract);
+        state.set_code(contract, contract_code);
+        state.set_storage(contract, slot, initial_value);
+
+        bs.merge(state);
+    }
+
+    // X -> X -> 0 then X -> 0 -> X
+    {
+        static constexpr auto gas_limit_tx =
+            50'000; // should be high ehough to cover actual gas used + low gas
+                    // SSTORE stipend for all revisions
+
+        Transaction const set_tx{
+            .sc =
+                {
+                    .signature =
+                        {
+                            .r =
+                                0x5fd883bb01a10915ebc06621b925bd6d624cb6768976b73c0d468b31f657d15b_u256,
+                            .s =
+                                0x121d855c539a23aadf6f06ac21165db1ad5efd261842e82a719c9863ca4ac04c_u256,
+                        },
+                },
+            .nonce = 25,
+            .max_fee_per_gas = max_fee_per_gas,
+            .gas_limit = gas_limit_tx,
+            .to = contract,
+        };
+
+        BlockHeader const header{.beneficiary = bene};
+        BlockHashBufferFinalized const block_hash_buffer;
+
+        boost::fibers::promise<void> prev{};
+        prev.set_value();
+
+        NoopCallTracer noop_call_tracer;
+        trace::StateTracer noop_state_tracer = std::monostate{};
+
+        auto const chain_ctx =
+            ChainContext<typename TestFixture::Trait>::debug_empty();
+
+        auto const receipt = ExecuteTransaction<typename TestFixture::Trait>(
+            KinetDevnet{},
+            0,
+            set_tx,
+            from,
+            {},
+            header,
+            block_hash_buffer,
+            bs,
+            metrics,
+            prev,
+            noop_call_tracer,
+            noop_state_tracer,
+            chain_ctx,
+            /*exec_recorder=*/nullptr)();
+
+        ASSERT_TRUE(!receipt.has_error());
+        EXPECT_EQ(receipt.value().status, 1u);
+
+        {
+            State state{bs, Incarnation{0, 0}};
+            auto const final_balance_uint256 = state.get_balance(from);
+            ASSERT_TRUE(
+                final_balance_uint256 < std::numeric_limits<uint64_t>::max());
+            auto const final_balance =
+                static_cast<uint64_t>(final_balance_uint256);
+
+            static constexpr auto gas_charged = [] {
+                if constexpr (TestFixture::is_kinet_trait()) {
+                    if constexpr (
+                        TestFixture::Trait::kinet_rev() > KINET_ZERO) {
+                        // Since KINET_ONE full gas_limit is charged
+                        return gas_limit_tx;
+                    }
+                }
+
+                return 26'112;
+            }();
+
+            static constexpr auto storage_refund_evm_uncapped = [] {
+                return 2800;
+            }();
+            static constexpr auto storage_refund = [=] {
+                if constexpr (TestFixture::is_kinet_trait()) {
+                    if constexpr (
+                        TestFixture::Trait::kinet_rev() > KINET_ZERO) {
+                        return 0;
+                    }
+                }
+                if constexpr (
+                    TestFixture::Trait::evm_rev() >= KINET_ETH_LONDON) {
+                    // due to EIP-3529 introduced in London revision
+                    return std::min(
+                        gas_charged / 5, storage_refund_evm_uncapped);
+                }
+                else {
+                    return std::min(
+                        gas_charged / 2, storage_refund_evm_uncapped);
+                    ;
+                }
+            }();
+
+            EXPECT_EQ(
+                final_balance,
+                initial_balance - (gas_charged * max_fee_per_gas) +
+                    (storage_refund * max_fee_per_gas));
+        }
+    }
+}
+
+TYPED_TEST(TraitsTest, static_validate_transaction_failure)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_SPURIOUS_DRAGON);
+    mpt::Db db{std::make_unique<InMemoryMachine>()};
+    db_t tdb{db};
+    vm::VM vm;
+    BlockState bs{tdb, vm};
+    BlockMetrics metrics;
+
+    boost::fibers::promise<void> prev{};
+    prev.set_value();
+
+    NoopCallTracer noop_call_tracer;
+    trace::StateTracer noop_state_tracer = std::monostate{};
+
+    auto const chain_ctx =
+        ChainContext<typename TestFixture::Trait>::debug_empty();
+
+    static constexpr auto from{
+        0xf8636377b7a998b51a3cf2bd711b870b3ab0ad56_address};
+
+    Transaction const tx{.sc = {.chain_id = 1 /* invalid chain id */}};
+
+    BlockHeader const header{};
+    BlockHashBufferFinalized const block_hash_buffer;
+
+    auto const receipt = ExecuteTransaction<typename TestFixture::Trait>(
+        KinetDevnet{},
+        0,
+        tx,
+        from,
+        {},
+        header,
+        block_hash_buffer,
+        bs,
+        metrics,
+        prev,
+        noop_call_tracer,
+        noop_state_tracer,
+        chain_ctx,
+        /*exec_recorder=*/nullptr)();
+
+    ASSERT_TRUE(receipt.has_error());
+
+    ASSERT_EQ(receipt.error(), TransactionError::WrongChainId);
+}

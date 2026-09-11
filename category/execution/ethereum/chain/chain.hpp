@@ -1,0 +1,68 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/core/bytes.hpp>
+#include <category/core/config.hpp>
+#include <category/core/int.hpp>
+#include <category/core/result.hpp>
+#include <category/execution/ethereum/chain/blob_schedule.hpp>
+#include <category/execution/ethereum/chain/genesis_state.hpp>
+#include <category/vm/evm/traits.hpp>
+
+#include <evmc/evmc.h>
+#include <evmc/evmc.hpp>
+
+#include <optional>
+#include <span>
+
+KINET_NAMESPACE_BEGIN
+
+class State;
+struct BlockHeader;
+struct Receipt;
+struct Transaction;
+
+struct Chain
+{
+    virtual ~Chain() = default;
+
+    virtual uint256_t get_chain_id() const = 0;
+
+    virtual kinet_eth_revision
+    get_revision(uint64_t block_number, uint64_t timestamp) const = 0;
+
+    virtual BlobSchedule get_blob_schedule(uint64_t timestamp) const = 0;
+
+    virtual GenesisState get_genesis_state() const = 0;
+};
+
+template <typename T>
+struct ChainContext;
+
+template <typename T>
+    requires is_evm_trait_v<T>
+struct ChainContext<T>
+{
+    // Returns an empty ChainContext for unit testing purposes.
+    // Not intended for production use.
+    static ChainContext<T> debug_empty()
+    {
+        return {};
+    }
+};
+
+KINET_NAMESPACE_END

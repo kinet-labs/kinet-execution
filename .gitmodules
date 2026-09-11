@@ -1,0 +1,85 @@
+[submodule "third_party/blst"]
+	path = third_party/blst
+	url = https://github.com/supranational/blst.git
+[submodule "third_party/concurrentqueue"]
+	path = third_party/concurrentqueue
+	url = https://github.com/cameron314/concurrentqueue
+[submodule "third_party/ethereum-tests"]
+	path = third_party/ethereum-tests
+	url = https://github.com/ethereum/tests
+[submodule "third_party/execution-specs"]
+	path = third_party/execution-specs
+	url = https://github.com/ethereum/execution-specs.git
+[submodule "third_party/intx"]
+	path = third_party/intx
+	url = https://github.com/chfast/intx.git
+	branch = master
+[submodule "third_party/komihash"]
+	path = third_party/komihash
+	url = https://github.com/avaneev/komihash.git
+[submodule "third_party/quill"]
+	path = third_party/quill
+	url = https://github.com/odygrd/quill.git
+[submodule "third_party/silkpre"]
+	path = third_party/silkpre
+	url = https://github.com/kinet-labs/silkpre.git
+[submodule "third_party/yellowpaper"]
+	path = third_party/yellowpaper
+	url = https://github.com/ethereum/yellowpaper.git
+[submodule "ethash"]
+	path = ethash
+	url = https://github.com/chfast/ethash.git
+[submodule "core/third_party/nanobench"]
+	path = third_party/nanobench
+	url = https://github.com/martinus/nanobench.git
+[submodule "core/third_party/nlohmann_json"]
+	path = third_party/nlohmann_json
+	url = https://github.com/nlohmann/json.git
+[submodule "core/third_party/unordered_dense"]
+	path = third_party/unordered_dense
+	url = https://github.com/martinus/unordered_dense.git
+[submodule "third_party/BLAKE3"]
+	path = third_party/BLAKE3
+	url = https://github.com/BLAKE3-team/BLAKE3.git
+[submodule "third_party/c-kzg-4844"]
+	path = third_party/c-kzg-4844
+	url = https://github.com/ethereum/c-kzg-4844.git
+[submodule "libs/vm/third_party/asmjit"]
+	path = third_party/asmjit
+	url = https://github.com/asmjit/asmjit.git
+[submodule "third_party/evmc"]
+	path = third_party/evmc
+	url = https://github.com/kinet-labs/evmc.git
+[submodule "third_party/cthash"]
+	path = third_party/cthash
+	url = https://github.com/hanickadot/cthash.git
+[submodule "third_party/immer"]
+	path = third_party/immer
+	url = https://github.com/arximboldi/immer.git
+[submodule "third_party/magic_enum"]
+	path = third_party/magic_enum
+	url = https://github.com/Neargye/magic_enum.git
+[submodule "third_party/fiber"]
+	path = third_party/fiber
+	url = https://github.com/kinet-labs/fiber.git
+[submodule "third_party/zkevm-standards"]
+	path = third_party/zkevm-standards
+	url = https://github.com/eth-act/zkevm-standards.git
+[submodule "third_party/kinet-execution-specs"]
+	path = third_party/kinet-execution-specs
+	url = https://github.com/kinet-labs/kinet-execution-specs.git
+[submodule "third_party/ethash"]
+	path = third_party/ethash
+	url = https://github.com/chfast/ethash.git
+[submodule "third_party/nanobench"]
+	path = third_party/nanobench
+	url = https://github.com/martinus/nanobench.git
+[submodule "third_party/nlohmann_json"]
+	path = third_party/nlohmann_json
+	url = https://github.com/nlohmann/json.git
+[submodule "third_party/unordered_dense"]
+	path = third_party/unordered_dense
+	url = https://github.com/martinus/unordered_dense.git
+[submodule "third_party/asmjit"]
+	path = third_party/asmjit
+	url = https://github.com/asmjit/asmjit.git

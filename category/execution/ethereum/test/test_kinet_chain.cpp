@@ -1,0 +1,845 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/bytes.hpp>
+#include <category/core/keccak.hpp>
+#include <category/execution/ethereum/chain/ethereum_mainnet.hpp>
+#include <category/execution/ethereum/chain/genesis_state.hpp>
+#include <category/execution/ethereum/chain/hive_net.hpp>
+#include <category/execution/ethereum/core/block.hpp>
+#include <category/execution/ethereum/core/rlp/block_rlp.hpp>
+#include <category/execution/ethereum/core/transaction.hpp>
+#include <category/execution/ethereum/core/units.hpp>
+#include <category/execution/ethereum/db/trie_db.hpp>
+#include <category/execution/ethereum/reserve_balance.hpp>
+#include <category/execution/ethereum/state2/block_state.hpp>
+#include <category/execution/ethereum/state3/state.hpp>
+#include <category/execution/ethereum/transaction_gas.hpp>
+#include <category/execution/ethereum/validate_block.hpp>
+#include <category/execution/ethereum/validate_transaction.hpp>
+#include <category/execution/kinet/chain/kinet_chain.hpp>
+#include <category/execution/kinet/chain/kinet_devnet.hpp>
+#include <category/execution/kinet/chain/kinet_mainnet.hpp>
+#include <category/execution/kinet/chain/kinet_testnet.hpp>
+#include <category/execution/kinet/reserve_balance.h>
+#include <category/execution/kinet/reserve_balance.hpp>
+#include <category/execution/kinet/staking/util/constants.hpp>
+#include <category/execution/kinet/system_sender.hpp>
+#include <category/execution/kinet/validate_kinet_transaction.hpp>
+#include <category/mpt/db.hpp>
+#include <category/vm/evm/explicit_traits.hpp>
+#include <category/vm/evm/traits.hpp>
+#include <kinet/test/traits_test.hpp>
+
+#include <bitset>
+
+#include <gtest/gtest.h>
+
+using namespace kinet;
+
+TYPED_TEST(KinetTraitsTest, compute_gas_refund)
+{
+    uint64_t const refund = compute_gas_refund<typename TestFixture::Trait>(
+        Transaction{.gas_limit = 21'000}, 20'000, 1'000);
+    if constexpr (TestFixture::REV >= KINET_ONE) {
+        EXPECT_EQ(refund, 0);
+    }
+    else {
+        EXPECT_EQ(refund, 20'200);
+    }
+}
+
+TEST(HiveNet, ChainConfig)
+{
+    HiveNet const chain;
+
+    EXPECT_EQ(chain.get_chain_id(), uint256_t{3503995874084926ULL});
+    // Merged from genesis (PoS): Berlin/London/Paris/Shanghai active at
+    // genesis, Cancun at timestamp 30, Prague at timestamp 60. Dispatch is
+    // purely by timestamp.
+    EXPECT_EQ(chain.get_revision(0, 0), KINET_ETH_SHANGHAI);
+    EXPECT_EQ(chain.get_revision(3, 30), KINET_ETH_CANCUN);
+    EXPECT_EQ(chain.get_revision(5, 59), KINET_ETH_CANCUN);
+    EXPECT_EQ(chain.get_revision(6, 60), KINET_ETH_PRAGUE);
+
+    GenesisState const genesis_state = chain.get_genesis_state();
+    EXPECT_EQ(genesis_state.header.difficulty, uint256_t{0x20000});
+    EXPECT_EQ(genesis_state.header.gas_limit, 0x5f5e100);
+    EXPECT_EQ(
+        genesis_state.header.extra_data,
+        from_hex("0x68697665636861696e").value());
+    EXPECT_EQ(genesis_state.header.base_fee_per_gas, uint256_t{0x3b9aca00});
+    EXPECT_EQ(genesis_state.header.withdrawals_root, NULL_ROOT);
+
+    // Genesis hash as recorded in the Hive runner fixtures (chain.rlp).
+    mpt::Db db{std::make_unique<InMemoryMachine>()};
+    TrieDb tdb{db};
+    load_genesis_state(genesis_state, tdb);
+    BlockHeader const header = tdb.read_eth_header();
+    EXPECT_EQ(
+        to_bytes(keccak256(rlp::encode_block_header(header))),
+        0x17456e286687a308b6525a6a73852ff4c89836bfef24338cc46cdf44d28055b0_bytes32);
+}
+
+TYPED_TEST(TraitsTest, Genesis)
+{
+    {
+        mpt::Db db{std::make_unique<InMemoryMachine>()};
+        TrieDb tdb{db};
+        KinetTestnet const chain;
+        load_genesis_state(chain.get_genesis_state(), tdb);
+        BlockHeader const header = tdb.read_eth_header();
+        bytes32_t const hash =
+            to_bytes(keccak256(rlp::encode_block_header(header)));
+        EXPECT_EQ(
+            hash,
+            0x298034669ee44327d2da9744b9b2782848e2f2a6959756b7b0471b09a404f5c9_bytes32);
+
+        auto result =
+            static_validate_header<typename TestFixture::Trait>(header);
+        if constexpr (TestFixture::Trait::evm_rev() >= KINET_ETH_PRAGUE) {
+            EXPECT_TRUE(result.has_value());
+        }
+        else {
+            // the header generated at the time was only valid in the Prague
+            // revision and onwards
+            EXPECT_TRUE(result.has_error());
+        }
+    }
+
+    {
+        mpt::Db db{std::make_unique<InMemoryMachine>()};
+        TrieDb tdb{db};
+        KinetDevnet const chain;
+        load_genesis_state(chain.get_genesis_state(), tdb);
+        BlockHeader const header = tdb.read_eth_header();
+        bytes32_t const hash =
+            to_bytes(keccak256(rlp::encode_block_header(header)));
+        EXPECT_EQ(
+            hash,
+            0xb711505d8f46fc921ae824f847f26c5c3657bf6c8b9dcf07ffdf3357a143bca9_bytes32);
+        auto result =
+            static_validate_header<typename TestFixture::Trait>(header);
+        if constexpr (TestFixture::Trait::evm_rev() < KINET_ETH_LONDON) {
+            EXPECT_TRUE(result.has_value());
+        }
+        else {
+            // the header generated at the time was not a valid header for the
+            // Paris revision or above
+            EXPECT_TRUE(result.has_error());
+        }
+    }
+    {
+        mpt::Db db{std::make_unique<InMemoryMachine>()};
+        TrieDb tdb{db};
+        KinetMainnet const chain;
+        load_genesis_state(chain.get_genesis_state(), tdb);
+        BlockHeader const header = tdb.read_eth_header();
+        bytes32_t const hash =
+            to_bytes(keccak256(rlp::encode_block_header(header)));
+        EXPECT_EQ(
+            hash,
+            0x0c47353304f22b1c15706367d739b850cda80b5c87bbc335014fef3d88deaac9_bytes32);
+
+        auto result =
+            static_validate_header<typename TestFixture::Trait>(header);
+        if constexpr (TestFixture::Trait::evm_rev() == KINET_ETH_CANCUN) {
+            EXPECT_TRUE(result.has_value());
+        }
+        else {
+            // the header generated at the time was only valid in the Cancun
+            // revision
+            EXPECT_TRUE(result.has_error());
+        }
+    }
+}
+
+enum PreventDipBits
+{
+    IsDelegated = 0,
+    SenderOrAuthorityInGrandparent = 1,
+    SenderOrAuthorityInParent = 2,
+    SenderInBlock = 3,
+    AuthorityInBlock = 4,
+    AuthorityInTransaction = 5,
+};
+
+constexpr uint8_t PREVENT_DIP_BITS_POWERSET_SIZE = 64;
+
+static_assert(
+    (1 << (AuthorityInTransaction + 1)) == PREVENT_DIP_BITS_POWERSET_SIZE);
+
+template <Traits traits>
+    requires is_kinet_trait_v<traits>
+void run_revert_transaction_test(
+    uint8_t const prevent_dip_bitset, uint64_t const initial_balance_mon,
+    uint64_t const gas_fee_mon, uint64_t const value_mon, bool const expected)
+{
+    static constexpr uint256_t BASE_FEE_PER_GAS = 10;
+    static constexpr Address SENDER{1};
+    mpt::Db db{std::make_unique<InMemoryMachine>()};
+    TrieDb tdb{db};
+    vm::VM vm;
+    BlockState bs{tdb, vm};
+
+    ASSERT_EQ(kinet_default_max_reserve_balance_mon(traits::kinet_rev()), 10);
+
+    // Set up initial state
+    {
+        State state{bs, Incarnation{0, 0}};
+        uint256_t const initial_balance =
+            uint256_t{initial_balance_mon} * ETHER;
+        state.add_to_balance(SENDER, initial_balance);
+        if (prevent_dip_bitset & (1 << IsDelegated)) {
+            byte_string const code{
+                0xef, 0x01, 0x00, 0x02, 0x02, 0x02, 0x02, 0x02,
+                0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+                0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+            };
+            state.set_code(SENDER, code);
+        }
+        KINET_ASSERT(bs.can_merge(state));
+        bs.merge(state);
+    }
+
+    uint256_t const gas_fee = uint256_t{gas_fee_mon} * ETHER;
+    uint256_t const gas_limit = gas_fee / BASE_FEE_PER_GAS;
+    KINET_ASSERT(
+        (gas_fee % BASE_FEE_PER_GAS) == 0 &&
+        gas_limit <= std::numeric_limits<uint64_t>::max());
+
+    Transaction const tx{
+        .max_fee_per_gas = BASE_FEE_PER_GAS,
+        .gas_limit = uint64_t{gas_limit},
+        .type = TransactionType::legacy,
+        .max_priority_fee_per_gas = 0,
+    };
+
+    std::vector<Address> senders;
+    if (prevent_dip_bitset & (1 << SenderInBlock)) {
+        senders.push_back(SENDER);
+    }
+    else {
+        senders.push_back(Address{2});
+    }
+    senders.emplace_back(SENDER);
+    std::vector<std::vector<std::optional<Address>>> authorities = {};
+    if (prevent_dip_bitset & (1 << AuthorityInBlock)) {
+        authorities.push_back({SENDER});
+    }
+    else {
+        authorities.push_back({});
+    }
+    if (prevent_dip_bitset & (1 << AuthorityInTransaction)) {
+        authorities.push_back({SENDER});
+    }
+    else {
+        authorities.push_back({});
+    }
+
+    // Create sets for the new ChainContext structure
+    ankerl::unordered_dense::segmented_set<Address>
+        grandparent_senders_and_authorities;
+    if (prevent_dip_bitset & (1 << SenderOrAuthorityInGrandparent)) {
+        grandparent_senders_and_authorities.insert(SENDER);
+    }
+    ankerl::unordered_dense::segmented_set<Address>
+        parent_senders_and_authorities;
+    if (prevent_dip_bitset & (1 << SenderOrAuthorityInParent)) {
+        parent_senders_and_authorities.insert(SENDER);
+    }
+    ankerl::unordered_dense::segmented_set<Address> const
+        senders_and_authorities = {SENDER};
+
+    ChainContext<traits> chain_context{
+        .grandparent_senders_and_authorities =
+            grandparent_senders_and_authorities,
+        .parent_senders_and_authorities = parent_senders_and_authorities,
+        .senders_and_authorities = senders_and_authorities,
+        .senders = senders,
+        .authorities = authorities};
+
+    {
+        State state{bs, Incarnation{1, 1}};
+        trace::StateTracer noop_state_tracer = std::monostate{};
+        init_reserve_balance_context<traits>(
+            state,
+            SENDER,
+            tx,
+            BASE_FEE_PER_GAS,
+            1,
+            noop_state_tracer,
+            chain_context);
+        state.subtract_from_balance(SENDER, gas_fee);
+        uint256_t const value = uint256_t{value_mon} * ETHER;
+        state.subtract_from_balance(SENDER, value);
+        bool should_revert = revert_transaction<traits>(
+            SENDER,
+            tx,
+            BASE_FEE_PER_GAS,
+            1, // transaction index
+            state,
+            noop_state_tracer,
+            chain_context);
+        bool should_revert_cached = revert_transaction_cached<traits>(state);
+
+        EXPECT_EQ(should_revert, expected)
+            << std::bitset<64>{prevent_dip_bitset};
+
+        EXPECT_EQ(should_revert_cached, should_revert)
+            << std::bitset<64>{prevent_dip_bitset};
+    }
+}
+
+EXPLICIT_KINET_TRAITS(run_revert_transaction_test)
+
+TYPED_TEST(
+    KinetTraitsTest, revert_transaction_no_dip_gas_fee_with_no_value_false)
+{
+    for (uint8_t i = 1; i < PREVENT_DIP_BITS_POWERSET_SIZE; ++i) {
+        run_revert_transaction_test<typename TestFixture::Trait>(
+            i, // prevent_dip_bitset
+            10, // initial balance (MON)
+            2, // gas fee (MON)
+            0, // value (MON)
+            false // expected should_revert
+        );
+
+        // now spend whole reserve
+        run_revert_transaction_test<typename TestFixture::Trait>(
+            i, // prevent_dip_bitset
+            10, // initial balance (MON)
+            10, // gas fee (MON)
+            0, // value (MON)
+            false // expected should_revert
+        );
+    }
+}
+
+TYPED_TEST(KinetTraitsTest, revert_transaction_no_dip_gas_fee_with_value_true)
+{
+    constexpr auto should_revert = [] {
+        if (TestFixture::Trait::kinet_rev() >= KINET_FOUR) {
+            return true;
+        }
+        else {
+            return false;
+        }
+    }();
+
+    for (uint8_t i = 1; i < PREVENT_DIP_BITS_POWERSET_SIZE; ++i) {
+        run_revert_transaction_test<typename TestFixture::Trait>(
+            i, // prevent_dip_bitset
+            10, // initial balance (MON)
+            2, // gas fee (MON)
+            1, // value (MON)
+            should_revert);
+
+        run_revert_transaction_test<typename TestFixture::Trait>(
+            i, // prevent_dip_bitset
+            15, // initial balance (MON)
+            5, // gas fee (MON)
+            6, // value (MON)
+            should_revert);
+    }
+}
+
+TYPED_TEST(KinetTraitsTest, revert_transaction_no_dip_gas_fee_with_value_false)
+{
+    for (uint8_t i = 1; i < PREVENT_DIP_BITS_POWERSET_SIZE; ++i) {
+        run_revert_transaction_test<typename TestFixture::Trait>(
+            i, // prevent_dip_bitset
+            15, // initial balance (MON)
+            5, // gas fee (MON)
+            5, // value (MON)
+            false // expected should_revert
+        );
+    }
+}
+
+TYPED_TEST(KinetTraitsTest, reserve_balance_checks_disabled_before_kinet_four)
+{
+    if constexpr (TestFixture::Trait::kinet_rev() < KINET_FOUR) {
+        // For revisions before KINET_FOUR, reserve-balance tracking must stay
+        // disabled. If it is accidentally enabled, this case hits
+        // sender_gas_fees > reserve for a non-dipping sender and throws.
+        run_revert_transaction_test<typename TestFixture::Trait>(
+            (1 << IsDelegated), // not allowed to dip into reserve
+            20, // initial balance (MON)
+            11, // gas fee (MON), strictly greater than reserve (10 MON)
+            0, // value (MON)
+            false // expected should_revert
+        );
+    }
+}
+
+TYPED_TEST(
+    KinetTraitsTest,
+    sender_gas_fee_above_reserve_stays_failed_after_large_credit)
+{
+    using traits = typename TestFixture::Trait;
+    if constexpr (traits::kinet_rev() < KINET_FOUR) {
+        GTEST_SKIP() << "reserve-balance checks are disabled before KINET_FOUR";
+    }
+
+    static constexpr Address SENDER{1};
+    static constexpr uint256_t BASE_FEE_PER_GAS = 10;
+
+    mpt::Db db{std::make_unique<InMemoryMachine>()};
+    TrieDb tdb{db};
+    vm::VM vm;
+    BlockState bs{tdb, vm};
+
+    {
+        State init_state{bs, Incarnation{0, 0}};
+        init_state.add_to_balance(SENDER, 20_ether);
+        KINET_ASSERT(bs.can_merge(init_state));
+        bs.merge(init_state);
+    }
+
+    uint256_t const sender_gas_fee = 11_ether; // reserve is capped at 10 MON
+    uint256_t const gas_limit_u256 = sender_gas_fee / BASE_FEE_PER_GAS;
+    KINET_ASSERT(
+        (sender_gas_fee % BASE_FEE_PER_GAS) == 0 &&
+        gas_limit_u256 <= std::numeric_limits<uint64_t>::max());
+
+    Transaction const tx{
+        .max_fee_per_gas = BASE_FEE_PER_GAS,
+        .gas_limit = static_cast<uint64_t>(gas_limit_u256),
+        .type = TransactionType::legacy,
+        .max_priority_fee_per_gas = 0,
+    };
+
+    ankerl::unordered_dense::segmented_set<Address> const
+        empty_grandparent_senders_and_authorities;
+    ankerl::unordered_dense::segmented_set<Address>
+        parent_senders_and_authorities;
+    parent_senders_and_authorities.insert(SENDER); // sender cannot dip
+    std::vector<Address> const senders = {SENDER};
+    std::vector<std::vector<std::optional<Address>>> const authorities = {{}};
+    ankerl::unordered_dense::segmented_set<Address> senders_and_authorities;
+    senders_and_authorities.insert(SENDER);
+    ChainContext<traits> const context{
+        .grandparent_senders_and_authorities =
+            empty_grandparent_senders_and_authorities,
+        .parent_senders_and_authorities = parent_senders_and_authorities,
+        .senders_and_authorities = senders_and_authorities,
+        .senders = senders,
+        .authorities = authorities,
+    };
+
+    State state{bs, Incarnation{1, 1}};
+    trace::StateTracer noop_state_tracer = std::monostate{};
+    init_reserve_balance_context<traits>(
+        state, SENDER, tx, BASE_FEE_PER_GAS, 0, noop_state_tracer, context);
+    state.subtract_from_balance(SENDER, sender_gas_fee);
+
+    EXPECT_TRUE(revert_transaction<traits>(
+        SENDER, tx, BASE_FEE_PER_GAS, 0, state, noop_state_tracer, context));
+    EXPECT_TRUE(revert_transaction_cached<traits>(state));
+
+    uint256_t const sender_balance = state.get_balance(SENDER);
+    state.add_to_balance(
+        SENDER, std::numeric_limits<uint256_t>::max() - sender_balance);
+
+    EXPECT_TRUE(revert_transaction<traits>(
+        SENDER, tx, BASE_FEE_PER_GAS, 0, state, noop_state_tracer, context));
+    EXPECT_TRUE(revert_transaction_cached<traits>(state));
+}
+
+TYPED_TEST(KinetTraitsTest, staking_contract_balance_drop_does_not_revert)
+{
+    if constexpr (TestFixture::Trait::kinet_rev() < KINET_FOUR) {
+        GTEST_SKIP() << "reserve-balance checks are disabled before KINET_FOUR";
+    }
+
+    using traits = typename TestFixture::Trait;
+    constexpr Address sender{1};
+    constexpr uint256_t base_fee_per_gas = 10;
+
+    mpt::Db db{std::make_unique<InMemoryMachine>()};
+    TrieDb tdb{db};
+    vm::VM vm;
+    BlockState bs{tdb, vm};
+
+    {
+        State state{bs, Incarnation{0, 0}};
+        state.add_to_balance(sender, 20_ether);
+        state.add_to_balance(staking::STAKING_CA, 10_ether);
+        KINET_ASSERT(bs.can_merge(state));
+        bs.merge(state);
+    }
+
+    uint256_t const sender_gas_fee = 1_ether;
+    uint256_t const gas_limit_u256 = sender_gas_fee / base_fee_per_gas;
+    KINET_ASSERT(
+        (sender_gas_fee % base_fee_per_gas) == 0 &&
+        gas_limit_u256 <= std::numeric_limits<uint64_t>::max());
+
+    Transaction const tx{
+        .max_fee_per_gas = base_fee_per_gas,
+        .gas_limit = static_cast<uint64_t>(gas_limit_u256),
+        .type = TransactionType::legacy,
+        .max_priority_fee_per_gas = 0,
+    };
+
+    ChainContext<traits> const chain_context{
+        .grandparent_senders_and_authorities = {},
+        .parent_senders_and_authorities = {},
+        .senders_and_authorities = {sender},
+        .senders = {sender},
+        .authorities = {{}},
+    };
+
+    State state{bs, Incarnation{1, 1}};
+    trace::StateTracer noop_state_tracer = std::monostate{};
+    init_reserve_balance_context<traits>(
+        state,
+        sender,
+        tx,
+        base_fee_per_gas,
+        0,
+        noop_state_tracer,
+        chain_context);
+    state.subtract_from_balance(sender, sender_gas_fee);
+    state.subtract_from_balance(staking::STAKING_CA, 1_ether);
+
+    EXPECT_FALSE(revert_transaction<traits>(
+        sender,
+        tx,
+        base_fee_per_gas,
+        0,
+        state,
+        noop_state_tracer,
+        chain_context));
+    EXPECT_FALSE(revert_transaction_cached<traits>(state));
+}
+
+TYPED_TEST(KinetTraitsTest, revert_transaction_dip_false)
+{
+    run_revert_transaction_test<typename TestFixture::Trait>(
+        0, // prevent_dip_bitset
+        10, // initial balance (MON)
+        10, // gas fee (MON)
+        0, // value (MON)
+        false // expected should_revert
+    );
+
+    run_revert_transaction_test<typename TestFixture::Trait>(
+        0, // prevent_dip_bitset
+        10, // initial balance (MON)
+        1, // gas fee (MON)
+        9, // value (MON)
+        false // expected should_revert
+    );
+}
+
+TYPED_TEST(KinetTraitsTest, can_sender_dip_into_reserve)
+{
+    // False because of pending txns
+    {
+        ankerl::unordered_dense::segmented_set<Address> const
+            empty_grandparent_senders_and_authorities;
+        ankerl::unordered_dense::segmented_set<Address> const
+            empty_parent_senders_and_authorities;
+        std::vector<Address> const senders = {{Address{1}, Address{1}}};
+        std::vector<std::vector<std::optional<Address>>> const authorities = {
+            {}, {}};
+        ankerl::unordered_dense::segmented_set<Address> const
+            senders_and_authorities{{Address{1}}};
+        ChainContext<typename TestFixture::Trait> const context{
+            .grandparent_senders_and_authorities =
+                empty_grandparent_senders_and_authorities,
+            .parent_senders_and_authorities =
+                empty_parent_senders_and_authorities,
+            .senders_and_authorities = senders_and_authorities,
+            .senders = senders,
+            .authorities = authorities,
+        };
+        EXPECT_FALSE(
+            can_sender_dip_into_reserve(Address{1}, 1, false, context));
+    }
+
+    // False because of authority
+    {
+        ankerl::unordered_dense::segmented_set<Address> const
+            empty_grandparent_senders_and_authorities;
+        ankerl::unordered_dense::segmented_set<Address> const
+            empty_parent_senders_and_authorities;
+        std::vector<Address> const senders = {{Address{2}, Address{1}}};
+        std::vector<std::vector<std::optional<Address>>> const authorities = {
+            {}, {Address{1}}};
+        ankerl::unordered_dense::segmented_set<Address> const
+            senders_and_authorities{{Address{1}}};
+        ChainContext<typename TestFixture::Trait> const context{
+            .grandparent_senders_and_authorities =
+                empty_grandparent_senders_and_authorities,
+            .parent_senders_and_authorities =
+                empty_parent_senders_and_authorities,
+            .senders_and_authorities = senders_and_authorities,
+            .senders = senders,
+            .authorities = authorities,
+        };
+        EXPECT_FALSE(can_sender_dip_into_reserve<typename TestFixture::Trait>(
+            Address{1}, 1, false, context));
+    }
+}
+
+TYPED_TEST(KinetTraitsTest, reserve_checks_code_hash)
+{
+    using traits = typename TestFixture::Trait;
+    static constexpr Address SENDER{1};
+    static constexpr Address NEW_CONTRACT{2};
+    static constexpr uint64_t BASE_FEE_PER_GAS = 10;
+
+    mpt::Db db{std::make_unique<InMemoryMachine>()};
+    TrieDb tdb{db};
+    vm::VM vm;
+    BlockState bs{tdb, vm};
+
+    {
+        State init_state{bs, Incarnation{0, 0}};
+        init_state.add_to_balance(SENDER, 20_ether);
+        init_state.add_to_balance(NEW_CONTRACT, 3_ether);
+        KINET_ASSERT(bs.can_merge(init_state));
+        bs.merge(init_state);
+    }
+
+    Transaction const tx{
+        .max_fee_per_gas = BASE_FEE_PER_GAS,
+        .gas_limit = 1,
+        .type = TransactionType::legacy,
+        .max_priority_fee_per_gas = 0,
+    };
+    uint256_t const gas_cost =
+        uint256_t{BASE_FEE_PER_GAS} * uint256_t{tx.gas_limit};
+
+    ankerl::unordered_dense::segmented_set<Address> const
+        empty_grandparent_senders_and_authorities;
+    ankerl::unordered_dense::segmented_set<Address> const
+        empty_parent_senders_and_authorities;
+    std::vector<Address> const senders = {SENDER};
+    std::vector<std::vector<std::optional<Address>>> const authorities = {{}};
+    ankerl::unordered_dense::segmented_set<Address> senders_and_authorities;
+    senders_and_authorities.insert(SENDER);
+    ChainContext<traits> const context{
+        .grandparent_senders_and_authorities =
+            empty_grandparent_senders_and_authorities,
+        .parent_senders_and_authorities = empty_parent_senders_and_authorities,
+        .senders_and_authorities = senders_and_authorities,
+        .senders = senders,
+        .authorities = authorities};
+
+    trace::StateTracer noop_state_tracer = std::monostate{};
+    auto const prepare_state = [&](State &state) {
+        init_reserve_balance_context<traits>(
+            state, SENDER, tx, BASE_FEE_PER_GAS, 0, noop_state_tracer, context);
+        state.subtract_from_balance(SENDER, gas_cost);
+        state.subtract_from_balance(NEW_CONTRACT, 3_ether);
+        byte_string const contract_code{0x60, 0x00};
+        state.set_code(NEW_CONTRACT, contract_code);
+    };
+
+    State state{bs, Incarnation{1, 1}};
+    prepare_state(state);
+
+    bool const should_revert = revert_transaction<traits>(
+        SENDER, tx, BASE_FEE_PER_GAS, 0, state, noop_state_tracer, context);
+    bool const should_revert_cached = revert_transaction_cached<traits>(state);
+
+    if constexpr (traits::kinet_rev() < KINET_FOUR) {
+        EXPECT_FALSE(should_revert);
+        EXPECT_FALSE(should_revert_cached);
+    }
+    else if constexpr (traits::kinet_rev() >= KINET_EIGHT) {
+        EXPECT_FALSE(should_revert);
+        EXPECT_FALSE(should_revert_cached);
+    }
+    else {
+        EXPECT_TRUE(should_revert);
+        EXPECT_TRUE(should_revert_cached);
+    }
+}
+
+TYPED_TEST(KinetTraitsTest, reserve_checks_empty_code_hash)
+{
+    using traits = typename TestFixture::Trait;
+    static constexpr Address SENDER{1};
+    static constexpr Address NEW_CONTRACT{2};
+    static constexpr uint64_t BASE_FEE_PER_GAS = 10;
+
+    mpt::Db db{std::make_unique<InMemoryMachine>()};
+    TrieDb tdb{db};
+    vm::VM vm;
+    BlockState bs{tdb, vm};
+
+    {
+        State init_state{bs, Incarnation{0, 0}};
+        init_state.add_to_balance(SENDER, 20_ether);
+        init_state.add_to_balance(NEW_CONTRACT, 3_ether);
+        KINET_ASSERT(bs.can_merge(init_state));
+        bs.merge(init_state);
+    }
+
+    Transaction const tx{
+        .max_fee_per_gas = BASE_FEE_PER_GAS,
+        .gas_limit = 1,
+        .type = TransactionType::legacy,
+        .max_priority_fee_per_gas = 0,
+    };
+    uint256_t const gas_cost =
+        uint256_t{BASE_FEE_PER_GAS} * uint256_t{tx.gas_limit};
+
+    ankerl::unordered_dense::segmented_set<Address> const
+        empty_grandparent_senders_and_authorities;
+    ankerl::unordered_dense::segmented_set<Address> const
+        empty_parent_senders_and_authorities;
+    std::vector<Address> const senders = {SENDER};
+    std::vector<std::vector<std::optional<Address>>> const authorities = {{}};
+    ankerl::unordered_dense::segmented_set<Address> senders_and_authorities;
+    senders_and_authorities.insert(SENDER);
+    ChainContext<traits> const context{
+        .grandparent_senders_and_authorities =
+            empty_grandparent_senders_and_authorities,
+        .parent_senders_and_authorities = empty_parent_senders_and_authorities,
+        .senders_and_authorities = senders_and_authorities,
+        .senders = senders,
+        .authorities = authorities};
+
+    State state{bs, Incarnation{1, 1}};
+    trace::StateTracer noop_state_tracer = std::monostate{};
+    init_reserve_balance_context<traits>(
+        state, SENDER, tx, BASE_FEE_PER_GAS, 0, noop_state_tracer, context);
+    state.subtract_from_balance(SENDER, gas_cost);
+    state.subtract_from_balance(NEW_CONTRACT, 3_ether);
+    state.set_code(NEW_CONTRACT, {});
+
+    bool const should_revert = revert_transaction<traits>(
+        SENDER, tx, BASE_FEE_PER_GAS, 0, state, noop_state_tracer, context);
+    bool const should_revert_cached = revert_transaction_cached<traits>(state);
+
+    if constexpr (traits::kinet_rev() < KINET_FOUR) {
+        EXPECT_FALSE(should_revert);
+        EXPECT_FALSE(should_revert_cached);
+    }
+    else {
+        EXPECT_TRUE(should_revert);
+        EXPECT_TRUE(should_revert_cached);
+    }
+}
+
+TYPED_TEST(KinetTraitsTest, reserve_checks_prefunded_init_selfdestruct)
+{
+    using traits = typename TestFixture::Trait;
+    constexpr Address SENDER{1};
+    constexpr Address NEW_CONTRACT{2};
+    constexpr Address BENEFICIARY{3};
+    constexpr uint64_t BASE_FEE_PER_GAS = 10;
+
+    mpt::Db db{std::make_unique<InMemoryMachine>()};
+    TrieDb tdb{db};
+    vm::VM vm;
+    BlockState bs{tdb, vm};
+
+    {
+        State init_state{bs, Incarnation{0, 0}};
+        init_state.add_to_balance(SENDER, 20_ether);
+        init_state.add_to_balance(NEW_CONTRACT, 3_ether);
+        KINET_ASSERT(bs.can_merge(init_state));
+        bs.merge(init_state);
+    }
+
+    Transaction const tx{
+        .max_fee_per_gas = BASE_FEE_PER_GAS,
+        .gas_limit = 1,
+        .type = TransactionType::legacy,
+        .max_priority_fee_per_gas = 0,
+    };
+    uint256_t const gas_cost =
+        uint256_t{BASE_FEE_PER_GAS} * uint256_t{tx.gas_limit};
+
+    ankerl::unordered_dense::segmented_set<Address> const
+        empty_grandparent_senders_and_authorities;
+    ankerl::unordered_dense::segmented_set<Address> const
+        empty_parent_senders_and_authorities;
+    std::vector<Address> const senders = {SENDER};
+    std::vector<std::vector<std::optional<Address>>> const authorities = {{}};
+    ankerl::unordered_dense::segmented_set<Address> senders_and_authorities;
+    senders_and_authorities.insert(SENDER);
+    ChainContext<traits> const context{
+        .grandparent_senders_and_authorities =
+            empty_grandparent_senders_and_authorities,
+        .parent_senders_and_authorities = empty_parent_senders_and_authorities,
+        .senders_and_authorities = senders_and_authorities,
+        .senders = senders,
+        .authorities = authorities};
+
+    State state{bs, Incarnation{1, 1}};
+    trace::StateTracer noop_state_tracer = std::monostate{};
+    init_reserve_balance_context<traits>(
+        state, SENDER, tx, BASE_FEE_PER_GAS, 0, noop_state_tracer, context);
+    state.subtract_from_balance(SENDER, gas_cost);
+
+    // Model constructor-time SELFDESTRUCT at a pre-funded address:
+    // create the account in current incarnation, then selfdestruct it before
+    // any runtime code is set.
+    state.create_contract(NEW_CONTRACT);
+    auto const [inserted, initial_balance] =
+        state.selfdestruct<traits>(NEW_CONTRACT, BENEFICIARY);
+    EXPECT_TRUE(inserted);
+    EXPECT_EQ(initial_balance, 3_ether);
+    EXPECT_EQ(state.get_balance(NEW_CONTRACT), 0);
+    EXPECT_EQ(state.get_balance(BENEFICIARY), 3_ether);
+
+    bool const should_revert = revert_transaction<traits>(
+        SENDER, tx, BASE_FEE_PER_GAS, 0, state, noop_state_tracer, context);
+    bool const should_revert_cached = revert_transaction_cached<traits>(state);
+
+    if constexpr (traits::kinet_rev() < KINET_FOUR) {
+        EXPECT_FALSE(should_revert);
+        EXPECT_FALSE(should_revert_cached);
+    }
+    else if constexpr (traits::kinet_rev() >= KINET_NINE) {
+        EXPECT_FALSE(should_revert);
+        EXPECT_FALSE(should_revert_cached);
+    }
+    else {
+        EXPECT_TRUE(should_revert);
+        EXPECT_TRUE(should_revert_cached);
+    }
+}
+
+TYPED_TEST(KinetTraitsTest, system_transaction_sender_is_authority)
+{
+    mpt::Db db{std::make_unique<InMemoryMachine>()};
+    TrieDb tdb{db};
+    vm::VM vm;
+    BlockState bs{tdb, vm};
+    State state{bs, Incarnation{0, 0}};
+    std::vector<std::optional<Address>> const authorities = {SYSTEM_SENDER};
+
+    trace::StateTracer noop_state_tracer = std::monostate{};
+    auto const res = validate_transaction<typename TestFixture::Trait>(
+        {}, {}, state, 0, authorities, noop_state_tracer);
+    if constexpr (TestFixture::Trait::kinet_rev() < KINET_FOUR) {
+        EXPECT_TRUE(res.has_value());
+    }
+    else {
+        ASSERT_TRUE(res.has_error());
+        EXPECT_EQ(
+            res.error(),
+            KinetTransactionError::SystemTransactionSenderIsAuthority);
+    }
+}

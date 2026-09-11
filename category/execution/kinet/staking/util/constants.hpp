@@ -1,0 +1,144 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/core/address.hpp>
+#include <category/execution/ethereum/core/contract/big_endian.hpp>
+#include <category/execution/ethereum/core/contract/storage_variable.hpp>
+#include <category/execution/ethereum/core/units.hpp>
+#include <category/execution/kinet/staking/config.hpp>
+#include <category/vm/evm/traits.hpp>
+
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <span>
+
+KINET_STAKING_NAMESPACE_BEGIN
+
+using namespace kinet::literals;
+
+// staking contract address
+inline constexpr Address STAKING_CA{0x1000};
+
+inline constexpr Address PRIORITY_FEE_DIST_ADDRESS{
+    0xfee5fee5fee5fee5fee5fee5fee5fee5fee5fee5_address};
+
+// MON has the same 18-decimal denomination as ether
+inline constexpr uint256_t MON{ETHER};
+
+// accumulator precision
+inline constexpr uint256_t UNIT_BIAS{
+    1000000000000000000000000000000000000_u256}; // 1e36
+
+// the limits namespace denotes constants that can be forked in future releases.
+namespace limits
+{
+    constexpr uint256_t dust_threshold()
+    {
+        return 1_gwei;
+    }
+
+    constexpr uint256_t max_commission()
+    {
+        return MON; // 1e18
+    }
+
+    template <Traits traits>
+    constexpr uint256_t active_validator_stake()
+    {
+        if constexpr (traits::kinet_rev() >= KINET_FIVE) {
+            return 10'000'000 * MON;
+        }
+        return 25'000'000 * MON;
+    }
+
+    constexpr uint256_t min_auth_address_stake()
+    {
+        return 100'000 * MON;
+    }
+
+    constexpr uint256_t min_external_reward()
+    {
+        return dust_threshold();
+    }
+
+    constexpr uint256_t max_external_reward()
+    {
+        return 10000000000000000000000000_u256; // 1e25
+    };
+
+    constexpr uint64_t active_valset_size()
+    {
+        return 200;
+    }
+
+    constexpr uint32_t array_pagination()
+    {
+        return 100;
+    };
+
+    template <Traits traits>
+    constexpr uint32_t linked_list_pagination()
+    {
+        if constexpr (traits::kinet_rev() < KINET_EIGHT) {
+            return 100;
+        }
+
+        // The relation to array pagination is each list node occupies two
+        // slots.
+        return 50;
+    };
+
+    template <Traits traits>
+    constexpr uint256_t maximum_block_reward()
+    {
+        if constexpr (traits::mip_12_active()) {
+            return 18 * MON;
+        }
+        else {
+            return 25 * MON;
+        }
+    }
+
+    constexpr uint64_t withdrawal_delay()
+    {
+        return 1;
+    }
+}
+
+// staking contract function selectors
+namespace selector
+{
+    inline constexpr uint32_t REWARD = 0x791bdcf3;
+    inline constexpr uint32_t SNAPSHOT = 0x157eeb21;
+    inline constexpr uint32_t ON_EPOCH_CHANGE = 0x1d4e9f02;
+}
+
+// sanity check: commission rate doesn't exceed 100% (1e18)
+// note that: delegator_reward = (raw_reward * COMMISSION) / 1e18
+static_assert(limits::max_commission() <= MON);
+
+enum
+{
+    ValidatorFlagsOk = 0,
+    ValidatorFlagsStakeTooLow = (1 << 0),
+    ValidatorFlagWithdrawn = (1 << 1),
+    ValidatorFlagsDoubleSign = (1 << 2),
+};
+
+KINET_STAKING_NAMESPACE_END

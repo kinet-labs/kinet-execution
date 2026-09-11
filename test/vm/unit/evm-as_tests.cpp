@@ -1,0 +1,2031 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include "asmjit/core/jitruntime.h"
+#include "category/core/bytes.hpp"
+#include "category/core/runtime/uint256.hpp"
+#include "category/vm/compiler/ir/x86/types.hpp"
+#include "category/vm/runtime//types.hpp"
+#include "category/vm/utils/evm-as/compiler.hpp"
+#include "evmc/evmc.hpp"
+#include <category/core/address.hpp>
+#include <category/core/int.hpp>
+#include <category/vm/compiler/ir/basic_blocks.hpp>
+#include <category/vm/compiler/ir/x86.hpp>
+#include <category/vm/evm/opcodes.hpp>
+#include <category/vm/interpreter/execute.hpp>
+#include <category/vm/interpreter/intercode.hpp>
+#include <category/vm/utils/evm-as.hpp>
+#include <category/vm/utils/evm-as/builder.hpp>
+#include <category/vm/utils/evm-as/instruction.hpp>
+#include <category/vm/utils/evm-as/kernel-builder.hpp>
+#include <category/vm/utils/evm-as/resolver.hpp>
+#include <category/vm/utils/evm-as/validator.hpp>
+
+#include <test/vm/utils/evm-as_utils.hpp>
+#include <test/vm/utils/test_context.hpp>
+
+#include <evmc/evmc.h>
+#include <gtest/gtest.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <format>
+#include <limits>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
+
+using namespace kinet;
+using namespace kinet::vm;
+using namespace kinet::vm::runtime;
+using namespace kinet::vm::utils;
+
+namespace
+{
+    std::shared_ptr<kinet::vm::compiler::native::Nativecode>
+    compile(asmjit::JitRuntime &rt, std::vector<uint8_t> const &bytecode)
+    {
+        using traits = EvmTraits<KINET_ETH_LATEST_STABLE_REVISION>;
+
+        kinet::vm::compiler::native::CompilerConfig const config{};
+        auto const ir = kinet::vm::compiler::basic_blocks::BasicBlocksIR(
+            kinet::vm::compiler::basic_blocks::unsafe_make_ir<traits>(
+                bytecode));
+        return kinet::vm::compiler::native::compile_basic_blocks<traits>(
+            rt, ir, config);
+    }
+
+    // NOTE/TODO: Copied verbatim from emitter_tests.cpp. Might be
+    // useful to factor this code out into a common shared module.
+    Address max_address()
+    {
+        Address ret;
+        std::memset(ret.bytes, -1, sizeof(ret.bytes) / sizeof(*ret.bytes));
+        return ret;
+    }
+
+    bytes32_t max_bytes32()
+    {
+        bytes32_t ret;
+        std::memset(ret.bytes, -1, sizeof(ret.bytes) / sizeof(*ret.bytes));
+        return ret;
+    }
+
+    runtime::Result test_result()
+    {
+        runtime::Result ret;
+        ret.status = static_cast<runtime::StatusCode>(
+            std::numeric_limits<uint64_t>::max());
+        memcpy(ret.offset, max_bytes32().bytes, 32);
+        memcpy(ret.size, max_bytes32().bytes, 32);
+        return ret;
+    }
+
+    kinet::vm::test::TestContext
+    test_context(int64_t const gas_remaining = 10'000'000)
+    {
+        return kinet::vm::test::TestContext{[&](auto &x) {
+            x.gas_remaining = gas_remaining;
+            x.env.recipient = max_address();
+            x.env.sender = max_address();
+            x.env.value = max_bytes32();
+            x.env.create2_salt = max_bytes32();
+            x.result = test_result();
+        }};
+    }
+
+    struct TestStackMemoryDeleter
+    {
+        void operator()(uint8_t *const p) const
+        {
+            std::free(p);
+        }
+    } test_stack_memory_deleter;
+
+    std::unique_ptr<uint8_t, TestStackMemoryDeleter> test_stack_memory()
+    {
+        return {
+            reinterpret_cast<uint8_t *>(std::aligned_alloc(32, 32 * 1024)),
+            test_stack_memory_deleter};
+    }
+
+    struct jit
+    {
+        static uint256_t
+        run(evm_as::EvmBuilder<
+            EvmTraits<KINET_ETH_LATEST_STABLE_REVISION>> const &eb)
+        {
+            std::vector<uint8_t> bytecode{};
+            evm_as::compile(eb, bytecode);
+
+            asmjit::JitRuntime rt{};
+            auto native = compile(rt, bytecode);
+
+            [&]() { ASSERT_TRUE(native != nullptr); }();
+
+            auto entry = native->entrypoint();
+
+            [&]() { ASSERT_TRUE(entry != nullptr); }();
+
+            auto ctx = test_context();
+            auto const &ret = ctx->result;
+
+            auto stack_memory = test_stack_memory();
+            entry(&*ctx, stack_memory.get());
+            [&]() { ASSERT_EQ(ret.status, runtime::StatusCode::Success); }();
+
+            // TODO: artificial restriction on result offset and size.
+            return load_be_unsafe<uint256_t>(ctx->memory.data);
+        }
+    };
+
+    std::vector<uint8_t> kernel_base_calldata(size_t const args_size)
+    {
+        auto const sz = 3000 * 32 * (args_size == 0 ? 1 : args_size);
+        std::vector<uint8_t> ret(sz, 0);
+        for (size_t i = 0; i < ret.size() / 32; ++i) {
+            store_be(&ret[i * 32], uint256_t{i + 1});
+        }
+        return ret;
+    }
+}
+
+TEST(EvmAs, PushExpansion)
+{
+    using namespace kinet::vm::utils::evm_as;
+    auto eb = evm_as::latest();
+    // Unsigned push expansion
+    auto const check = [](auto const &eb) -> void {
+        std::vector<compiler::EvmOpCode> matchers = {
+            compiler::EvmOpCode::PUSH0,  compiler::EvmOpCode::PUSH1,
+            compiler::EvmOpCode::PUSH2,  compiler::EvmOpCode::PUSH3,
+            compiler::EvmOpCode::PUSH4,  compiler::EvmOpCode::PUSH5,
+            compiler::EvmOpCode::PUSH6,  compiler::EvmOpCode::PUSH7,
+            compiler::EvmOpCode::PUSH8,  compiler::EvmOpCode::PUSH9,
+            compiler::EvmOpCode::PUSH10, compiler::EvmOpCode::PUSH11,
+            compiler::EvmOpCode::PUSH12, compiler::EvmOpCode::PUSH13,
+            compiler::EvmOpCode::PUSH14, compiler::EvmOpCode::PUSH15,
+            compiler::EvmOpCode::PUSH16, compiler::EvmOpCode::PUSH17,
+            compiler::EvmOpCode::PUSH18, compiler::EvmOpCode::PUSH19,
+            compiler::EvmOpCode::PUSH20, compiler::EvmOpCode::PUSH21,
+            compiler::EvmOpCode::PUSH22, compiler::EvmOpCode::PUSH23,
+            compiler::EvmOpCode::PUSH24, compiler::EvmOpCode::PUSH25,
+            compiler::EvmOpCode::PUSH26, compiler::EvmOpCode::PUSH27,
+            compiler::EvmOpCode::PUSH28, compiler::EvmOpCode::PUSH29,
+            compiler::EvmOpCode::PUSH30, compiler::EvmOpCode::PUSH31,
+            compiler::EvmOpCode::PUSH32,
+        };
+        ASSERT_EQ(eb.size(), matchers.size());
+
+        ASSERT_TRUE(Instruction::is_plain(eb[0]));
+        ASSERT_EQ(Instruction::as_plain(eb[0]).opcode, matchers[0]);
+        for (size_t i = 1; i < eb.size(); i++) {
+            ASSERT_TRUE(Instruction::is_push(eb[i]));
+            ASSERT_EQ(Instruction::as_push(eb[i]).opcode, matchers[i]);
+        }
+    };
+
+    eb.push(0);
+    for (int nbytes = 1; nbytes < 8; nbytes++) {
+        uint64_t const value = (1ULL << (8 * nbytes)) - 1;
+        eb.push(value);
+    }
+    eb.push(std::numeric_limits<uint64_t>::max());
+    for (int nbytes = 9; nbytes < 32; nbytes++) {
+        uint256_t const value = (uint256_t{1} << (8 * nbytes)) - 1;
+        eb.push(value);
+    }
+    eb.push(std::numeric_limits<uint256_t>::max());
+    ASSERT_TRUE(evm_as::validate(eb));
+    check(eb);
+
+    // Signed push expansion
+    eb = evm_as::latest();
+    eb.spush(-1).spush(-1'000'000);
+    ASSERT_EQ(eb.size(), 2);
+    ASSERT_TRUE(Instruction::is_push(eb[0]));
+    ASSERT_TRUE(Instruction::is_push(eb[1]));
+    auto const push1 = Instruction::as_push(eb[0]);
+    ASSERT_EQ(push1.imm, std::numeric_limits<uint256_t>::max());
+
+    auto i = push1.imm;
+    int j = 0;
+    while (i != 0) {
+        i = i + 1;
+        j++;
+    }
+    ASSERT_EQ(j, 1);
+
+    auto const push2 = Instruction::as_push(eb[1]);
+    ASSERT_EQ(push2.imm, signextend(7, -1'000'000));
+
+    i = push2.imm;
+    j = 0;
+    while (i != 0) {
+        i = i + 1;
+        j++;
+    }
+    ASSERT_EQ(j, 1'000'000);
+    ASSERT_TRUE(evm_as::validate(eb));
+}
+
+TEST(EvmAs, SwapExpansion)
+{
+    auto eb = evm_as::latest();
+
+    eb.push(1).push(2).push(3).swap(2);
+    ASSERT_TRUE(evm_as::validate(eb));
+    ASSERT_TRUE(evm_as::Instruction::is_plain(eb[3]));
+    ASSERT_EQ(
+        evm_as::Instruction::as_plain(eb[3]).opcode,
+        compiler::EvmOpCode::SWAP2);
+
+    eb = evm_as::latest();
+    std::vector<compiler::EvmOpCode> swaps = {
+        compiler::EvmOpCode::SWAP1,
+        compiler::EvmOpCode::SWAP2,
+        compiler::EvmOpCode::SWAP3,
+        compiler::EvmOpCode::SWAP4,
+        compiler::EvmOpCode::SWAP5,
+        compiler::EvmOpCode::SWAP6,
+        compiler::EvmOpCode::SWAP7,
+        compiler::EvmOpCode::SWAP8,
+        compiler::EvmOpCode::SWAP9,
+        compiler::EvmOpCode::SWAP10,
+        compiler::EvmOpCode::SWAP11,
+        compiler::EvmOpCode::SWAP12,
+        compiler::EvmOpCode::SWAP13,
+        compiler::EvmOpCode::SWAP14,
+        compiler::EvmOpCode::SWAP15,
+        compiler::EvmOpCode::SWAP16};
+    for (size_t i = 1; i <= 16; i++) {
+        eb.swap(i);
+    }
+    ASSERT_EQ(eb.size(), swaps.size());
+    for (size_t i = 0; i < eb.size(); i++) {
+        ASSERT_TRUE(evm_as::Instruction::is_plain(eb[i]));
+        ASSERT_EQ(evm_as::Instruction::as_plain(eb[i]).opcode, swaps[i]);
+    }
+    ASSERT_FALSE(evm_as::validate(eb));
+
+    eb = evm_as::latest();
+    eb.swap(100);
+    ASSERT_EQ(eb.size(), 1);
+    ASSERT_TRUE(evm_as::Instruction::is_invalid(eb[0]));
+    ASSERT_TRUE(evm_as::Instruction::as_invalid(eb[0]).has_name());
+    ASSERT_EQ(evm_as::Instruction::as_invalid(eb[0]).name, "SWAP100");
+}
+
+TEST(EvmAs, DupExpansion)
+{
+    auto eb = evm_as::latest();
+
+    eb.push(1).push(2).push(3).dup(2);
+    ASSERT_TRUE(evm_as::validate(eb));
+    ASSERT_TRUE(evm_as::Instruction::is_plain(eb[3]));
+    ASSERT_EQ(
+        evm_as::Instruction::as_plain(eb[3]).opcode, compiler::EvmOpCode::DUP2);
+
+    eb = evm_as::latest();
+    std::vector<compiler::EvmOpCode> dups = {
+        compiler::EvmOpCode::DUP1,
+        compiler::EvmOpCode::DUP2,
+        compiler::EvmOpCode::DUP3,
+        compiler::EvmOpCode::DUP4,
+        compiler::EvmOpCode::DUP5,
+        compiler::EvmOpCode::DUP6,
+        compiler::EvmOpCode::DUP7,
+        compiler::EvmOpCode::DUP8,
+        compiler::EvmOpCode::DUP9,
+        compiler::EvmOpCode::DUP10,
+        compiler::EvmOpCode::DUP11,
+        compiler::EvmOpCode::DUP12,
+        compiler::EvmOpCode::DUP13,
+        compiler::EvmOpCode::DUP14,
+        compiler::EvmOpCode::DUP15,
+        compiler::EvmOpCode::DUP16};
+    for (size_t i = 1; i <= 16; i++) {
+        eb.dup(i);
+    }
+    ASSERT_EQ(eb.size(), dups.size());
+    for (size_t i = 0; i < eb.size(); i++) {
+        ASSERT_TRUE(evm_as::Instruction::is_plain(eb[i]));
+        ASSERT_EQ(evm_as::Instruction::as_plain(eb[i]).opcode, dups[i]);
+    }
+
+    eb = evm_as::latest();
+    eb.dup(17);
+    ASSERT_EQ(eb.size(), 1);
+    ASSERT_TRUE(evm_as::Instruction::is_invalid(eb[0]));
+    ASSERT_TRUE(evm_as::Instruction::as_invalid(eb[0]).has_name());
+    ASSERT_EQ(evm_as::Instruction::as_invalid(eb[0]).name, "DUP17");
+}
+
+TEST(EvmAs, InvalidPush)
+{
+    auto eb = evm_as::latest();
+
+    uint8_t i = 32;
+    do {
+        eb.push(++i, 123);
+    }
+    while (i < std::numeric_limits<uint8_t>::max());
+
+    std::vector<evm_as::ValidationError> errors{};
+    ASSERT_FALSE(evm_as::validate(eb, errors));
+    ASSERT_EQ(errors.size(), 223);
+
+    ASSERT_EQ(eb.size(), 223);
+    for (auto const &ins : eb) {
+        ASSERT_TRUE(evm_as::Instruction::is_invalid(ins));
+    }
+}
+
+TEST(EvmAs, PushLabels)
+{
+    using namespace kinet::vm::utils::evm_as;
+    auto eb = evm_as::latest();
+
+    eb.push(".FOO").push("bar").push("");
+    ASSERT_EQ(eb.size(), 3);
+
+    ASSERT_TRUE(Instruction::is_push_label(eb[0]));
+    ASSERT_EQ(Instruction::as_push_label(eb[0]).label, ".FOO");
+
+    ASSERT_TRUE(Instruction::is_push_label(eb[1]));
+    ASSERT_EQ(Instruction::as_push_label(eb[1]).label, "bar");
+
+    ASSERT_TRUE(Instruction::is_push_label(eb[2]));
+    ASSERT_EQ(Instruction::as_push_label(eb[2]).label, "");
+
+    std::vector<evm_as::ValidationError> errors{};
+    ASSERT_FALSE(evm_as::validate(eb, errors));
+    ASSERT_EQ(errors.size(), 4);
+    ASSERT_EQ(errors[0].offset, 2);
+    ASSERT_EQ(errors[0].msg, "Empty label");
+    for (size_t i = 1; i < errors.size(); i++) {
+        ASSERT_TRUE(errors[i].msg.rfind("Undefined label", 0) == 0);
+    }
+}
+
+TEST(EvmAs, DuplicatedLabels)
+{
+    auto eb = evm_as::latest();
+
+    eb.jumpdest(".FOO").jumpdest(".BAR").jumpdest(".FOO");
+    std::vector<evm_as::ValidationError> errors{};
+    ASSERT_FALSE(evm_as::validate(eb, errors));
+    ASSERT_EQ(errors.size(), 1);
+
+    ASSERT_EQ(errors[0].offset, 2);
+    ASSERT_TRUE(errors[0].msg.rfind("Multiply defined label", 0) == 0);
+}
+
+TEST(EvmAs, LabelResolution)
+{
+    using namespace kinet::vm::utils::evm_as;
+    auto eb = evm_as::latest();
+
+    eb.jumpdest(".FOO").jump(".FOO");
+    ASSERT_EQ(eb.size(), 3);
+    ASSERT_TRUE(Instruction::is_jumpdest(eb[0]));
+    ASSERT_TRUE(Instruction::is_push_label(eb[1]));
+    ASSERT_TRUE(Instruction::is_plain(eb[2]));
+    ASSERT_EQ(Instruction::as_plain(eb[2]).opcode, compiler::EvmOpCode::JUMP);
+    ASSERT_TRUE(evm_as::validate(eb));
+    auto const label_offsets = resolve_labels(eb);
+    auto const &it = label_offsets.find(".FOO");
+    ASSERT_TRUE(it != label_offsets.end());
+    ASSERT_EQ(it->second, 0);
+}
+
+TEST(EvmAs, LabelResolution2)
+{
+    using namespace kinet::vm::utils::evm_as;
+    auto eb = evm_as::latest();
+
+    eb.jump(".END");
+    for (size_t i = 0; i < 256; i++) {
+        eb.push0();
+    }
+    eb.jumpdest(".END");
+    ASSERT_EQ(eb.size(), 259);
+    ASSERT_TRUE(Instruction::is_push_label(eb[0]));
+    auto const label_offsets = resolve_labels(eb);
+    auto const &it = label_offsets.find(".END");
+    ASSERT_TRUE(it != label_offsets.end());
+    ASSERT_EQ(it->second, 260);
+    ASSERT_TRUE(evm_as::validate(eb));
+}
+
+TEST(EvmAs, UndefinedLabels)
+{
+    auto eb = evm_as::latest();
+
+    eb.jump("END");
+    std::vector<evm_as::ValidationError> errors{};
+    ASSERT_FALSE(evm_as::validate(eb, errors));
+    ASSERT_EQ(errors.size(), 1);
+    ASSERT_EQ(errors[0].msg, "Undefined label 'END'");
+}
+
+TEST(EvmAs, ComposeIdentity)
+{
+    auto eb1 = evm_as::latest();
+    auto empty = evm_as::latest();
+
+    eb1.push0();
+
+    auto eb2 = eb1.compose(empty);
+    ASSERT_EQ(empty.size(), 0);
+    ASSERT_EQ(eb1.size(), eb2.size());
+    eb2.push0();
+    ASSERT_EQ(eb1.size() + 1, eb2.size());
+
+    eb2 = empty.compose(eb1);
+    ASSERT_EQ(empty.size(), 0);
+    ASSERT_EQ(eb1.size(), eb2.size());
+    eb2.push0();
+    ASSERT_EQ(eb1.size() + 1, eb2.size());
+}
+
+TEST(EvmAs, Compose1)
+{
+    auto const check = [](size_t offset, size_t expected_size) -> auto {
+        return [=](auto const &eb) -> void {
+            using namespace kinet::vm::utils::evm_as;
+            ASSERT_EQ(eb.size(), expected_size);
+            for (size_t i = 0; i < eb.size(); i++) {
+                ASSERT_TRUE(Instruction::is_push(eb[i]));
+                ASSERT_EQ(
+                    Instruction::as_push(eb[i]).imm, uint256_t{i + 1 + offset});
+            }
+        };
+    };
+
+    auto eb1 = evm_as::latest();
+    auto eb2 = evm_as::latest();
+
+    eb1.push(1).push(2);
+    ASSERT_TRUE(evm_as::validate(eb1));
+
+    eb2.push(3).push(4);
+    ASSERT_TRUE(evm_as::validate(eb2));
+
+    auto eb3 = eb1.compose(eb2);
+    ASSERT_TRUE(evm_as::validate(eb3));
+
+    check(0, 2)(eb1);
+    check(2, 2)(eb2);
+    check(0, 4)(eb3);
+
+    ASSERT_TRUE(evm_as::validate(eb1));
+    ASSERT_TRUE(evm_as::validate(eb2));
+    ASSERT_TRUE(evm_as::validate(eb3));
+}
+
+TEST(EvmAs, Compose2)
+{
+
+    auto eb1 = evm_as::latest();
+    auto eb2 = evm_as::latest();
+
+    eb1.jump(".END");
+    ASSERT_FALSE(evm_as::validate(eb1));
+
+    eb2.jumpdest(".END");
+    ASSERT_TRUE(evm_as::validate(eb2));
+
+    auto eb3 = eb1.compose(eb2);
+    ASSERT_FALSE(evm_as::validate(eb1));
+    ASSERT_TRUE(evm_as::validate(eb2));
+    ASSERT_TRUE(evm_as::validate(eb3));
+}
+
+TEST(EvmAs, Append1)
+{
+
+    auto eb1 = evm_as::latest();
+    auto eb2 = evm_as::latest();
+
+    eb1.jump(".END");
+    ASSERT_FALSE(evm_as::validate(eb1));
+
+    eb2.jumpdest(".END");
+    ASSERT_TRUE(evm_as::validate(eb2));
+
+    eb1.append(eb2);
+    ASSERT_TRUE(evm_as::validate(eb1));
+    ASSERT_TRUE(evm_as::validate(eb2));
+}
+
+TEST(EvmAs, BytecodeCompile1)
+{
+    auto eb = evm_as::latest();
+
+    std::vector<uint8_t> expected{
+        compiler::EvmOpCode::PUSH32,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF};
+    ASSERT_TRUE(evm_as::validate(eb.spush(-1)));
+    std::vector<uint8_t> bytecode{};
+    evm_as::compile(eb, bytecode);
+    ASSERT_EQ(bytecode.size(), expected.size());
+    for (size_t i = 0; i < bytecode.size(); i++) {
+        ASSERT_EQ(bytecode[i], expected[i]);
+    }
+
+    expected = {
+        compiler::EvmOpCode::PUSH32,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x02,
+        0x4C,
+        0xB0,
+        0x16,
+        0xEA};
+
+    eb = evm_as::latest();
+    ASSERT_TRUE(evm_as::validate(eb.push(32, 9876543210)));
+    bytecode.clear();
+    evm_as::compile(eb, bytecode);
+    ASSERT_EQ(bytecode.size(), expected.size());
+    for (size_t i = 0; i < bytecode.size(); i++) {
+        ASSERT_EQ(bytecode[i], expected[i]);
+    }
+
+    expected = {compiler::EvmOpCode::PUSH5, 0x02, 0x4C, 0xB0, 0x16, 0xEA};
+
+    eb = evm_as::latest();
+    ASSERT_TRUE(evm_as::validate(eb.push(9876543210)));
+    bytecode.clear();
+    evm_as::compile(eb, bytecode);
+    ASSERT_EQ(bytecode.size(), expected.size());
+    for (size_t i = 0; i < bytecode.size(); i++) {
+        ASSERT_EQ(bytecode[i], expected[i]);
+    }
+}
+
+TEST(EvmAs, BytecodeCompile2)
+{
+    auto eb = evm_as::latest();
+
+    std::vector<uint8_t> expected = {
+        compiler::EvmOpCode::PUSH2, 0x01, 0x04, compiler::EvmOpCode::JUMP};
+    for (size_t i = 0; i < 256; i++) {
+        expected.push_back(compiler::EvmOpCode::PUSH0);
+    }
+    expected.push_back(compiler::EvmOpCode::JUMPDEST);
+    ASSERT_EQ(expected.size(), 261);
+
+    eb.jump(".END");
+    for (size_t i = 0; i < 256; i++) {
+        eb.push0();
+    }
+    eb.jumpdest(".END");
+    ASSERT_EQ(eb.size(), 259);
+    ASSERT_TRUE(evm_as::validate(eb));
+    std::vector<uint8_t> bytecode{};
+    evm_as::compile(eb, bytecode);
+    ASSERT_EQ(bytecode.size(), expected.size());
+    for (size_t i = 0; i < bytecode.size(); i++) {
+        ASSERT_EQ(bytecode[i], expected[i]);
+    }
+}
+
+TEST(EvmAs, BytecodeCompile3)
+{
+    auto eb = evm_as::latest();
+
+    std::vector<uint8_t> expected = {compiler::EvmOpCode::JUMPDEST};
+    for (size_t i = 0; i < 300; i++) {
+        expected.push_back(compiler::EvmOpCode::PUSH0);
+    }
+    expected.push_back(compiler::EvmOpCode::PUSH0);
+    expected.push_back(compiler::EvmOpCode::JUMP);
+    ASSERT_EQ(expected.size(), 303);
+
+    eb.jumpdest(".END");
+    for (size_t i = 0; i < 300; i++) {
+        eb.push0();
+    }
+    eb.jump(".END");
+    ASSERT_EQ(eb.size(), 303);
+    ASSERT_TRUE(evm_as::validate(eb));
+    std::vector<uint8_t> bytecode{};
+    evm_as::compile(eb, bytecode);
+    ASSERT_EQ(bytecode.size(), expected.size());
+    for (size_t i = 0; i < bytecode.size(); i++) {
+        ASSERT_EQ(bytecode[i], expected[i]);
+    }
+}
+
+TEST(EvmAs, PushLabelZeroOffsetPreShanghai)
+{
+    auto eb = evm_as::paris();
+
+    eb.jumpdest(".START").jump(".START");
+    ASSERT_TRUE(evm_as::validate(eb));
+
+    auto const label_offsets = resolve_labels(eb);
+    ASSERT_EQ(label_offsets.find(".START")->second, 0);
+
+    std::vector<uint8_t> const expected = {
+        compiler::EvmOpCode::JUMPDEST,
+        compiler::EvmOpCode::PUSH1,
+        0x00,
+        compiler::EvmOpCode::JUMP};
+
+    std::vector<uint8_t> bytecode;
+    evm_as::compile(eb, bytecode);
+    ASSERT_EQ(bytecode, expected);
+
+    std::string const expected_mnemonic = "JUMPDEST\nPUSH1 0x00\nJUMP\n";
+    ASSERT_EQ(
+        evm_as::mcompile(eb, evm_as::mnemonic_config{true, false, 32}),
+        expected_mnemonic);
+}
+
+TEST(EvmAs, BytecodeCompile4)
+{
+    auto eb = evm_as::latest();
+
+    std::string expected = "\x5F\x5F\x01";
+    ASSERT_EQ(expected.size(), 3);
+
+    eb.push0().push0().add();
+    ASSERT_EQ(eb.size(), 3);
+    ASSERT_TRUE(evm_as::validate(eb));
+
+    std::string bytecode = evm_as::compile(eb);
+    ASSERT_EQ(bytecode.size(), expected.size());
+    for (size_t i = 0; i < bytecode.size(); i++) {
+        ASSERT_EQ(bytecode[i], expected[i]);
+    }
+}
+
+TEST(EvmAs, Execution1)
+{
+    auto eb = evm_as::latest();
+    uint256_t const expected = 0x42;
+
+    // The default program on evm.codes/playground (as of May 2025).
+    eb.push(1, 0x42).push(1, 0).mstore().push(1, 0x20).push(1, 0).return_();
+
+    ASSERT_TRUE(evm_as::validate(eb));
+
+    uint256_t const result = jit::run(eb);
+    ASSERT_EQ(result, expected);
+}
+
+TEST(EvmAs, Execution2)
+{
+    auto eb = evm_as::latest();
+    uint256_t const expected = 0x0A;
+
+    eb.spush(-10) // [-10]
+        .push0() // [0 -10]
+        .jumpdest(".r") // [0 -10]
+        .push(1) // [1 0 -10]
+        .add() // [(1 + 0) -10]
+        .swap1() // [-10 (1 + 0)]
+        .push(1) // [1 -10 (1 + 0)]
+        .add() // [9 (1 + 0)]
+        .dup1() // [9 9 (1 + 0)]
+        .swap2() // [(1 + 0) 9 9]
+        .swap1() // [9 (1 + 0) 9]
+        .jumpi(".r") // [.r 9 (1 + 0) 9]
+        .push0() // [0 (1 + 0) 0]
+        .mstore() // [0]
+        .push(32) // [32 0]
+        .push0() // [0 32 0]
+        .return_(); // [0]
+
+    ASSERT_TRUE(evm_as::validate(eb));
+
+    uint256_t const result = jit::run(eb);
+    ASSERT_EQ(result, expected);
+}
+
+TEST(EvmAs, Execution3)
+{
+    auto eb = evm_as::latest();
+    uint256_t const expected = 0xC0FFEEC0FFEE;
+
+    eb.jump("END").push(0xBADBADBADBAD).push0().mstore();
+
+    for (uint32_t i = 0; i < std::numeric_limits<uint16_t>::max(); i++) {
+        eb.push0().pop();
+    }
+
+    eb.push(32)
+        .push0()
+        .return_()
+        .jumpdest("END")
+        .push(expected)
+        .push0()
+        .mstore()
+        .push(32)
+        .push0()
+        .return_();
+
+    ASSERT_TRUE(evm_as::validate(eb));
+
+    uint256_t const result = jit::run(eb);
+    ASSERT_EQ(result, expected);
+}
+
+TEST(EvmAs, Execution4)
+{
+    auto eb = evm_as::latest();
+    uint256_t const expected = 0xABBA;
+
+    eb.push0() // dummy value
+        .jump("START")
+        .jumpdest("END")
+        .push(1)
+        .add()
+        .push0()
+        .mstore()
+        .push(32)
+        .push(0)
+        .return_();
+
+    for (uint32_t i = 0; i < std::numeric_limits<uint16_t>::max(); i++) {
+        eb.push0().pop();
+    }
+
+    eb.jumpdest("START").push(0xABB9).jump("END").stop();
+
+    ASSERT_TRUE(evm_as::validate(eb));
+
+    uint256_t const result = jit::run(eb);
+    ASSERT_EQ(result, expected);
+}
+
+TEST(EvmAs, MnemonicCompile1)
+{
+    auto eb = evm_as::latest();
+
+    std::string const expected =
+        "// Add 1 + 511.\nPUSH1 0x1\nPUSH2 0x1FF\nADD\n";
+
+    eb.comment("Add 1 + 511.").push(1).push(511).add();
+    ASSERT_TRUE(evm_as::validate(eb));
+    ASSERT_EQ(evm_as::mcompile(eb), expected);
+}
+
+TEST(EvmAs, MnemonicCompile2)
+{
+    auto eb = evm_as::latest();
+
+    std::string const expected =
+        "// Add 1 + 511.\n// Another comment.\n// Yet "
+        "another comment.\nPUSH1 0x1\nPUSH2 0x1FF\nADD\n";
+
+    eb.comment("Add 1 + 511.\nAnother comment.\nYet another comment.")
+        .push(1)
+        .push(511)
+        .add();
+    ASSERT_TRUE(evm_as::validate(eb));
+    ASSERT_EQ(evm_as::mcompile(eb), expected);
+}
+
+TEST(EvmAs, MnemonicCompile3)
+{
+    auto eb = evm_as::latest();
+
+    std::string expected =
+        "// Infinite loop\nJUMPDEST .LOOP\nPUSH .LOOP\nJUMP\n";
+
+    eb.comment("Infinite loop").jumpdest(".LOOP").jump(".LOOP");
+    ASSERT_TRUE(evm_as::validate(eb));
+    ASSERT_EQ(evm_as::mcompile(eb), expected);
+
+    expected = "// Infinite loop (unlabelled)\nJUMPDEST\nPUSH0\nJUMP\n";
+
+    eb = evm_as::latest();
+    eb.comment("Infinite loop (unlabelled)").jumpdest().push0().jump();
+    ASSERT_TRUE(evm_as::validate(eb));
+    ASSERT_EQ(evm_as::mcompile(eb), expected);
+}
+
+TEST(EvmAs, EmptyComment)
+{
+    auto eb = evm_as::latest();
+
+    ASSERT_TRUE(evm_as::validate(eb));
+    ASSERT_EQ(evm_as::mcompile(eb), "");
+
+    eb.comment("");
+    ASSERT_TRUE(evm_as::validate(eb));
+    ASSERT_EQ(evm_as::mcompile(eb), "//\n");
+}
+
+TEST(EvmAs, StackUnderflow)
+{
+    auto eb = evm_as::latest();
+
+    std::vector<evm_as::ValidationError> errors{};
+    ASSERT_FALSE(evm_as::validate(eb.add(), errors));
+    ASSERT_EQ(errors.size(), 1);
+    ASSERT_EQ(errors[0].msg, "Stack underflow");
+}
+
+TEST(EvmAs, StackOverflow)
+{
+    auto eb = evm_as::latest();
+
+    for (size_t i = 0; i < 1025; i++) {
+        eb.push0();
+    }
+
+    std::vector<evm_as::ValidationError> errors{};
+    ASSERT_FALSE(evm_as::validate(eb, errors));
+    ASSERT_EQ(errors.size(), 1);
+    ASSERT_EQ(errors[0].msg, "Stack overflow");
+}
+
+TEST(EvmAs, StackOk)
+{
+    auto eb = evm_as::latest();
+
+    for (size_t i = 0; i < 1025; i++) {
+        eb.push0().pop();
+    }
+
+    ASSERT_TRUE(evm_as::validate(eb));
+}
+
+TEST(EvmAs, lookup)
+{
+    auto eb = evm_as::latest();
+    auto const info = evm_as::latest().lookup(compiler::EvmOpCode::ADD);
+    ASSERT_EQ(info.name, "ADD");
+}
+
+TEST(EvmAs, Legacy)
+{
+    auto eb = evm_as::earliest();
+    std::vector<evm_as::ValidationError> errors{};
+    eb.push0();
+    ASSERT_FALSE(evm_as::validate(eb, errors));
+    ASSERT_EQ(errors.size(), 1);
+    ASSERT_EQ(errors[0].msg, "Invalid instruction '0x5F'");
+
+    eb = evm_as::earliest();
+    eb.push(0);
+    ASSERT_TRUE(evm_as::validate(eb));
+
+    auto eb2 = evm_as::shanghai();
+    eb2.push0();
+    ASSERT_TRUE(evm_as::validate(eb2));
+
+    eb2 = evm_as::shanghai();
+    eb2.push(0);
+    ASSERT_TRUE(evm_as::validate(eb2));
+    ASSERT_EQ(eb2.size(), 1);
+    ASSERT_TRUE(evm_as::Instruction::is_plain(eb2[0]));
+    ASSERT_EQ(
+        evm_as::Instruction::as_plain(eb2[0]).opcode,
+        compiler::EvmOpCode::PUSH0);
+}
+
+TEST(EvmAs, ValidationSlack)
+{
+    // This test illustrates some of the slack of the simple validator.
+    auto eb = evm_as::latest();
+
+    eb.jump("setup")
+        .jumpdest("main")
+        .pop()
+        .stop()
+        .jumpdest("setup")
+        .push0()
+        .jump("main");
+
+    std::vector<evm_as::ValidationError> errors{};
+    ASSERT_FALSE(evm_as::validate(eb, errors));
+    ASSERT_EQ(errors.size(), 1);
+    ASSERT_EQ(errors[0].msg, "Stack underflow");
+    ASSERT_EQ(errors[0].offset, 3);
+}
+
+static evm_as::mnemonic_config mconfig{false, true, 12};
+
+TEST(EvmAs, Annotation1)
+{
+    auto eb = evm_as::latest();
+
+    std::string const expected = "PUSH1 0x1   // [1]\n"
+                                 "PUSH1 0x3F  // [63, 1]\n"
+                                 "ADD         // [(63 + 1)]\n";
+
+    eb.push(1).push(63).add();
+    ASSERT_EQ(evm_as::mcompile(eb, mconfig), expected);
+}
+
+TEST(EvmAs, Annotation2)
+{
+    auto eb = evm_as::latest();
+
+    uint32_t u32max = std::numeric_limits<uint32_t>::max();
+
+    std::string expected = std::format(
+        "PUSH4 0x{:X} // [{}]\n"
+        "PUSH1 0x1   // [1, {}]\n"
+        "ADD         // [(1 + 4294967295)]\n",
+        u32max,
+        u32max,
+        u32max);
+
+    eb.push(u32max).push(1).add();
+    ASSERT_EQ(evm_as::mcompile(eb, mconfig), expected);
+
+    // "Large" inputs get named.
+    expected = std::format(
+        "PUSH5 0x{:X} // [X0]\n"
+        "PUSH1 0x1   // [1, X0]\n"
+        "ADD         // [(1 + X0)]\n",
+        static_cast<uint64_t>(u32max) + 1);
+
+    eb = evm_as::latest();
+    eb.push(static_cast<uint64_t>(u32max) + 1).push(1).add();
+    ASSERT_EQ(evm_as::mcompile(eb, mconfig), expected);
+}
+
+TEST(EvmAs, Annotation3)
+{
+    auto eb = evm_as::latest();
+
+    std::string const expected = "PUSH0       // [0]\n"
+                                 "PUSH1 0x1   // [1, 0]\n"
+                                 "PUSH1 0x2   // [2, 1, 0]\n"
+                                 "PUSH1 0x3   // [3, 2, 1, 0]\n"
+                                 "PUSH1 0x4   // [4, 3, 2, 1, 0]\n"
+                                 "PUSH1 0x5   // [5, 4, 3, 2, 1, 0]\n"
+                                 "PUSH1 0x6   // [6, 5, 4, 3, 2, 1, 0]\n"
+                                 "PUSH1 0x7   // [7, 6, 5, 4, 3, 2, 1, 0]\n"
+                                 "PUSH1 0x8   // [8, 7, 6, 5, 4, 3, ..., 0]\n";
+
+    eb.push0().push(1).push(2).push(3).push(4).push(5).push(6).push(7).push(8);
+    ASSERT_EQ(evm_as::mcompile(eb, mconfig), expected);
+}
+
+TEST(EvmAs, Annotation4)
+{
+    auto eb = evm_as::latest();
+
+    size_t large =
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max()) + 1;
+
+    std::string const expected = std::format(
+        "PUSH5 0x{:X} // [X0]\n"
+        "PUSH5 0x{:X} // [Y0, X0]\n"
+        "PUSH5 0x{:X} // [Z0, Y0, X0]\n"
+        "PUSH5 0x{:X} // [A0, Z0, Y0, X0]\n"
+        "PUSH5 0x{:X} // [B0, A0, Z0, Y0, X0]\n"
+        "PUSH5 0x{:X} // [C0, B0, A0, Z0, Y0, X0]\n"
+        "PUSH5 0x{:X} // [X1, C0, B0, A0, Z0, Y0, X0]\n",
+        large,
+        large,
+        large,
+        large,
+        large,
+        large,
+        large);
+
+    for (size_t i = 0; i < 7; i++) {
+        eb.push(large);
+    }
+    ASSERT_EQ(evm_as::mcompile(eb, mconfig), expected);
+}
+
+TEST(EvmAs, Annotation5)
+{
+    auto eb = evm_as::latest();
+
+    size_t large =
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max()) + 1;
+
+    std::string const expected_last_line = std::format(
+        "PUSH5 0x{:X} // [X100, C99, B99, A99, Z99, Y99, ..., X0]", large);
+
+    for (size_t i = 0; i < 601; i++) {
+        eb.push(large);
+    }
+
+    std::stringstream output(evm_as::mcompile(eb, mconfig));
+    std::string line;
+    std::vector<std::string> lines;
+
+    while (std::getline(output, line, '\n')) {
+        lines.push_back(line);
+    }
+    ASSERT_TRUE(lines.size() > 0);
+    ASSERT_EQ(lines[lines.size() - 1], expected_last_line);
+}
+
+TEST(EvmAs, Annotation6)
+{
+    auto eb = evm_as::latest();
+
+    std::string expected = std::format(
+        "PUSH1 0x{:X}  // [123]\n"
+        "DUP1        // [123, 123]\n",
+        123);
+
+    eb.push(123).dup1();
+    ASSERT_EQ(evm_as::mcompile(eb, mconfig), expected);
+
+    expected = std::format(
+        "PUSH1 0x{:X}   // [1]\n"
+        "PUSH1 0x{:X}   // [2, 1]\n"
+        "PUSH1 0x{:X}   // [3, 2, 1]\n"
+        "DUP3        // [1, 3, 2, 1]\n",
+        1,
+        2,
+        3);
+    eb = evm_as::latest();
+    eb.push(1).push(2).push(3).dup3();
+    ASSERT_EQ(evm_as::mcompile(eb, mconfig), expected);
+}
+
+TEST(EvmAs, Annotation7)
+{
+    auto eb = evm_as::latest();
+
+    std::string expected = std::format(
+        "PUSH1 0x{:X}   // [1]\n"
+        "PUSH1 0x{:X}   // [2, 1]\n"
+        "SWAP1       // [1, 2]\n",
+        1,
+        2);
+
+    eb.push(1).push(2).swap1();
+    ASSERT_EQ(evm_as::mcompile(eb, mconfig), expected);
+
+    expected = std::format(
+        "PUSH1 0x{:X}   // [1]\n"
+        "PUSH1 0x{:X}   // [2, 1]\n"
+        "PUSH1 0x{:X}   // [3, 2, 1]\n"
+        "SWAP2       // [1, 2, 3]\n",
+        1,
+        2,
+        3);
+    eb = evm_as::latest();
+    eb.push(1).push(2).push(3).swap2();
+    ASSERT_EQ(evm_as::mcompile(eb, mconfig), expected);
+}
+
+TEST(EvmAs, KernelBuilderRepetitionCount)
+{
+    using traits = EvmTraits<KINET_ETH_PRAGUE>;
+    using KB = evm_as::KernelBuilder<traits>;
+
+    auto seq = [&](size_t args_size, bool has_output) {
+        KB s;
+        for (size_t i = 0; i < args_size; ++i) {
+            s.pop();
+        }
+        if (has_output) {
+            s.push0();
+        }
+        s.push(KB::free_memory_start).mload(); // [n]
+        s.push(1).add(); // [n + 1]
+        s.push(KB::free_memory_start).mstore(); // []
+        return s;
+    };
+
+    auto run = [&](size_t args_size,
+                   KB const &kb,
+                   test::KernelCalldata const &calldata) {
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(kb, bytecode);
+
+        interpreter::Intercode icode{bytecode};
+
+        auto stack_memory = test_stack_memory();
+        auto ctx = test_context();
+        ctx->env.input_data = calldata.data();
+        ctx->env.input_data_size = static_cast<uint32_t>(calldata.size());
+
+        interpreter::execute<traits>(*ctx, icode, stack_memory.get());
+
+        ASSERT_EQ(ctx->result.status, runtime::StatusCode::Success);
+        ASSERT_EQ(
+            load_le<uint256_t>(ctx->result.size), KB::resulting_memory_size);
+        ASSERT_EQ(
+            load_le<uint256_t>(ctx->result.offset), KB::free_memory_start);
+
+        auto const n =
+            load_be_unsafe<uint256_t>(&ctx->memory.data[KB::free_memory_start]);
+        ASSERT_EQ(
+            n, KB::get_sequence_repetition_count(args_size, calldata.size()));
+    };
+
+    for (size_t args_size = 0; args_size <= 10; ++args_size) {
+        auto const base_calldata = kernel_base_calldata(args_size);
+        auto const tp_calldata =
+            test::to_throughput_calldata<traits>(args_size, base_calldata);
+        for (bool has_output : {false, true}) {
+            auto const &s = seq(args_size, has_output);
+            run(args_size,
+                KB{}.throughput(s, args_size, has_output),
+                tp_calldata);
+        }
+        if (args_size) {
+            auto const &s = seq(args_size, true);
+            auto const calldata =
+                test::to_latency_calldata(s, args_size, tp_calldata);
+            run(args_size, KB{}.latency(s, args_size), calldata);
+        }
+    }
+}
+
+TEST(EvmAs, KernelBuilderCalldata)
+{
+    using traits = EvmTraits<KINET_ETH_PRAGUE>;
+    using KB = evm_as::KernelBuilder<traits>;
+
+    KB post_seq;
+    post_seq.jumpdest("invalid-input");
+    post_seq.stop();
+
+    auto output_seq = [&](size_t args_size, bool has_output) {
+        KB s;
+        // [arg(1), arg(2), ..., arg(n)]
+        for (size_t i = 1; i < args_size; ++i) {
+            s.xor_();
+        }
+        // [XOR]
+        if (args_size) {
+            if (!has_output) {
+                s.pop();
+                // []
+            }
+        }
+        else if (has_output) {
+            s.push0();
+        }
+        return s;
+    };
+
+    auto seq = [&](size_t args_size, bool has_output) {
+        KB s;
+        // [arg(1), arg(2), ..., arg(n)]
+        for (size_t i = 0; i < args_size; ++i) {
+            s.dup(args_size);
+        }
+        // [arg(1), ..., arg(n), arg(1), ..., arg(n)]
+        s.push(KB::free_memory_start).mload();
+        // [i, arg(1), ..., arg(n), arg(1), ..., arg(n)]
+        for (size_t i = 0; i < args_size; ++i) {
+            // [i, arg(i), arg(i+1), ..., arg(n), arg(1), ..., arg(n)]
+            s.push(1).add();
+            // [i + 1, arg(i), arg(i+1), ..., arg(n), arg(1), ..., arg(n)]
+            s.dup1();
+            // [i + 1, i + 1, arg(i), arg(i+1), ..., arg(n), arg(1), ...,
+            // arg(n)]
+            s.swap2();
+            // [arg(i), i + 1, i + 1, arg(i+1), ..., arg(n), arg(1), ...,
+            // arg(n)]
+            s.eq();
+            // [arg(i) == i + 1, i + 1, arg(i+1), ..., arg(n), arg(1), ...,
+            // arg(n)]
+            s.iszero();
+            // [arg(i) != i + 1, i + 1, arg(i+1), ..., arg(n), arg(1), ...,
+            // arg(n)]
+            s.jumpi("invalid-input");
+        }
+        // [i', arg(1), ..., arg(n)]
+        s.push(KB::free_memory_start).mstore();
+        // [arg(1), ..., arg(n)]
+        s.append(output_seq(args_size, has_output));
+        return s;
+    };
+
+    auto run = [&](KB const &kb, test::KernelCalldata const &calldata) {
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(kb, bytecode);
+
+        interpreter::Intercode icode{bytecode};
+
+        auto stack_memory = test_stack_memory();
+        auto ctx = test_context();
+        ctx->env.input_data = calldata.data();
+        ctx->env.input_data_size = static_cast<uint32_t>(calldata.size());
+
+        interpreter::execute<traits>(*ctx, icode, stack_memory.get());
+
+        ASSERT_EQ(ctx->result.status, runtime::StatusCode::Success);
+        ASSERT_EQ(
+            load_le<uint256_t>(ctx->result.size), KB::resulting_memory_size);
+        ASSERT_EQ(
+            load_le<uint256_t>(ctx->result.offset), KB::free_memory_start);
+    };
+
+    for (size_t args_size = 0; args_size <= 10; ++args_size) {
+        auto const base_calldata = kernel_base_calldata(args_size);
+        auto const tp_calldata =
+            test::to_throughput_calldata<traits>(args_size, base_calldata);
+        for (bool has_output : {false, true}) {
+            auto const &s = seq(args_size, has_output);
+            KB kb;
+            kb.throughput(s, args_size, has_output);
+            kb.append(post_seq);
+            run(kb, tp_calldata);
+        }
+        if (args_size) {
+            auto const &os = output_seq(args_size, true);
+            auto const calldata =
+                test::to_latency_calldata(os, args_size, tp_calldata);
+            auto const &s = seq(args_size, true);
+            KB kb;
+            kb.latency(s, args_size);
+            kb.append(post_seq);
+            run(kb, calldata);
+        }
+    }
+}
+
+TEST(EvmAs, PushAddress)
+{
+    // 1 byte address
+    {
+        auto eb = evm_as::latest();
+        eb.push(Address{0xBC});
+        EXPECT_TRUE(evm_as::validate(eb));
+
+        std::vector<uint8_t> expected{compiler::EvmOpCode::PUSH1, 0xBC};
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(eb, bytecode);
+        EXPECT_EQ(bytecode, expected);
+
+        std::string const expected_mnemonic = "PUSH1 0xBC\n";
+        EXPECT_EQ(evm_as::mcompile(eb), expected_mnemonic);
+    }
+
+    // 2 byte address
+    {
+        auto eb = evm_as::latest();
+        eb.push(Address{0xABBA});
+        EXPECT_TRUE(evm_as::validate(eb));
+
+        std::vector<uint8_t> expected{compiler::EvmOpCode::PUSH2, 0xAB, 0xBA};
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(eb, bytecode);
+        EXPECT_EQ(bytecode, expected);
+
+        std::string const expected_mnemonic = "PUSH2 0xABBA\n";
+        EXPECT_EQ(evm_as::mcompile(eb), expected_mnemonic);
+    }
+
+    // 13 byte address
+    {
+        using namespace kinet::literals;
+        auto eb = evm_as::latest();
+        eb.push(0x0123456789ABCDEF0123456789_address);
+        EXPECT_TRUE(evm_as::validate(eb));
+
+        std::vector<uint8_t> expected{
+            compiler::EvmOpCode::PUSH13,
+            0x01,
+            0x23,
+            0x45,
+            0x67,
+            0x89,
+            0xAB,
+            0xCD,
+            0xEF,
+            0x01,
+            0x23,
+            0x45,
+            0x67,
+            0x89};
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(eb, bytecode);
+        EXPECT_EQ(bytecode, expected);
+
+        std::string const expected_mnemonic =
+            "PUSH13 0x0123456789ABCDEF0123456789\n";
+        EXPECT_EQ(evm_as::mcompile(eb), expected_mnemonic);
+    }
+
+    // 20 byte address
+    {
+        using namespace kinet::literals;
+        auto eb = evm_as::latest();
+        eb.push(0xaaaf5374fce5edbc8e2a8697c15331677e6ebf0b_address);
+        EXPECT_TRUE(evm_as::validate(eb));
+
+        std::vector<uint8_t> expected{
+            compiler::EvmOpCode::PUSH20,
+            0xAA,
+            0xAF,
+            0x53,
+            0x74,
+            0xFC,
+            0xE5,
+            0xED,
+            0xBC,
+            0x8E,
+            0x2A,
+            0x86,
+            0x97,
+            0xC1,
+            0x53,
+            0x31,
+            0x67,
+            0x7E,
+            0x6E,
+            0xBF,
+            0x0B};
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(eb, bytecode);
+        EXPECT_EQ(bytecode, expected);
+
+        std::string const expected_mnemonic =
+            "PUSH20 0xAAAF5374FCE5EDBC8E2A8697C15331677E6EBF0B\n";
+        EXPECT_EQ(evm_as::mcompile(eb), expected_mnemonic);
+    }
+
+    // System address
+    {
+        auto eb = evm_as::latest();
+        eb.push(Address{});
+        EXPECT_TRUE(evm_as::validate(eb));
+
+        std::vector<uint8_t> expected{compiler::EvmOpCode::PUSH0};
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(eb, bytecode);
+        EXPECT_EQ(bytecode, expected);
+
+        std::string const expected_mnemonic = "PUSH0\n";
+        EXPECT_EQ(evm_as::mcompile(eb), expected_mnemonic);
+    }
+
+    // System address, special case rev < SHANGHAI
+    {
+        auto eb = evm_as::paris();
+        eb.push(Address{});
+        EXPECT_TRUE(evm_as::validate(eb));
+
+        std::vector<uint8_t> expected{compiler::EvmOpCode::PUSH1, 0x0};
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(eb, bytecode);
+        EXPECT_EQ(bytecode, expected);
+
+        std::string const expected_mnemonic = "PUSH1 0x0\n";
+        EXPECT_EQ(evm_as::mcompile(eb), expected_mnemonic);
+    }
+}
+
+TEST(EvmAs, PushAddressLabelResolution)
+{
+    {
+        auto eb = evm_as::latest();
+        eb.push(Address{0}).jump("LABEL").jumpdest("LABEL");
+        EXPECT_TRUE(evm_as::validate(eb));
+
+        std::vector<uint8_t> expected{
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH1,
+            0x4, // offset of the jump destination
+            compiler::EvmOpCode::JUMP,
+            compiler::EvmOpCode::JUMPDEST};
+
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(eb, bytecode);
+        EXPECT_EQ(bytecode, expected);
+    }
+
+    {
+        auto eb = evm_as::latest();
+        eb.push(Address{0xDEADC0DE}).jump("LABEL").jumpdest("LABEL");
+        EXPECT_TRUE(evm_as::validate(eb));
+
+        std::vector<uint8_t> expected{
+            compiler::EvmOpCode::PUSH4,
+            0xDE,
+            0xAD,
+            0xC0,
+            0xDE,
+            compiler::EvmOpCode::PUSH1,
+            0x8, // offset of the jump destination
+            compiler::EvmOpCode::JUMP,
+            compiler::EvmOpCode::JUMPDEST};
+
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(eb, bytecode);
+        EXPECT_EQ(bytecode, expected);
+    }
+
+    {
+        static Address const addr{{0xaa, 0xaf, 0x53, 0x74, 0xfc, 0xe5, 0xed,
+                                   0xbc, 0x8e, 0x2a, 0x86, 0x97, 0xc1, 0x53,
+                                   0x31, 0x67, 0x7e, 0x6e, 0xbf, 0x0b}};
+        auto eb = evm_as::latest();
+        for (size_t i = 0; i < 999; i++) {
+            eb.push(addr); // 1 + 20 bytes
+        }
+        ASSERT_EQ(eb.size(), 999);
+        eb.jump("LABEL").jumpdest("LABEL");
+        EXPECT_TRUE(evm_as::validate(eb));
+
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(eb, bytecode);
+        ASSERT_EQ(
+            bytecode.size(),
+            21 * 999 + (1 + 2) + 1 +
+                1); // 999 pushes + push2 label + jump + jumpdest
+
+        // The jump destination is at the end of the bytecode, so the offset
+        // must be
+        // clang-format off
+        //    bytecode.size() - 1
+        // ==
+        //    (21 * 999 (1 + 2) + 1 + 1) - 1 
+        // ==
+        //    20983 
+        // == 
+        //    0x51F7
+        // clang-format on
+        EXPECT_EQ(bytecode[bytecode.size() - 5], 0x61); // PUSH2
+        EXPECT_EQ(
+            bytecode[bytecode.size() - 4],
+            0x51); // 0x51F7 is the offset of the jump destination
+        EXPECT_EQ(bytecode[bytecode.size() - 3], 0xF7);
+        EXPECT_EQ(bytecode[bytecode.size() - 2], 0x56); // JUMP
+        EXPECT_EQ(bytecode[bytecode.size() - 1], 0x5B); // JUMPDEST
+    }
+}
+
+TEST(EvmAs, CallMacroExpansions)
+{
+    // Call
+    {
+        auto eb1 = evm_as::latest();
+        eb1.call(
+            0x1000, Address{0xABBA}, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000);
+        EXPECT_TRUE(evm_as::validate(eb1));
+
+        auto eb2 = evm_as::latest();
+        eb2.push(0x7000) // returndata size
+            .push(0x6000) // returndata offset
+            .push(0x5000) // args size
+            .push(0x4000) // args offset
+            .push(0x3000) // value
+            .push(Address{0xabba}) // to address
+            .push(0x1000) // gas
+            .call();
+        EXPECT_TRUE(evm_as::validate(eb2));
+
+        auto eb3 = evm_as::latest();
+        eb3.call(evm_as::sugar::CallArgs{
+            .gas = 0x1000,
+            .address = Address{0xABBA},
+            .value = 0x3000,
+            .args_offset = 0x4000,
+            .args_size = 0x5000,
+            .ret_offset = 0x6000,
+            .ret_size = 0x7000});
+
+        std::vector<uint8_t> bytecode1{};
+        evm_as::compile(eb1, bytecode1);
+        std::vector<uint8_t> bytecode2{};
+        evm_as::compile(eb2, bytecode2);
+        EXPECT_EQ(bytecode1, bytecode2);
+        std::vector<uint8_t> bytecode3{};
+        evm_as::compile(eb3, bytecode3);
+        EXPECT_EQ(bytecode1, bytecode3);
+
+        auto const expected = "PUSH2 0x7000\n"
+                              "PUSH2 0x6000\n"
+                              "PUSH2 0x5000\n"
+                              "PUSH2 0x4000\n"
+                              "PUSH2 0x3000\n"
+                              "PUSH2 0xABBA\n"
+                              "PUSH2 0x1000\n"
+                              "CALL\n";
+
+        EXPECT_EQ(evm_as::mcompile(eb1), expected);
+        EXPECT_EQ(evm_as::mcompile(eb2), expected);
+        EXPECT_EQ(evm_as::mcompile(eb3), expected);
+    }
+
+    // Call named arguments
+    {
+        using namespace kinet::vm::utils::evm_as::sugar;
+        auto eb1 = evm_as::latest();
+        eb1.call({.gas = 10'000'000, .address = Address{0xDEADC0DE}});
+        EXPECT_TRUE(evm_as::validate(eb1));
+
+        std::vector<uint8_t> const expected_bytecode{
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH4,
+            0xDE,
+            0xAD,
+            0xC0,
+            0xDE,
+            compiler::EvmOpCode::PUSH3,
+            0x98,
+            0x96,
+            0x80,
+            compiler::EvmOpCode::CALL};
+
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(eb1, bytecode);
+        EXPECT_EQ(bytecode, expected_bytecode);
+
+        auto const expected = "PUSH0\n"
+                              "PUSH0\n"
+                              "PUSH0\n"
+                              "PUSH0\n"
+                              "PUSH0\n"
+                              "PUSH4 0xDEADC0DE\n"
+                              "PUSH3 0x989680\n"
+                              "CALL\n";
+
+        EXPECT_EQ(evm_as::mcompile(eb1), expected);
+
+        // All defaults
+        auto const eb2 = evm_as::latest().call({});
+        EXPECT_TRUE(evm_as::validate(eb2));
+
+        std::vector<uint8_t> expected_bytecode2{
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::CALL};
+        std::vector<uint8_t> bytecode2{};
+        evm_as::compile(eb2, bytecode2);
+        EXPECT_EQ(bytecode2, expected_bytecode2);
+
+        auto const expected2 = "PUSH0\n"
+                               "PUSH0\n"
+                               "PUSH0\n"
+                               "PUSH0\n"
+                               "PUSH0\n"
+                               "PUSH0\n"
+                               "PUSH0\n"
+                               "CALL\n";
+        EXPECT_EQ(evm_as::mcompile(eb2), expected2);
+    }
+
+    // Call code
+    {
+        auto eb1 = evm_as::latest();
+        eb1.callcode(
+            0x1111,
+            Address{0xFEEDC0DE},
+            0x3333,
+            0x4444,
+            0x5555,
+            0x6666,
+            0x7777);
+        EXPECT_TRUE(evm_as::validate(eb1));
+
+        auto eb2 = evm_as::latest();
+        eb2.push(0x7777) // returndata size
+            .push(0x6666) // returndata offset
+            .push(0x5555) // args size
+            .push(0x4444) // args offset
+            .push(0x3333) // value
+            .push(Address{0xfeedc0de}) // to address
+            .push(0x1111) // gas
+            .callcode();
+        EXPECT_TRUE(evm_as::validate(eb2));
+
+        std::vector<uint8_t> bytecode1{};
+        evm_as::compile(eb1, bytecode1);
+        std::vector<uint8_t> bytecode2{};
+        evm_as::compile(eb2, bytecode2);
+        EXPECT_EQ(bytecode1, bytecode2);
+
+        auto const expected = "PUSH2 0x7777\n"
+                              "PUSH2 0x6666\n"
+                              "PUSH2 0x5555\n"
+                              "PUSH2 0x4444\n"
+                              "PUSH2 0x3333\n"
+                              "PUSH4 0xFEEDC0DE\n"
+                              "PUSH2 0x1111\n"
+                              "CALLCODE\n";
+
+        EXPECT_EQ(evm_as::mcompile(eb1), expected);
+        EXPECT_EQ(evm_as::mcompile(eb2), expected);
+    }
+
+    // Call code named arguments
+    {
+        using namespace kinet::vm::utils::evm_as::sugar;
+        auto eb1 = evm_as::latest();
+        eb1.callcode({.value = 42});
+        EXPECT_TRUE(evm_as::validate(eb1));
+
+        std::vector<uint8_t> const expected_bytecode{
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH1,
+            0x2A,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::CALLCODE};
+
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(eb1, bytecode);
+        EXPECT_EQ(bytecode, expected_bytecode);
+
+        auto const expected = "PUSH0\n"
+                              "PUSH0\n"
+                              "PUSH0\n"
+                              "PUSH0\n"
+                              "PUSH1 0x2A\n"
+                              "PUSH0\n"
+                              "PUSH0\n"
+                              "CALLCODE\n";
+
+        EXPECT_EQ(evm_as::mcompile(eb1), expected);
+    }
+
+    // Delegate call
+    {
+        auto eb1 = evm_as::latest();
+        eb1.delegatecall(
+            0x123, Address{0xC0FFEEC0DE}, 0x456, 0x789, 0xABC, 0xDEF);
+        EXPECT_TRUE(evm_as::validate(eb1));
+
+        auto eb2 = evm_as::latest();
+        eb2.push(0xDEF) // returndata size
+            .push(0xABC) // returndata offset
+            .push(0x789) // args size
+            .push(0x456) // args offset
+            .push(Address{0xc0ffeec0de}) // to address
+            .push(0x123) // gas
+            .delegatecall();
+        EXPECT_TRUE(evm_as::validate(eb2));
+
+        std::vector<uint8_t> bytecode1{};
+        evm_as::compile(eb1, bytecode1);
+        std::vector<uint8_t> bytecode2{};
+        evm_as::compile(eb2, bytecode2);
+        EXPECT_EQ(bytecode1, bytecode2);
+
+        auto const expected = "PUSH2 0xDEF\n"
+                              "PUSH2 0xABC\n"
+                              "PUSH2 0x789\n"
+                              "PUSH2 0x456\n"
+                              "PUSH5 0xC0FFEEC0DE\n"
+                              "PUSH2 0x123\n"
+                              "DELEGATECALL\n";
+
+        EXPECT_EQ(evm_as::mcompile(eb1), expected);
+        EXPECT_EQ(evm_as::mcompile(eb2), expected);
+    }
+
+    // Delegate call named arguments
+    {
+        using namespace kinet::vm::utils::evm_as::sugar;
+        auto eb1 = evm_as::latest();
+        eb1.delegatecall(
+            {.args_offset = 128,
+             .args_size = 64,
+             .ret_offset = 512,
+             .ret_size = 256});
+        EXPECT_TRUE(evm_as::validate(eb1));
+
+        std::vector<uint8_t> const expected_bytecode{
+            compiler::EvmOpCode::PUSH2,
+            0x01,
+            0x00,
+            compiler::EvmOpCode::PUSH2,
+            0x02,
+            0x00,
+            compiler::EvmOpCode::PUSH1,
+            0x40,
+            compiler::EvmOpCode::PUSH1,
+            0x80,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::DELEGATECALL};
+
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(eb1, bytecode);
+        EXPECT_EQ(bytecode, expected_bytecode);
+
+        auto const expected = "PUSH2 0x100\n"
+                              "PUSH2 0x200\n"
+                              "PUSH1 0x40\n"
+                              "PUSH1 0x80\n"
+                              "PUSH0\n"
+                              "PUSH0\n"
+                              "DELEGATECALL\n";
+
+        EXPECT_EQ(evm_as::mcompile(eb1), expected);
+    }
+
+    // Static call
+    {
+        auto eb1 = evm_as::latest();
+        eb1.staticcall(0x1, Address{0xABEEFEEC0DE}, 0x2, 0x3, 0x4, 0x5);
+        EXPECT_TRUE(evm_as::validate(eb1));
+
+        auto eb2 = evm_as::latest();
+        eb2.push(0x5) // returndata size
+            .push(0x4) // returndata offset
+            .push(0x3) // args size
+            .push(0x2) // args offset
+            .push(Address{0xabeefeec0de}) // to address
+            .push(0x1) // gas
+            .staticcall();
+        EXPECT_TRUE(evm_as::validate(eb2));
+
+        std::vector<uint8_t> bytecode1{};
+        evm_as::compile(eb1, bytecode1);
+        std::vector<uint8_t> bytecode2{};
+        evm_as::compile(eb2, bytecode2);
+        EXPECT_EQ(bytecode1, bytecode2);
+
+        auto const expected = "PUSH1 0x5\n"
+                              "PUSH1 0x4\n"
+                              "PUSH1 0x3\n"
+                              "PUSH1 0x2\n"
+                              "PUSH6 0x0ABEEFEEC0DE\n"
+                              "PUSH1 0x1\n"
+                              "STATICCALL\n";
+
+        EXPECT_EQ(evm_as::mcompile(eb1), expected);
+        EXPECT_EQ(evm_as::mcompile(eb2), expected);
+    }
+
+    // Static call named arguments
+    {
+        using namespace kinet::vm::utils::evm_as::sugar;
+        auto eb1 = evm_as::latest();
+        eb1.staticcall({.gas = 5000, .ret_offset = 2048, .ret_size = 65536});
+        EXPECT_TRUE(evm_as::validate(eb1));
+
+        std::vector<uint8_t> const expected_bytecode{
+            compiler::EvmOpCode::PUSH3,
+            0x1,
+            0x00,
+            0x00,
+            compiler::EvmOpCode::PUSH2,
+            0x8,
+            0x0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH0,
+            compiler::EvmOpCode::PUSH2,
+            0x13,
+            0x88,
+            compiler::EvmOpCode::STATICCALL};
+
+        std::vector<uint8_t> bytecode{};
+        evm_as::compile(eb1, bytecode);
+        EXPECT_EQ(bytecode, expected_bytecode);
+
+        auto const expected = "PUSH3 0x10000\n"
+                              "PUSH2 0x800\n"
+                              "PUSH0\n"
+                              "PUSH0\n"
+                              "PUSH0\n"
+                              "PUSH2 0x1388\n"
+                              "STATICCALL\n";
+
+        EXPECT_EQ(evm_as::mcompile(eb1), expected);
+    }
+}
+
+template <size_t N>
+    requires(N > 0 && N <= 32)
+struct fixed_bytes
+{
+    explicit fixed_bytes(uint256_t const &value)
+    {
+        uint8_t buf[32] = {};
+        store_be(buf, value);
+        std::memcpy(bytes, buf + (32 - N), N);
+    }
+
+    uint8_t bytes[N];
+};
+
+TEST(EvmAs, FixedBytesPush)
+{
+    auto eb = evm_as::latest();
+
+    eb.push(fixed_bytes<1>(255))
+        .push(fixed_bytes<2>(0xABCD))
+        .push(fixed_bytes<11>(0x0123456789ABCDEFFEDCBA_u256))
+        .push(fixed_bytes<27>(
+            0x0123456789ABCDEFFEDCBA9876543210FEDCBA9876543210123456_u256))
+        .push(fixed_bytes<32>(
+            0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF_u256));
+
+    EXPECT_TRUE(evm_as::validate(eb));
+
+    std::vector<uint8_t> bytecode{};
+    evm_as::compile(eb, bytecode);
+
+    std::vector<uint8_t> expected{
+        compiler::EvmOpCode::PUSH1,
+        0xFF,
+        compiler::EvmOpCode::PUSH2,
+        0xAB,
+        0xCD,
+        compiler::EvmOpCode::PUSH11,
+        0x01,
+        0x23,
+        0x45,
+        0x67,
+        0x89,
+        0xAB,
+        0xCD,
+        0xEF,
+        0xFE,
+        0xDC,
+        0xBA,
+        compiler::EvmOpCode::PUSH27,
+        0x01,
+        0x23,
+        0x45,
+        0x67,
+        0x89,
+        0xAB,
+        0xCD,
+        0xEF,
+        0xFE,
+        0xDC,
+        0xBA,
+        0x98,
+        0x76,
+        0x54,
+        0x32,
+        0x10,
+        0xFE,
+        0xDC,
+        0xBA,
+        0x98,
+        0x76,
+        0x54,
+        0x32,
+        0x10,
+        0x12,
+        0x34,
+        0x56,
+        compiler::EvmOpCode::PUSH32,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF};
+
+    EXPECT_EQ(bytecode.size(), expected.size());
+    EXPECT_EQ(bytecode, expected);
+
+    std::string const expected_mnemonic =
+        "PUSH1 0xFF\n"
+        "PUSH2 0xABCD\n"
+        "PUSH11 0x123456789ABCDEFFEDCBA\n"
+        "PUSH27 0x123456789ABCDEFFEDCBA9876543210FEDCBA9876543210123456\n"
+        "PUSH32 "
+        "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\n";
+    EXPECT_EQ(evm_as::mcompile(eb), expected_mnemonic);
+}
+
+TEST(EvmAs, Invalid)
+{
+    auto eb = evm_as::latest();
+    eb.invalid();
+
+    EXPECT_FALSE(evm_as::validate(eb));
+    EXPECT_TRUE(evm_as::validate(eb, {.allow_invalid = true}));
+
+    std::vector<uint8_t> bytecode{};
+    evm_as::compile(eb, bytecode);
+
+    std::vector<uint8_t> expected{0xFE};
+
+    EXPECT_EQ(bytecode, expected);
+
+    std::string const expected_mnemonic = "INVALID\n";
+    EXPECT_EQ(evm_as::mcompile(eb), expected_mnemonic);
+}
+
+TEST(EvmAs, NewVarMaxSubscript)
+{
+    evm_as::internal::annot_context ctx{};
+    ctx.next_subscript = std::numeric_limits<size_t>::max();
+
+    std::string const var = evm_as::internal::new_var(ctx);
+    ASSERT_EQ(var, std::format("X{}", std::numeric_limits<size_t>::max()));
+}

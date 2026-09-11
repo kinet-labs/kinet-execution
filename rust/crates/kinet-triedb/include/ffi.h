@@ -1,0 +1,175 @@
+// Copyright (C) 2025-26 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/execution/ethereum/core/base_ctypes.h>
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct TriedbRoInner TriedbRoInner;
+
+int triedb_open(
+    char const *dbdirpath, TriedbRoInner **, uint64_t node_lru_max_mem);
+int triedb_close(TriedbRoInner *);
+
+// returns -1 if key not found
+// if >= 0, returns length of value
+int triedb_read(
+    TriedbRoInner *, uint8_t const *key, uint8_t key_len_nibbles,
+    uint8_t const **value, uint64_t block_id);
+
+// true if the primary timeline is page-encoded (Kinet state machine), in which
+// case storage is keyed by keccak(page_key) (page_key = slot >> 7) and the leaf
+// is an encoded page; otherwise storage is slot-encoded.
+bool triedb_is_page_encoded(TriedbRoInner *);
+
+// Dual-DB migration phase. Fully determines each timeline's encoding, so
+// readers derive both from it. Safe on a read-only handle while the writer
+// is live.
+//   0 = legacy        (primary ethereum, no secondary)
+//   1 = dual-timeline (primary ethereum, page secondary backfilling)
+//   2 = page-encoded  (primary kinet, no secondary)
+//   3 = promoted      (primary kinet, slot secondary kept as history)
+// Phases only change offline via kinet-mpt with every reader and the daemon
+// stopped; a handle observes one phase for its lifetime.
+uint8_t triedb_migration_phase(TriedbRoInner *);
+
+// Storage-pool disk capacity and usage, in bytes. Zeros for in-memory /
+// not-on-disk Dbs. Safe on a read-only handle while the writer is live.
+typedef struct triedb_storage_stats
+{
+    uint64_t disk_capacity_bytes;
+    uint64_t disk_used_bytes;
+} triedb_storage_stats;
+
+void triedb_storage_stats_read(TriedbRoInner *, triedb_storage_stats *out);
+
+// Compute the storage page key for a 32-byte slot key on a page-encoded db:
+// page_key = slot >> 7. Writes the 32-byte big-endian page key (the key the
+// storage trie is looked up by) to out_page_key.
+void triedb_compute_page_key(uint8_t const *slot_key, uint8_t *out_page_key);
+
+// Compute the slot's offset within its page for a 32-byte slot key: the low 7
+// bits of the slot key. This is the `offset` argument to
+// triedb_decode_storage_page_slot.
+uint8_t triedb_compute_slot_offset(uint8_t const *slot_key);
+
+// Decode a page-encoded storage leaf (as returned by triedb_read for a
+// page-encoded db, looked up with the page key) and write the 32-byte value of
+// the slot at `offset` (the low 7 bits of the original slot key) to out_value.
+// Returns false on decode error.
+bool triedb_decode_storage_page_slot(
+    uint8_t const *leaf, size_t leaf_len, uint8_t offset, uint8_t *out_value);
+
+typedef void (*triedb_async_read_callback_fn)(
+    uint8_t const *value, int length, void *user);
+// calls (*completed) when read is
+// complete. length is -1 if key not
+// found. If >=0, returns length of
+// value. Call triedb_finalize when
+// done with the value.
+void triedb_async_read(
+    TriedbRoInner *, uint8_t const *key, uint8_t key_len_nibbles,
+    uint64_t block_id, triedb_async_read_callback_fn callback, void *user);
+
+// traverse the trie.
+enum triedb_async_traverse_callback
+{
+    triedb_async_traverse_callback_value,
+    triedb_async_traverse_callback_finished_normally,
+    triedb_async_traverse_callback_finished_early
+};
+
+typedef void (*triedb_async_traverse_callback_fn)(
+    enum triedb_async_traverse_callback kind, void *context,
+    uint8_t const *path, size_t path_len, uint8_t const *value,
+    size_t value_len);
+bool triedb_traverse(
+    TriedbRoInner *, uint8_t const *key, uint8_t key_len_nibbles,
+    uint64_t block_id, void *context,
+    triedb_async_traverse_callback_fn callback);
+void triedb_async_traverse(
+    TriedbRoInner *, uint8_t const *key, uint8_t key_len_nibbles,
+    uint64_t block_id, void *context,
+    triedb_async_traverse_callback_fn callback);
+void triedb_async_ranged_get(
+    TriedbRoInner *, uint8_t const *prefix_key, uint8_t prefix_len_nibbles,
+    uint8_t const *min_key, uint8_t min_len_nibbles, uint8_t const *max_key,
+    uint8_t max_len_nibbles, uint64_t block_id, void *context,
+    triedb_async_traverse_callback_fn callback);
+// pumps async reads, processing no
+// more than count maximum, returning
+// how many were processed.
+size_t triedb_poll(TriedbRoInner *, bool blocking, size_t count);
+int triedb_finalize(uint8_t const *value);
+
+// returns MAX if doesn't exist
+uint64_t triedb_latest_proposed_version(TriedbRoInner *);
+// returns all-zeros if doesn't exist
+kinet_c_bytes32 triedb_latest_proposed_block_id(TriedbRoInner *);
+// returns MAX if doesn't exist
+uint64_t triedb_latest_voted_version(TriedbRoInner *);
+// returns all-zeros if doesn't exist
+kinet_c_bytes32 triedb_latest_voted_block_id(TriedbRoInner *);
+// returns MAX if doesn't exist
+uint64_t triedb_latest_finalized_version(TriedbRoInner *);
+// returns MAX if doesn't exist
+uint64_t triedb_latest_verified_version(TriedbRoInner *);
+
+// returns MAX if doesn't exist
+// Earliest version available on any timeline.
+uint64_t triedb_earliest_version(TriedbRoInner *);
+// returns MAX if doesn't exist
+// Latest version available on any timeline.
+uint64_t triedb_latest_version(TriedbRoInner *);
+// Earliest version on file in the primary timeline. Versions below it are
+// only on file in the secondary (when one is active); on an archive node
+// after the offline promote that is the frozen slot-encoded history.
+uint64_t triedb_primary_earliest_version(TriedbRoInner *);
+
+#pragma pack(push, 1)
+
+typedef struct validator_data
+{
+    uint8_t secp_pubkey[33];
+    uint8_t bls_pubkey[48];
+    // big endian u256
+    uint8_t stake[32];
+} validator_data;
+
+typedef struct validator_set
+{
+    struct validator_data *validators;
+    uint64_t length;
+} validator_set;
+
+#pragma pack(pop)
+
+void triedb_free_valset(validator_set *);
+
+validator_set *
+triedb_read_valset(TriedbRoInner *, size_t block_num, uint64_t requested_epoch);
+
+#ifdef __cplusplus
+}
+#endif

@@ -1,0 +1,458 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/core/assert.h>
+#include <category/core/byte_string.hpp>
+#include <category/core/rlp/encode.hpp>
+
+#include <category/core/mem/allocators.hpp>
+#include <category/mpt/config.hpp>
+#include <category/mpt/merkle/compact_encode.hpp>
+#include <category/mpt/merkle/node_reference.hpp>
+#include <category/mpt/node.hpp>
+
+#include <algorithm>
+#include <cstdint>
+#include <span>
+
+KINET_MPT_NAMESPACE_BEGIN
+
+namespace detail
+{
+    struct InternalMerkleState
+    {
+        unsigned char buffer[KECCAK256_SIZE];
+        unsigned len{0};
+
+        void keccak_inplace_to_root_hash()
+        {
+            KINET_ASSERT(len <= KECCAK256_SIZE);
+            if (len < KECCAK256_SIZE) {
+                kinet_keccak256(buffer, len, buffer);
+                len = KECCAK256_SIZE;
+            }
+        }
+    };
+
+    constexpr unsigned calc_branch_rlp_max_size(unsigned const leaf_data_size)
+    {
+        return static_cast<unsigned>(rlp::list_length(
+            rlp::list_length(KECCAK256_SIZE) * 16 +
+            rlp::list_length(leaf_data_size)));
+    }
+}
+
+std::span<unsigned char> encode_empty_string(std::span<unsigned char> result);
+
+std::span<unsigned char>
+encode_16_children(std::span<ChildData>, std::span<unsigned char> result);
+
+std::span<unsigned char>
+encode_16_children(Node const &, std::span<unsigned char> result);
+
+byte_string encode_two_pieces(
+    NibblesView path, byte_string_view second, bool is_leaf = false);
+
+[[gnu::always_inline]] inline unsigned encode_two_pieces_reference(
+    unsigned char *const dest, NibblesView const path,
+    byte_string_view const second, bool const is_leaf = false)
+{
+    auto const rlp = encode_two_pieces(path, second, is_leaf);
+    return to_node_reference({rlp.data(), rlp.size()}, dest);
+}
+
+struct Compute
+{
+    virtual ~Compute() = default;
+    //! compute length of hash from a span of child data, which include the node
+    //! pointer, file offset and calculated hash, the returned size is used to
+    //! allocate mpt::Node internal data
+    virtual unsigned compute_node_data_len(
+        std::span<ChildData> children, uint16_t mask, NibblesView path,
+        std::optional<byte_string_view> value) = 0;
+    //! Write computed node data to buffer and return the number of bytes
+    //! written.
+    virtual unsigned
+    set_node_data(unsigned char *buffer, unsigned max_size) = 0;
+    //! compute the hash data of a trie rooted at `node`, write it into
+    //! `buffer`, and return the number of bytes written.
+    virtual unsigned compute(unsigned char *buffer, Node const &node) = 0;
+};
+
+struct EmptyCompute : Compute
+{
+    virtual unsigned compute_node_data_len(
+        std::span<ChildData>, uint16_t, NibblesView,
+        std::optional<byte_string_view>) override
+    {
+        return 0;
+    }
+
+    virtual unsigned set_node_data(unsigned char *, unsigned) override
+    {
+        return 0;
+    }
+
+    virtual unsigned compute(unsigned char *, Node const &) override
+    {
+        return 0;
+    }
+};
+
+template <typename T>
+concept leaf_processor = requires(Node const &node) {
+    { T::process(node) } -> std::convertible_to<byte_string_view>;
+};
+
+template <leaf_processor LeafValueProcessor>
+struct MerkleComputeBase : Compute
+{
+    static constexpr auto max_branch_rlp_size = rlp::list_length(
+        rlp::list_length(KECCAK256_SIZE) * 16 + rlp::list_length(0));
+    static constexpr auto max_leaf_data_size = rlp::list_length( // account rlp
+        rlp::list_length(32) // balance
+        + rlp::list_length(KECCAK256_SIZE) // code hash
+        + rlp::list_length(KECCAK256_SIZE) // storage hash
+        + rlp::list_length(8) // nonce
+    );
+    static_assert(max_branch_rlp_size == 532);
+    static_assert(max_leaf_data_size == 110);
+
+    // Compute data from children and value to the internal state, which
+    // will later be copied to in the intermediate data section inside node
+    virtual unsigned compute_node_data_len(
+        std::span<ChildData> const children, uint16_t const mask,
+        NibblesView /*path*/,
+        std::optional<byte_string_view> const value) override
+    {
+        KINET_ASSERT(mask);
+        if (!value.has_value()) {
+            // no intermediate data for non-leaf node
+            return 0;
+        }
+        // special case, the node to be created has only one branch
+        if (std::has_single_bit(mask)) {
+            auto const it = std::ranges::find_if(
+                children, [](ChildData const &item) constexpr {
+                    return item.is_valid();
+                });
+            KINET_ASSERT(it != children.end());
+            compute_hash_with_extra_nibble_to_state_(*it);
+            // root data of a subtrie is always a hash
+            state.keccak_inplace_to_root_hash();
+            return KECCAK256_SIZE;
+        }
+
+        unsigned char branch_str_rlp[max_branch_rlp_size];
+        auto result = encode_16_children(children, {branch_str_rlp});
+        // encode empty value string
+        result = encode_empty_string(result);
+        auto const concat_len =
+            static_cast<size_t>(result.data() - branch_str_rlp);
+        KINET_ASSERT(concat_len <= max_branch_rlp_size);
+
+        // encode list
+        auto const rlp_len = rlp::list_length(concat_len);
+        KINET_ASSERT(rlp_len <= max_branch_rlp_size);
+        unsigned char branch_rlp[max_branch_rlp_size];
+        rlp::encode_list(
+            branch_rlp, byte_string_view{branch_str_rlp, concat_len});
+        // Compute hash to internal state and return hash length
+        state.len = to_node_reference({branch_rlp, rlp_len}, state.buffer);
+        // root data of merkle trie is always a hash
+        state.keccak_inplace_to_root_hash();
+        return KECCAK256_SIZE;
+    }
+
+    virtual unsigned
+    set_node_data(unsigned char *const buffer, unsigned const max_size) override
+    {
+        if (state.len == 0) {
+            return 0;
+        }
+        unsigned const len = state.len;
+        KINET_ASSERT(len <= max_size);
+        // a simple memcpy if already computed to internal state
+        std::memcpy(buffer, state.buffer, state.len);
+        // reset state
+        state.len = 0;
+        return len;
+    }
+
+    virtual unsigned
+    compute(unsigned char *const buffer, Node const &node) override
+    {
+        if (node.has_value()) {
+            return encode_two_pieces_reference(
+                buffer,
+                node.path_nibble_view(),
+                LeafValueProcessor::process(node), // processed leaf data
+                true);
+        }
+        KINET_ASSERT(node.number_of_children() > 1);
+        if (node.has_path()) {
+            unsigned char reference[KECCAK256_SIZE];
+            unsigned const len = compute_branch_reference_(reference, node);
+            return encode_two_pieces_reference(
+                buffer, node.path_nibble_view(), {reference, len}, false);
+        }
+        return compute_branch_reference_(buffer, node);
+    }
+
+private:
+    detail::InternalMerkleState state{};
+
+    unsigned compute_hash_with_extra_nibble_to_state_(ChildData &single_child)
+    {
+        Node *const node = single_child.ptr.get();
+        KINET_ASSERT(node);
+
+        return state.len = encode_two_pieces_reference(
+                state.buffer,
+                concat(single_child.branch, node->path_nibble_view()),
+                (node->has_value()
+                     ? LeafValueProcessor::process(*node)
+                     : (node->has_path()
+                            ? ([&] -> byte_string {
+                                  unsigned char branch_hash[KECCAK256_SIZE];
+                                  return {
+                                      branch_hash,
+                                      compute_branch_reference_(branch_hash, *node)};
+                              }())
+                            : byte_string_view{single_child.data, single_child.len})),
+                node->has_value());
+    }
+
+    unsigned
+    compute_branch_reference_(unsigned char *const buffer, Node const &node)
+    {
+        KINET_ASSERT(node.number_of_children());
+        unsigned char branch_str_rlp[max_branch_rlp_size];
+        auto result = encode_16_children(node, {branch_str_rlp});
+        // encode empty value string
+        result = encode_empty_string(result);
+
+        auto const concat_len =
+            static_cast<size_t>(result.data() - branch_str_rlp);
+        KINET_ASSERT(concat_len <= max_branch_rlp_size);
+        auto const branch_rlp_len = rlp::list_length(concat_len);
+        KINET_ASSERT(branch_rlp_len <= max_branch_rlp_size);
+
+        unsigned char branch_rlp[max_branch_rlp_size];
+        rlp::encode_list(
+            branch_rlp, byte_string_view{branch_str_rlp, concat_len});
+        return to_node_reference({branch_rlp, branch_rlp_len}, buffer);
+    }
+};
+
+/* Compute implementation for variable length merkle trie, for example receipt
+trie. Current use cases only involve insert operation but no update or erase
+in the middle of a variable length trie.
+
+TODO for vicky: consolidate VarLenMerkleCompute and MerkleCompute into one.
+*/
+struct NoopProcessor
+{
+    static byte_string_view process(Node const &node)
+    {
+        return node.value();
+    }
+};
+
+template <leaf_processor LeafValueProcessor = NoopProcessor>
+byte_string encode_branch(Node const &node)
+{
+    KINET_ASSERT(node.number_of_children());
+    byte_string branch_str_rlp(
+        detail::calc_branch_rlp_max_size(node.value_len), 0);
+    auto result = encode_16_children(node, branch_str_rlp);
+    result = (node.has_value() && node.value_len)
+                 ? rlp::encode_string(result, LeafValueProcessor::process(node))
+                 : encode_empty_string(result);
+    auto const concat_len =
+        static_cast<size_t>(result.data() - branch_str_rlp.data());
+    byte_string branch_rlp(rlp::list_length(concat_len), 0);
+    rlp::encode_list(branch_rlp, {branch_str_rlp.data(), concat_len});
+    return branch_rlp;
+}
+
+template <leaf_processor LeafValueProcessor = NoopProcessor>
+struct VarLenMerkleCompute : Compute
+{
+    // Compute the intermediate branch data to the internal state.
+    // For variable length merkle trie, we store branch node data inline in
+    // nodes that have at least one child and non-empty path.
+    virtual unsigned compute_node_data_len(
+        std::span<ChildData> const children, uint16_t const mask,
+        NibblesView const path,
+        std::optional<byte_string_view> const value) override
+    {
+        KINET_ASSERT(mask);
+        if (path.empty()) {
+            // node without any children or node with empty path has no
+            // intermediate data
+            return 0;
+        }
+        return do_compute_node_data_len(children, value);
+    }
+
+    virtual unsigned
+    set_node_data(unsigned char *const buffer, unsigned const max_size) override
+    {
+        // copy from internal state
+        if (state.len == 0) {
+            return 0;
+        }
+        unsigned const len = state.len;
+        KINET_ASSERT(len <= max_size);
+        // a simple memcpy if already computed to internal state
+        std::memcpy(buffer, state.buffer, state.len);
+        // reset state
+        state.len = 0;
+        return len;
+    }
+
+    virtual unsigned
+    compute(unsigned char *const buffer, Node const &node) override
+    {
+        // Ethereum leaf: leaf node hash without child
+        if (node.number_of_children() == 0) {
+            KINET_ASSERT(node.has_value());
+            return encode_two_pieces_reference(
+                buffer,
+                node.path_nibble_view(),
+                LeafValueProcessor::process(node),
+                true);
+        }
+        // Ethereum extension: there is non-empty path
+        // rlp(encoded path, inline branch hash)
+        if (node.has_path()) { // extension node, rlp encode with path too
+            KINET_ASSERT(node.bitpacked.data_len);
+            // A node with children is always an extension, even when it also
+            // carries a value: the value is already encoded in the 17th slot
+            // of the inline branch data, so the hex-prefix must be the
+            // non-terminating (extension) one.
+            return encode_two_pieces_reference(
+                buffer, node.path_nibble_view(), node.data(), false);
+        }
+        // Ethereum branch
+        return compute_branch_reference_(buffer, node);
+    }
+
+protected:
+    detail::InternalMerkleState state;
+
+    unsigned do_compute_node_data_len(
+        std::span<ChildData> const children,
+        std::optional<byte_string_view> const value)
+    {
+        // compute branch node data to internal state
+        unsigned const branch_str_max_len = detail::calc_branch_rlp_max_size(
+            (unsigned)value.transform(&byte_string_view::size).value_or(0));
+
+        byte_string branch_str_rlp(branch_str_max_len, 0);
+        auto result = encode_16_children(children, branch_str_rlp);
+        // encode vt (branch values are not processed, already in correct
+        // format)
+        result = (value.has_value() && value.value().size())
+                     ? rlp::encode_string(result, value.value())
+                     : encode_empty_string(result);
+        auto const concat_len =
+            static_cast<size_t>(result.data() - branch_str_rlp.data());
+        // encode list
+        byte_string rlp(rlp::list_length(concat_len), 0);
+        rlp::encode_list(rlp, {branch_str_rlp.data(), concat_len});
+        // Compute hash to internal state and return hash length
+        state.len = to_node_reference({rlp.data(), rlp.size()}, state.buffer);
+        return state.len;
+    }
+
+    unsigned
+    compute_branch_reference_(unsigned char *const buffer, Node const &node)
+    {
+        auto const rlp = encode_branch<LeafValueProcessor>(node);
+        return to_node_reference({rlp.data(), rlp.size()}, buffer);
+    }
+};
+
+template <leaf_processor LeafValueProcessor = NoopProcessor>
+struct RootVarLenMerkleCompute : public VarLenMerkleCompute<LeafValueProcessor>
+{
+    using Base = VarLenMerkleCompute<LeafValueProcessor>;
+    using Base::compute_branch_reference_;
+    using Base::state;
+
+    virtual unsigned compute(unsigned char *const, Node const &) override
+    {
+        return 0;
+    }
+
+    virtual unsigned compute_node_data_len(
+        std::span<ChildData> const children, uint16_t const mask, NibblesView,
+        std::optional<byte_string_view> const value) override
+    {
+        KINET_ASSERT(mask);
+        if (std::has_single_bit(mask)) {
+            auto const it = std::ranges::find_if(
+                children, [](ChildData const &item) constexpr {
+                    return item.is_valid();
+                });
+            KINET_ASSERT(it != children.end());
+            compute_hash_with_extra_nibble_to_state_(*it);
+        }
+        else {
+            Base::do_compute_node_data_len(children, value);
+        }
+        // root data of a merkle trie is always a hash
+        state.keccak_inplace_to_root_hash();
+        return KECCAK256_SIZE;
+    }
+
+    virtual unsigned
+    set_node_data(unsigned char *const buffer, unsigned const max_size) override
+    {
+        return Base::set_node_data(buffer, max_size);
+    }
+
+private:
+    unsigned compute_hash_with_extra_nibble_to_state_(ChildData &single_child)
+    {
+        Node *const node = single_child.ptr.get();
+        KINET_ASSERT(node != nullptr);
+
+        return state.len = encode_two_pieces_reference(
+                   state.buffer,
+                   concat(single_child.branch, node->path_nibble_view()),
+                   /* second: branch hash or leaf value */
+                   node->mask ? (node->bitpacked.data_len ? node->data()
+                                                          : [&] -> byte_string {
+                       KINET_ASSERT(!node->has_path());
+                       unsigned char branch_hash[KECCAK256_SIZE];
+                       return {
+                           branch_hash,
+                           compute_branch_reference_(branch_hash, *node)};
+                   }())
+                              : LeafValueProcessor::process(*node),
+                   // A node with children is an extension based on ethereum MPT
+                   // definition even if it also has a value; the value is
+                   // already inside the branch encoding. Only a childless node
+                   // takes the terminating leaf prefix.
+                   node->mask == 0);
+    }
+};
+
+KINET_MPT_NAMESPACE_END

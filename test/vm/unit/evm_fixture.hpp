@@ -1,0 +1,318 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/core/address.hpp>
+#include <category/core/bytes.hpp>
+#include <category/core/int.hpp>
+#include <category/vm/evm/kinet/revision.h>
+#include <category/vm/evm/revision.h>
+#include <category/vm/evm/switch_traits.hpp>
+#include <category/vm/evm/traits.hpp>
+#include <category/vm/runtime/allocator.hpp>
+#include <category/vm/runtime/types.hpp>
+#include <category/vm/vm.hpp>
+#include <kinet/test/traits_test.hpp>
+#include <test/vm/utils/test_message.hpp>
+
+#include <kinetml_evm/kinetml_evm.hpp>
+
+#include <evmc/evmc.hpp>
+#include <evmc/mocked_host.hpp>
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <filesystem>
+#include <span>
+
+namespace fs = std::filesystem;
+
+namespace kinet::vm::compiler::test
+{
+    template <typename T>
+    class VMTraitsTestBase
+    {
+    public:
+        VMTraitsTestBase() noexcept = default;
+
+    protected:
+        enum Implementation
+        {
+            Compiler,
+            Interpreter,
+            Spec,
+        };
+
+        // The OCaml spec VM ignores the evmc_revision it is handed and is
+        // pinned to this Kinet revision; execute_and_compare skips for any
+        // other trait.
+        static constexpr kinet_revision spec_revision = KINET_EIGHT;
+
+        static constexpr auto get_trait()
+        {
+            if constexpr (std::
+                              same_as<typename T::value_type, kinet_revision>) {
+                return kinet::KinetTraits<T::value>{};
+            }
+            else {
+                return kinet::EvmTraits<T::value>{};
+            }
+        }
+
+        using Trait = decltype(get_trait());
+
+        static consteval bool is_kinet_trait() noexcept
+        {
+            return kinet::is_kinet_trait_v<Trait>;
+        }
+
+        static consteval bool is_evm_trait() noexcept
+        {
+            return kinet::is_evm_trait_v<Trait>;
+        }
+
+        static constexpr runtime::Memory::Version get_memory_version()
+        {
+            return Trait::mip_3_active() ? runtime::Memory::Version::MIP3
+                                         : runtime::Memory::Version::V1;
+        }
+
+        kinet::vm::VM vm_{};
+
+        kinet::vm::test::TestMessage test_msg_;
+        evmc_message &msg_{*test_msg_};
+
+        evmc::MockedHost host_;
+
+        evmc::Result result_;
+
+        std::span<uint8_t const> output_data_{};
+
+        void pre_execute(
+            std::int64_t gas_limit,
+            std::span<std::uint8_t const> calldata) noexcept
+        {
+            static_assert(TraitsTest<T>::Trait::evm_rev() >= KINET_ETH_BERLIN);
+
+            result_ = evmc::Result();
+            output_data_ = {};
+
+            host_.accounts[msg_.sender].balance =
+                store_be_as<bytes32_t>(std::numeric_limits<uint256_t>::max());
+
+            msg_.gas = gas_limit;
+            msg_.input_data = calldata.data();
+            msg_.input_size = calldata.size();
+
+            // EIP-2929: sender and recipient start warm (active since Berlin)
+            host_.access_account(msg_.sender);
+            host_.access_account(msg_.recipient);
+        }
+
+        void execute(
+            std::int64_t gas_limit, std::span<std::uint8_t const> code,
+            std::span<std::uint8_t const> calldata = {},
+            Implementation impl = Compiler) noexcept
+        {
+            pre_execute(gas_limit, calldata);
+
+            auto icode = make_shared_intercode(code);
+
+            auto rt_ctx = runtime::Context::from(
+                &host_.get_interface(), host_.to_context(), &msg_, code);
+            if (impl == Compiler) {
+                auto ncode =
+                    vm_.compiler().compile<typename TraitsTest<T>::Trait>(
+                        icode);
+
+                ASSERT_TRUE(ncode->entrypoint() != nullptr);
+                result_ = evmc::Result{vm_.execute_native_entrypoint_raw<
+                    typename TraitsTest<T>::Trait>(
+                    rt_ctx, ncode->entrypoint())};
+            }
+            else if (impl == Interpreter) {
+                result_ =
+                    vm_.execute_intercode_raw<typename TraitsTest<T>::Trait>(
+                        rt_ctx, icode);
+            }
+            else {
+                KINET_ASSERT(impl == Spec);
+                evmc::VM spec_vm{evmc_create_kinetml_evm()};
+
+                result_ = spec_vm.execute(
+                    host_.get_interface(),
+                    host_.to_context(),
+                    to_evmc_revision(TraitsTest<T>::Trait::evm_rev()),
+                    msg_,
+                    code.data(),
+                    code.size());
+            }
+        }
+
+        void execute(
+            std::int64_t gas_limit, std::initializer_list<std::uint8_t> code,
+            std::span<std::uint8_t const> calldata = {},
+            Implementation impl = Compiler) noexcept
+        {
+            execute(gas_limit, std::span{code}, calldata, impl);
+        }
+
+        void execute(
+            std::span<std::uint8_t const> code,
+            std::span<std::uint8_t const> calldata = {},
+            Implementation impl = Compiler) noexcept
+        {
+            execute(
+                std::numeric_limits<std::int64_t>::max(), code, calldata, impl);
+        }
+
+        void execute(
+            std::initializer_list<std::uint8_t> code,
+            std::span<std::uint8_t const> calldata = {},
+            Implementation impl = Compiler) noexcept
+        {
+            execute(std::span{code}, calldata, impl);
+        }
+
+        bool has_empty_state() const noexcept
+        {
+            return host_.accounts.empty() &&
+                   host_.recorded_account_accesses.empty() &&
+                   host_.recorded_blockhashes.empty() &&
+                   host_.recorded_calls.empty() &&
+                   host_.recorded_logs.empty() &&
+                   host_.recorded_selfdestructs.empty();
+        }
+
+    public:
+        void execute_and_compare(
+            std::int64_t gas_limit, std::span<std::uint8_t const> code,
+            std::span<std::uint8_t const> calldata = {}) noexcept
+        {
+            if constexpr (!std::same_as<Trait, KinetTraits<spec_revision>>) {
+                GTEST_SKIP() << "spec oracle is pinned to "
+                             << kinet_revision_to_string(spec_revision);
+            }
+
+            // This comparison shouldn't be called multiple times in one test;
+            // if any state has been recorded on this host before we begin a
+            // test, the test should fail and stop us from trying to make
+            // assertions about a broken state.
+            ASSERT_TRUE(has_empty_state());
+
+            execute(gas_limit, code, calldata, Compiler);
+            auto actual = std::move(result_);
+
+            // We need to reset the host between executions; otherwise the state
+            // maintained will produce inconsistent results (e.g. an account is
+            // touched by the first run, then is subsequently warm for the
+            // second one).
+            host_ = {};
+
+            execute(gas_limit, code, calldata, Spec);
+            auto expected = std::move(result_);
+
+            switch (expected.status_code) {
+            case EVMC_SUCCESS:
+            case EVMC_REVERT:
+                ASSERT_EQ(actual.status_code, expected.status_code);
+                break;
+            default:
+                ASSERT_NE(actual.status_code, EVMC_SUCCESS);
+                ASSERT_NE(actual.status_code, EVMC_REVERT);
+                break;
+            }
+
+            ASSERT_EQ(actual.gas_left, expected.gas_left);
+            ASSERT_EQ(actual.gas_refund, expected.gas_refund);
+            ASSERT_EQ(actual.output_size, expected.output_size);
+
+            ASSERT_TRUE(std::equal(
+                actual.output_data,
+                actual.output_data + actual.output_size,
+                expected.output_data));
+
+            ASSERT_EQ(
+                Address(actual.create_address),
+                Address(expected.create_address));
+        }
+
+        void execute_and_compare(
+            std::int64_t gas_limit, std::initializer_list<std::uint8_t> code,
+            std::span<std::uint8_t const> calldata = {}) noexcept
+        {
+            execute_and_compare(gas_limit, std::span{code}, calldata);
+        }
+    };
+
+    template <typename T>
+    class VMTraitsTest
+        : public VMTraitsTestBase<T>
+        , public ::testing::Test
+    {
+
+    protected:
+        VMTraitsTest() noexcept = default;
+    };
+
+    class VMFileTest
+        : public testing::Test
+        , public testing::WithParamInterface<std::tuple<
+              fs::directory_entry,
+              std::variant<kinet_eth_revision, kinet_revision>>>
+    {
+    protected:
+        template <Traits traits>
+        static void execute_and_compare_evm_rev(
+            std::int64_t gas_limit, std::span<std::uint8_t const> code) noexcept
+        {
+            VMTraitsTestBase<::detail::EvmRevisionConstant<traits::evm_rev()>>
+                test;
+            test.execute_and_compare(gas_limit, code);
+        }
+
+        template <Traits traits>
+        static void execute_and_compare_kinet_rev(
+            std::int64_t gas_limit, std::span<std::uint8_t const> code) noexcept
+        {
+            VMTraitsTestBase<
+                ::detail::KinetRevisionConstant<traits::kinet_rev()>>
+                test;
+            test.execute_and_compare(gas_limit, code);
+        }
+
+        void execute_and_compare(
+            std::int64_t gas_limit, std::span<std::uint8_t const> code,
+            std::variant<kinet_eth_revision, kinet_revision> rev_) noexcept
+        {
+            if (std::holds_alternative<kinet_eth_revision>(rev_)) {
+                auto rev = std::get<kinet_eth_revision>(rev_);
+                SWITCH_EVM_TRAITS(
+                    VMFileTest::execute_and_compare_evm_rev, gas_limit, code);
+            }
+            else {
+                auto rev = std::get<kinet_revision>(rev_);
+                SWITCH_KINET_TRAITS(
+                    VMFileTest::execute_and_compare_kinet_rev, gas_limit, code);
+            }
+        }
+    };
+}
+
+TYPED_TEST_SUITE(
+    VMTraitsTest, ::detail::KinetEvmRevisionTypes,
+    ::detail::RevisionTestNameGenerator);

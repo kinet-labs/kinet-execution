@@ -1,0 +1,213 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <atomic>
+#include <cassert>
+#include <compare>
+#include <cstdint>
+#include <span>
+
+#if defined(__linux__)
+    #include <linux/types.h> // for __u64
+    #include <sys/uio.h> // for struct iovec
+#endif
+
+#define KINET_ASYNC_NAMESPACE_BEGIN                                            \
+    namespace kinet                                                            \
+    {                                                                          \
+        namespace async                                                        \
+        {
+
+#define KINET_ASYNC_NAMESPACE_END                                              \
+    }                                                                          \
+    }
+
+#define KINET_ASYNC_NAMESPACE ::kinet::async
+
+#include <category/core/assert.h>
+#include <category/core/hash.hpp>
+
+#ifndef KINET_CONTEXT_HAVE_ASAN
+    #ifndef __clang__
+        #if defined(__SANITIZE_ADDRESS__)
+            #define KINET_CONTEXT_HAVE_ASAN 1
+        #elif defined(__SANITIZE_THREAD__)
+            #define KINET_CONTEXT_HAVE_TSAN 1
+        #elif defined(__SANITIZE_UNDEFINED__)
+            #define KINET_CONTEXT_HAVE_UBSAN 1
+        #endif
+    #else
+        #if __has_feature(address_sanitizer)
+            #define KINET_CONTEXT_HAVE_ASAN 1
+        #elif __has_feature(thread_sanitizer)
+            #define KINET_CONTEXT_HAVE_TSAN 1
+        #elif defined(__SANITIZE_UNDEFINED__)
+            #define KINET_CONTEXT_HAVE_UBSAN 1
+        #endif
+    #endif
+#endif
+
+KINET_ASYNC_NAMESPACE_BEGIN
+
+//! The same type io_uring uses for offsets into files during i/o
+#if defined(__linux__)
+using file_offset_t = __u64;
+#else
+using file_offset_t = std::uint64_t;
+#endif
+
+//! An identifier of data within a `storage_pool`
+struct chunk_offset_t
+{
+    static constexpr unsigned OFFSET_BITS = 28;
+    static constexpr unsigned ID_BITS = 20;
+    static constexpr unsigned SPARE_BITS = 15;
+
+    file_offset_t offset : OFFSET_BITS; //!< Offset into the chunk, max is 256Mb
+    file_offset_t id : ID_BITS; //!< Id of the chunk, max is 1 million,
+                                //!< therefore maximum addressable storage
+                                //!< is 256Tb
+
+    /*! Next fifteen bits are unused by the async library and can be used by
+    client code for anything they wish. Triedb places a
+    `node_disk_pages_spare_15` into these bits which it uses to store how
+    many 512 byte sectors to read to completely load a node's value, thus both
+    a node's location within storage and how many bytes are needed to read it
+    are encapsulated within a single dense 64 bit identifier for Triedb.
+    */
+    file_offset_t spare : SPARE_BITS;
+    file_offset_t bits_format : 1; //! Reserve top bit to switch between
+                                   //! different bits formatting
+
+    static constexpr file_offset_t max_offset = (1ULL << OFFSET_BITS) - 1;
+    static constexpr file_offset_t max_id = (1U << ID_BITS) - 1;
+    static constexpr file_offset_t max_spare = (1ULL << SPARE_BITS) - 1;
+
+    static constexpr chunk_offset_t invalid_value() noexcept
+    {
+        return {max_id, max_offset};
+    }
+
+    constexpr chunk_offset_t(
+        uint32_t const id_, file_offset_t const offset_,
+        file_offset_t const spare_ = max_spare)
+        : offset(offset_ & max_offset)
+        , id(id_ & max_id)
+        , spare{spare_ & max_spare}
+        , bits_format{0x1}
+    {
+        KINET_ASSERT(id_ <= max_id);
+        KINET_ASSERT(offset_ <= max_offset);
+        KINET_ASSERT(spare_ <= max_spare);
+    }
+
+    constexpr bool operator==(chunk_offset_t const &o) const noexcept
+    {
+        return offset == o.offset && id == o.id;
+    }
+
+    constexpr auto operator<=>(chunk_offset_t const &o) const noexcept
+    {
+        if (offset == o.offset && id == o.id) {
+            return std::weak_ordering::equivalent;
+        }
+        if (id < o.id || (id == o.id && offset < o.offset)) {
+            return std::weak_ordering::less;
+        }
+        return std::weak_ordering::greater;
+    }
+
+    constexpr chunk_offset_t add_to_offset(file_offset_t offset_) const noexcept
+    {
+        chunk_offset_t ret(*this);
+        offset_ += ret.offset;
+        KINET_ASSERT(offset_ <= max_offset);
+        ret.offset = offset_ & max_offset;
+        return ret;
+    }
+
+    constexpr file_offset_t raw() const noexcept
+    {
+        return (static_cast<file_offset_t>(id) << OFFSET_BITS) |
+               static_cast<file_offset_t>(offset);
+    }
+
+    void set_spare(uint16_t const value) noexcept
+    {
+        KINET_ASSERT(value < max_spare);
+        spare = value & max_spare;
+    }
+};
+
+static_assert(sizeof(chunk_offset_t) == 8);
+static_assert(alignof(chunk_offset_t) == 8);
+static_assert(std::is_trivially_copyable_v<chunk_offset_t>);
+
+struct chunk_offset_t_hasher
+{
+    constexpr size_t operator()(chunk_offset_t const v) const noexcept
+    {
+        return fnv1a_hash<file_offset_t>()(v.raw());
+    }
+};
+
+//! Tag type for tests to ask for anonymous inodes
+struct use_anonymous_inode_tag
+{
+};
+
+struct use_anonymous_sized_inode_tag
+{
+};
+
+//! The invalid file offset
+static constexpr chunk_offset_t INVALID_OFFSET =
+    chunk_offset_t::invalid_value();
+
+//! The CPU page size and bits to assume
+static constexpr uint16_t CPU_PAGE_BITS = 12;
+static constexpr uint16_t CPU_PAGE_SIZE = (1U << CPU_PAGE_BITS);
+
+//! The storage i/o page size and bits to assume
+static constexpr uint16_t DISK_PAGE_BITS = 9;
+static constexpr uint16_t DISK_PAGE_SIZE = (1U << DISK_PAGE_BITS);
+
+//! The DMA friendly page size and bits
+static constexpr uint16_t DMA_PAGE_BITS = 6;
+static constexpr uint16_t DMA_PAGE_SIZE = (1U << DMA_PAGE_BITS);
+
+#if defined(__linux__)
+//! Calculate total byte length from an array of iovec buffers
+inline size_t iov_length(std::span<const struct iovec> const iovecs)
+{
+    size_t total = 0;
+    for (auto const &iov : iovecs) {
+        total += iov.iov_len;
+    }
+    return total;
+}
+#endif
+
+KINET_ASYNC_NAMESPACE_END
+
+// chunk_offset_t storage in the db metadata is accessed through
+// std::atomic_ref (see db_metadata_context). It lives in cross-process
+// shared memory, so require that view to be lock-free: a lock-based
+// fallback would use a per-process (hence non-shareable) lock table and
+// break cross-process atomicity.
+static_assert(std::atomic_ref<
+              KINET_ASYNC_NAMESPACE::chunk_offset_t>::is_always_lock_free);

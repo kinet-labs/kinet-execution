@@ -1,0 +1,675 @@
+// Copyright (C) 2025-26 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include "ffi.h"
+
+#include <category/core/byte_string.hpp>
+#include <category/core/log.hpp>
+#include <category/core/nibble.h>
+#include <category/execution/ethereum/db/util.hpp>
+#include <category/execution/kinet/db/storage_page.hpp>
+#include <category/execution/kinet/staking/read_valset.hpp>
+#include <category/mpt/db.hpp>
+#include <category/mpt/ondisk_db_config.hpp>
+#include <category/mpt/traverse.hpp>
+#include <category/mpt/traverse_util.hpp>
+#include <category/mpt/util.hpp>
+
+#include <quill/std/SystemError.h>
+
+#include <algorithm>
+#include <cassert>
+#include <filesystem>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <utility>
+#include <vector>
+
+struct TriedbRoInner
+{
+    kinet::mpt::AsyncIOContext io_ctx;
+    kinet::mpt::Db db;
+    kinet::mpt::AsyncContext async_ctx;
+
+    // Secondary timeline, opened when active. Both timelines share the one
+    // AsyncIOContext (an AsyncIO is one-per-thread). During the migration the
+    // secondary is the page-encoded backfill target; after page db gets
+    // promoted to primary, secondary becomes the frozen slot-encoded history
+    // that serves pre-cutoff versions the primary doesn't have. Versioned
+    // reads route primary first, then secondary (see db_for).
+    std::optional<kinet::mpt::Db> secondary_db;
+    std::optional<kinet::mpt::AsyncContext> secondary_async_ctx;
+
+    explicit TriedbRoInner(
+        std::vector<std::filesystem::path> dbname_paths,
+        uint64_t const node_lru_max_mem)
+        : io_ctx{kinet::mpt::ReadOnlyOnDiskDbConfig{
+              .disable_mismatching_storage_pool_check = true,
+              .dbname_paths = std::move(dbname_paths)}}
+        , db{io_ctx}
+        , async_ctx{db, node_lru_max_mem}
+    {
+        if (db.timeline_active(kinet::mpt::timeline_id::secondary)) {
+            secondary_db.emplace(io_ctx, kinet::mpt::timeline_id::secondary);
+            secondary_async_ctx.emplace(*secondary_db, node_lru_max_mem);
+        }
+    }
+
+    // The primary owns everything from its earliest version upward; only
+    // versions below that floor fall through to the secondary (the strictly
+    // older history). An empty primary reports INVALID_BLOCK_NUM (u64 max)
+    // as its earliest, which routes every version to the secondary.
+    kinet::mpt::Db &db_for(uint64_t const version)
+    {
+        if (version >= db.get_earliest_version() || !secondary_db.has_value()) {
+            return db;
+        }
+        return *secondary_db;
+    }
+
+    kinet::mpt::AsyncContext &async_ctx_for(uint64_t const version)
+    {
+        return (&db_for(version) == &db) ? async_ctx : *secondary_async_ctx;
+    }
+};
+
+namespace
+{
+    // Convert a nibble path into a packed byte array.
+    void nibbles_to_bytes(
+        uint8_t *dest, kinet::mpt::NibblesView const nibbles,
+
+        size_t const nibble_count)
+
+    {
+        for (unsigned n = 0; n < static_cast<unsigned>(nibble_count); ++n) {
+            set_nibble(dest, n, nibbles.get(n));
+        }
+    }
+
+    kinet::mpt::NibblesView
+    key_to_nibbles_view(uint8_t const *const key, uint8_t const key_len_nibbles)
+    {
+        return kinet::mpt::NibblesView{0, key_len_nibbles, key};
+    }
+}
+
+int triedb_open(
+    char const *dbdirpath, TriedbRoInner **db, uint64_t const node_lru_max_mem)
+{
+    if (dbdirpath == nullptr || db == nullptr || *db != nullptr) {
+        return -1;
+    }
+
+    std::vector<std::filesystem::path> paths;
+    std::error_code ec;
+
+    if (std::filesystem::is_block_file(dbdirpath, ec)) {
+        paths.emplace_back(dbdirpath);
+    }
+    else if (!ec) {
+        for (auto const &file :
+             std::filesystem::directory_iterator(dbdirpath, ec)) {
+            paths.emplace_back(file.path());
+        }
+    }
+
+    if (ec) {
+        LOG_ERROR("Failed to inspect database path: {} ({})", dbdirpath, ec);
+        return -2;
+    }
+
+    try {
+        *db = new TriedbRoInner{std::move(paths), node_lru_max_mem};
+    }
+    catch (std::exception const &e) {
+        std::cerr << e.what();
+        return -3;
+    }
+    return 0;
+}
+
+int triedb_close(TriedbRoInner *db)
+{
+    delete db;
+    return 0;
+}
+
+int triedb_read(
+    TriedbRoInner *db, uint8_t const *const key, uint8_t const key_len_nibbles,
+    uint8_t const **value, uint64_t const block_id)
+{
+    if (db == nullptr || value == nullptr) {
+        return -3;
+    }
+
+    *value = nullptr;
+
+    auto result = db->db_for(block_id).find(
+        key_to_nibbles_view(key, key_len_nibbles), block_id);
+    if (!result.has_value()) {
+        return -1;
+    }
+
+    auto const &value_view = result.value().node->value();
+    if (value_view.size() >
+        static_cast<size_t>(std::numeric_limits<int>::max())) {
+        // value length doesn't fit in return type
+        return -2;
+    }
+    int const value_len = static_cast<int>(value_view.size());
+    if (value_len > 0) {
+        uint8_t *buf = new uint8_t[value_len];
+        memcpy(buf, value_view.data(), value_len);
+        *value = buf;
+    }
+    return value_len;
+}
+
+bool triedb_is_page_encoded(TriedbRoInner *const db)
+{
+    if (db == nullptr) {
+        return false;
+    }
+    return db->db.state_machine_type() == kinet::mpt::state_machine_kind::kinet;
+}
+
+uint8_t triedb_migration_phase(TriedbRoInner *const db)
+{
+    // Phase codes; must stay in sync with the contract in ffi.h and the Rust
+    // MigrationPhase mapping in lib.rs. The phase fully determines each
+    // timeline's encoding (see ffi.h), so readers derive both from it.
+    enum phase : uint8_t
+    {
+        legacy = 0,
+        dual_timeline = 1,
+        page_encoded = 2,
+        promoted = 3,
+    };
+
+    if (db == nullptr) {
+        return legacy;
+    }
+    bool const secondary_active =
+        db->db.timeline_active(kinet::mpt::timeline_id::secondary);
+    if (db->db.state_machine_type() == kinet::mpt::state_machine_kind::kinet) {
+        return secondary_active ? promoted : page_encoded;
+    }
+    return secondary_active ? dual_timeline : legacy;
+}
+
+void triedb_storage_stats_read(
+    TriedbRoInner *const db, triedb_storage_stats *const out)
+{
+    if (out == nullptr) {
+        return;
+    }
+    *out = {0, 0};
+    if (db == nullptr) {
+        return;
+    }
+    auto const stats = db->db.get_storage_stats();
+    out->disk_capacity_bytes = stats.disk_capacity_bytes;
+    out->disk_used_bytes = stats.disk_used_bytes;
+}
+
+void triedb_compute_page_key(
+    uint8_t const *const slot_key, uint8_t *const out_page_key)
+{
+    kinet::bytes32_t key;
+    memcpy(key.bytes, slot_key, sizeof(key.bytes));
+    auto const page_key = kinet::compute_page_key(key);
+    memcpy(out_page_key, page_key.bytes, sizeof(page_key.bytes));
+}
+
+uint8_t triedb_compute_slot_offset(uint8_t const *const slot_key)
+{
+    kinet::bytes32_t key;
+    memcpy(key.bytes, slot_key, sizeof(key.bytes));
+    return kinet::compute_slot_offset(key);
+}
+
+bool triedb_decode_storage_page_slot(
+    uint8_t const *const leaf, size_t const leaf_len, uint8_t const offset,
+    uint8_t *const out_value)
+{
+    if (leaf == nullptr || out_value == nullptr) {
+        return false;
+    }
+    kinet::byte_string_view enc{leaf, leaf_len};
+    auto const page_bytes = kinet::decode_storage_db_ignore_key(enc);
+    if (page_bytes.has_error()) {
+        return false;
+    }
+    auto const page = kinet::decode_storage_page(page_bytes.value());
+    if (page.has_error()) {
+        return false;
+    }
+    // offset is the slot key's low 7 bits (0..SLOT_OFFSET_MASK). Reject an
+    // out-of-range value rather than masking it: masking would silently read
+    // the wrong slot (e.g. 0x80 -> slot 0) and hide a caller bug, and indexing
+    // past the 128-slot page would be UB.
+    if (offset > kinet::storage_page_t::SLOT_OFFSET_MASK) {
+        return false;
+    }
+    auto const slot = page.value()[offset];
+    memcpy(out_value, slot.bytes, sizeof(slot.bytes));
+    return true;
+}
+
+namespace
+{
+    struct AsyncReadReceiver
+    {
+        triedb_async_read_callback_fn callback_;
+        void *user_;
+
+        void set_value(
+            kinet::async::erased_connected_operation *state,
+            kinet::async::result<kinet::byte_string> result)
+        {
+            uint8_t const *value = nullptr;
+            int length = 0;
+            triedb_async_read_callback_fn const callback = callback_;
+            void *const user = user_;
+            if (!result) {
+                length = -1;
+            }
+            else {
+                auto const &value_view = result.value();
+                if (value_view.size() >
+                    static_cast<size_t>(std::numeric_limits<int>::max())) {
+                    // value length doesn't fit in return type
+                    length = -2;
+                }
+                else {
+                    length = static_cast<int>(value_view.size());
+                    if (length > 0) {
+                        uint8_t *buf = new uint8_t[length];
+                        memcpy(
+                            buf,
+                            value_view.data(),
+                            static_cast<size_t>(length));
+                        value = buf;
+                    }
+                }
+            }
+            delete state;
+            callback(value, length, user);
+        }
+    };
+}
+
+void triedb_async_read(
+    TriedbRoInner *db, uint8_t const *const key, uint8_t const key_len_nibbles,
+    uint64_t const block_id, triedb_async_read_callback_fn callback, void *user)
+{
+    auto *state = new auto(kinet::async::connect(
+        kinet::mpt::make_get_sender(
+            &db->async_ctx_for(block_id),
+            key_to_nibbles_view(key, key_len_nibbles),
+            block_id),
+        AsyncReadReceiver{callback, user}));
+    state->initiate();
+}
+
+namespace
+{
+    class TraverseMachineWithCallback final : public kinet::mpt::TraverseMachine
+    {
+        void *context_;
+        triedb_async_traverse_callback_fn callback_;
+        kinet::mpt::Nibbles path_;
+
+    public:
+        TraverseMachineWithCallback(
+            void *context, triedb_async_traverse_callback_fn callback,
+            kinet::mpt::NibblesView const initial_path)
+            : context_(context)
+            , callback_(callback)
+            , path_(initial_path)
+        {
+        }
+
+        virtual bool
+        down(unsigned char const branch, kinet::mpt::Node const &node) override
+        {
+            if (branch == kinet::mpt::INVALID_BRANCH) {
+                return true;
+            }
+            path_ = kinet::mpt::concat(
+                kinet::mpt::NibblesView{path_},
+                branch,
+                node.path_nibble_view());
+
+            if (node.has_value()) { // node is a leaf
+                assert(
+                    (path_.nibble_size() & 1) == 0); // assert even nibble size
+                size_t const path_bytes = path_.nibble_size() / 2;
+                auto path_data = std::make_unique<uint8_t[]>(path_bytes);
+
+                nibbles_to_bytes(path_data.get(), path_, path_.nibble_size());
+
+                // path_data is key, node.value().data() is rlp(value)
+                callback_(
+                    triedb_async_traverse_callback_value,
+                    context_,
+                    path_data.get(),
+                    path_bytes,
+                    node.value().data(),
+                    node.value().size());
+
+                return false;
+            }
+
+            return true;
+        }
+
+        virtual void
+        up(unsigned char const branch, kinet::mpt::Node const &node) override
+        {
+            kinet::mpt::NibblesView const path_view{path_};
+            int const rem_size = [&] {
+                if (branch == kinet::mpt::INVALID_BRANCH) {
+                    return 0;
+                }
+                return path_view.nibble_size() - 1 -
+                       node.path_nibble_view().nibble_size();
+            }();
+            path_ = path_view.substr(0, static_cast<unsigned>(rem_size));
+        }
+
+        virtual std::unique_ptr<TraverseMachine> clone() const override
+        {
+            return std::make_unique<TraverseMachineWithCallback>(*this);
+        }
+    };
+
+    struct TraverseReceiver
+    {
+        void *context;
+        triedb_async_traverse_callback_fn callback;
+
+        void set_value(
+            kinet::async::erased_connected_operation *state,
+            kinet::async::result<bool> res)
+        {
+            KINET_ASSERT_PRINTF(
+                res,
+                "triedb_async_traverse: Traversing failed with %s",
+                res.assume_error().message().c_str());
+            callback(
+                res.assume_value()
+                    ? triedb_async_traverse_callback_finished_normally
+                    : triedb_async_traverse_callback_finished_early,
+                context,
+                nullptr,
+                0,
+                nullptr,
+                0);
+            delete state; // deletes this
+        }
+    };
+
+    struct GetRootForTraverseReceiver
+    {
+        using ResultType =
+            kinet::async::result<std::shared_ptr<kinet::mpt::Node>>;
+
+        kinet::mpt::detail::TraverseSender traverse_sender;
+        TraverseReceiver traverse_receiver;
+
+        GetRootForTraverseReceiver(
+            void *context, triedb_async_traverse_callback_fn callback,
+            kinet::mpt::detail::TraverseSender traverse_sender_)
+            : traverse_sender(std::move(traverse_sender_))
+            , traverse_receiver(context, callback)
+        {
+        }
+
+        void set_value(
+            kinet::async::erased_connected_operation *state, ResultType res)
+        {
+            if (!res) {
+                traverse_receiver.callback(
+                    triedb_async_traverse_callback_finished_early,
+                    traverse_receiver.context,
+                    nullptr,
+                    0,
+                    nullptr,
+                    0);
+            }
+            else {
+                traverse_sender.traverse_root = res.assume_value();
+                (new auto(kinet::async::connect(
+                     std::move(traverse_sender), std::move(traverse_receiver))))
+                    ->initiate();
+            }
+            delete state; // deletes this
+        }
+    };
+}
+
+bool triedb_traverse(
+    TriedbRoInner *db, uint8_t const *const key, uint8_t const key_len_nibbles,
+    uint64_t const block_id, void *context,
+    triedb_async_traverse_callback_fn callback)
+{
+    kinet::mpt::NibblesView const prefix{0, key_len_nibbles, key};
+    kinet::mpt::Db &routed_db = db->db_for(block_id);
+    auto cursor = routed_db.find(prefix, block_id);
+    if (!cursor.has_value()) {
+        callback(
+            triedb_async_traverse_callback_finished_early,
+            context,
+            nullptr,
+            0,
+            nullptr,
+            0);
+        return false;
+    }
+
+    TraverseMachineWithCallback machine(
+        context, callback, kinet::mpt::NibblesView{});
+
+    bool const completed =
+        routed_db.traverse(cursor.value(), machine, block_id);
+
+    callback(
+        completed ? triedb_async_traverse_callback_finished_normally
+                  : triedb_async_traverse_callback_finished_early,
+        context,
+        nullptr,
+        0,
+        nullptr,
+        0);
+    return completed;
+}
+
+void triedb_async_ranged_get(
+    TriedbRoInner *db, uint8_t const *const prefix_key,
+    uint8_t const prefix_len_nibbles, uint8_t const *const min_key,
+    uint8_t const min_len_nibbles, uint8_t const *const max_key,
+    uint8_t const max_len_nibbles, uint64_t const block_id, void *context,
+    triedb_async_traverse_callback_fn callback)
+{
+    kinet::mpt::NibblesView const prefix{0, prefix_len_nibbles, prefix_key};
+    kinet::mpt::NibblesView const min{0, min_len_nibbles, min_key};
+    kinet::mpt::NibblesView const max{0, max_len_nibbles, max_key};
+    auto machine = std::make_unique<kinet::mpt::RangedGetMachine>(
+        min,
+        max,
+        [callback, context](
+            kinet::mpt::NibblesView const key,
+            kinet::byte_string_view const value) {
+            size_t const key_len_nibbles = key.nibble_size();
+            KINET_ASSERT_PRINTF(
+                (key_len_nibbles & 1) == 0,
+                "Only supported for even length paths but got %lu nibbles",
+                key_len_nibbles);
+            size_t const key_len_bytes = key_len_nibbles / 2;
+            auto key_data = std::make_unique<uint8_t[]>(key_len_bytes);
+
+            nibbles_to_bytes(key_data.get(), key, key_len_nibbles);
+
+            callback(
+                triedb_async_traverse_callback_value,
+                context,
+                key_data.get(),
+                key_len_bytes,
+                value.data(),
+                value.size());
+        });
+    kinet::mpt::AsyncContext &ctx = db->async_ctx_for(block_id);
+    (new auto(kinet::async::connect(
+         kinet::mpt::make_get_node_sender(&ctx, prefix, block_id),
+         GetRootForTraverseReceiver(
+             context,
+             callback,
+             kinet::mpt::make_traverse_sender(
+                 &ctx, {}, std::move(machine), block_id)))))
+        ->initiate();
+}
+
+void triedb_async_traverse(
+    TriedbRoInner *db, uint8_t const *const key, uint8_t const key_len_nibbles,
+    uint64_t const block_id, void *context,
+    triedb_async_traverse_callback_fn callback)
+{
+    kinet::mpt::NibblesView const prefix{0, key_len_nibbles, key};
+    auto machine = std::make_unique<TraverseMachineWithCallback>(
+        context, callback, kinet::mpt::NibblesView{});
+    kinet::mpt::AsyncContext &ctx = db->async_ctx_for(block_id);
+    (new auto(kinet::async::connect(
+         kinet::mpt::make_get_node_sender(&ctx, prefix, block_id),
+         GetRootForTraverseReceiver(
+             context,
+             callback,
+             kinet::mpt::make_traverse_sender(
+                 &ctx, {}, std::move(machine), block_id)))))
+        ->initiate();
+}
+
+size_t triedb_poll(TriedbRoInner *db, bool const blocking, size_t const count)
+{
+    // Both timelines share one AsyncIO, so polling the primary handle pumps
+    // the secondary's reads too.
+    return db->db.poll(blocking, count);
+}
+
+int triedb_finalize(uint8_t const *const value)
+{
+    delete[] value;
+    return 0;
+}
+
+uint64_t triedb_latest_proposed_version(TriedbRoInner *db)
+{
+    return db->db.get_latest_proposed_version();
+}
+
+kinet_c_bytes32 triedb_latest_proposed_block_id(TriedbRoInner *db)
+{
+    return db->db.get_latest_proposed_block_id();
+}
+
+uint64_t triedb_latest_voted_version(TriedbRoInner *db)
+{
+    return db->db.get_latest_voted_version();
+}
+
+kinet_c_bytes32 triedb_latest_voted_block_id(TriedbRoInner *db)
+{
+    return db->db.get_latest_voted_block_id();
+}
+
+uint64_t triedb_latest_finalized_version(TriedbRoInner *db)
+{
+    return db->db.get_latest_finalized_version();
+}
+
+uint64_t triedb_latest_verified_version(TriedbRoInner *db)
+{
+    return db->db.get_latest_verified_version();
+}
+
+uint64_t triedb_earliest_version(TriedbRoInner *db)
+{
+    uint64_t earliest = db->db.get_earliest_version();
+    if (db->secondary_db.has_value()) {
+        earliest = std::min(earliest, db->secondary_db->get_earliest_version());
+    }
+    return earliest;
+}
+
+uint64_t triedb_latest_version(TriedbRoInner *db)
+{
+    uint64_t latest = db->db.get_latest_version();
+    if (db->secondary_db.has_value()) {
+        uint64_t const secondary_latest =
+            db->secondary_db->get_latest_version();
+        if (latest == kinet::mpt::INVALID_BLOCK_NUM ||
+            (secondary_latest != kinet::mpt::INVALID_BLOCK_NUM &&
+             secondary_latest > latest)) {
+            latest = secondary_latest;
+        }
+    }
+    return latest;
+}
+
+uint64_t triedb_primary_earliest_version(TriedbRoInner *db)
+{
+    return db->db.get_earliest_version();
+}
+
+namespace
+{
+    validator_set *alloc_valset(uint64_t const length)
+    {
+        validator_data *validators = new validator_data[length];
+        return new validator_set{.validators = validators, .length = length};
+    }
+}
+
+void triedb_free_valset(validator_set *valset)
+{
+    delete[] valset->validators;
+    delete valset;
+}
+
+validator_set *triedb_read_valset(
+    TriedbRoInner *db, size_t const block_num, uint64_t const requested_epoch)
+{
+    auto ret = kinet::staking::read_valset(
+        db->db_for(block_num), block_num, requested_epoch);
+    if (!ret.has_value()) {
+        return nullptr;
+    }
+
+    uint64_t const length = ret.value().size();
+    validator_set *valset = alloc_valset(length);
+    for (uint64_t i = 0; i < length; ++i) {
+        std::memcpy(
+            valset->validators[i].secp_pubkey, ret.value()[i].secp_pubkey, 33);
+        std::memcpy(
+            valset->validators[i].bls_pubkey, ret.value()[i].bls_pubkey, 48);
+        std::memcpy(
+            valset->validators[i].stake, ret.value()[i].stake.bytes, 32);
+    }
+
+    return valset;
+}

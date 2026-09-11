@@ -1,0 +1,464 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/address.hpp>
+#include <category/core/assert.h>
+#include <category/core/bytes.hpp>
+#include <category/core/config.hpp>
+#include <category/core/int.hpp>
+#include <category/core/kinet_exception.hpp>
+#include <category/execution/ethereum/chain/chain.hpp>
+#include <category/execution/ethereum/core/transaction.hpp>
+#include <category/execution/ethereum/core/units.hpp>
+#include <category/execution/ethereum/reserve_balance.hpp>
+#include <category/execution/ethereum/state3/state.hpp>
+#include <category/execution/ethereum/transaction_gas.hpp>
+#include <category/execution/kinet/chain/kinet_chain.hpp>
+#include <category/execution/kinet/reserve_balance.h>
+#include <category/execution/kinet/reserve_balance.hpp>
+#include <category/execution/kinet/staking/util/constants.hpp>
+#include <category/vm/code.hpp>
+#include <category/vm/evm/delegation.hpp>
+#include <category/vm/evm/explicit_traits.hpp>
+#include <category/vm/evm/kinet/revision.h>
+#include <category/vm/evm/traits.hpp>
+
+#include <ankerl/unordered_dense.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <ranges>
+
+unsigned kinet_default_max_reserve_balance_mon(enum kinet_revision)
+{
+    return 10;
+}
+
+KINET_ANONYMOUS_NAMESPACE_BEGIN
+
+template <Traits traits>
+bool dipped_into_reserve(
+    Address const &sender, Transaction const &tx,
+    uint256_t const &base_fee_per_gas, uint64_t const i,
+    trace::StateTracer &state_tracer, ChainContext<traits> const &ctx,
+    State &state)
+{
+    KINET_ASSERT(i < ctx.senders.size());
+    KINET_ASSERT(i < ctx.authorities.size());
+    KINET_ASSERT(ctx.senders.size() == ctx.authorities.size());
+
+    static constexpr bool allow_init_selfdestruct_exemption =
+        traits::kinet_rev() >= KINET_NINE;
+
+    uint256_t const gas_fees =
+        uint256_t{tx.gas_limit} * gas_price<traits>(tx, base_fee_per_gas);
+    auto const &orig = state.original();
+    for (auto const &[addr, cur_account] : state.current()) {
+        KINET_ASSERT(orig.contains(addr));
+        bytes32_t const orig_code_hash = orig.at(addr).get_code_hash();
+        bytes32_t const effective_code_hash =
+            (traits::kinet_rev() >= KINET_EIGHT)
+                ? cur_account.recent().get_code_hash()
+                : orig_code_hash;
+        bool effective_is_delegated = false;
+
+        // the balance of the staking contract address can decrease but that
+        // should not cause this tx to revert as that address cannot send
+        // transactions
+        if (addr == staking::STAKING_CA) {
+            continue;
+        }
+
+        // Skip if not EOA
+        if (effective_code_hash != NULL_HASH) {
+            vm::SharedIntercode const intercode =
+                state.read_code(effective_code_hash)->intercode();
+            trace::on_read_code(state_tracer, effective_code_hash, intercode);
+            effective_is_delegated = kinet::vm::evm::is_delegated(
+                {intercode->code(), intercode->size()});
+            if (!effective_is_delegated) {
+                continue;
+            }
+        }
+        else if (
+            allow_init_selfdestruct_exemption && state.is_destructed(addr) &&
+            state.is_current_incarnation(addr)) {
+            continue;
+        }
+
+        // Check if dipped into reserve
+        std::optional<uint256_t> const violation_threshold =
+            [&] -> std::optional<uint256_t> {
+            uint256_t const orig_balance = state.get_original_balance(addr);
+            uint256_t const reserve =
+                std::min(get_max_reserve<traits>(addr), orig_balance);
+            if (addr == sender) {
+                if (gas_fees > reserve) { // must be dipping
+                    return std::nullopt;
+                }
+                return reserve - gas_fees;
+            }
+            return reserve;
+        }();
+        uint256_t const curr_balance = state.get_balance(addr);
+        if (!violation_threshold.has_value() ||
+            curr_balance < violation_threshold.value()) {
+            if (addr == sender) {
+                if (!can_sender_dip_into_reserve(
+                        sender, i, effective_is_delegated, ctx)) {
+                    return true;
+                }
+                // Skip if allowed to dip into reserve
+            }
+            else {
+                // Safety: this assertion should not be a recoverable one, as it
+                // indicates a logic error in the surrounding code: the
+                // violation threshold can only be nullopt when addr == sender,
+                // which is not the case in this branch.
+                KINET_ASSERT(violation_threshold.has_value());
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool is_delegated(
+    State &state, bytes32_t const &code_hash, trace::StateTracer &state_tracer)
+{
+    if (KINET_UNLIKELY(code_hash == NULL_HASH)) {
+        return false;
+    }
+
+    auto const vcode = state.read_code(code_hash);
+    KINET_ASSERT(vcode);
+    auto const &icode = vcode->intercode();
+    trace::on_read_code(state_tracer, code_hash, icode);
+    return vm::evm::is_delegated({icode->code(), icode->size()});
+}
+
+bool is_smart_contract_code(byte_string_view const code)
+{
+    return !code.empty() && !vm::evm::is_delegated({code.data(), code.size()});
+}
+
+bool dipped_into_reserve_cached(ReserveBalance const &rb)
+{
+    KINET_ASSERT(rb.tracking_enabled());
+    return rb.has_violation();
+}
+
+KINET_ANONYMOUS_NAMESPACE_END
+
+KINET_NAMESPACE_BEGIN
+
+ReserveBalance::ReserveBalance(State *const state)
+    : state_{state}
+{
+}
+
+bool ReserveBalance::tracking_enabled() const
+{
+    return tracking_enabled_;
+}
+
+bool ReserveBalance::has_violation() const
+{
+    return !failed_.empty();
+}
+
+bool ReserveBalance::failed_contains(Address const &address) const
+{
+    return failed_.contains(address);
+}
+
+bool ReserveBalance::subject_account(Address const &address)
+{
+    // the balance of the staking contract address can decrease but that
+    // should not cause this tx to revert as that address cannot send
+    // transactions
+    if (address == staking::STAKING_CA) {
+        return false;
+    }
+
+    OriginalAccountState &orig_state = state_->original_account_state(address);
+    bytes32_t const effective_code_hash = use_recent_code_hash_
+                                              ? state_->get_code_hash(address)
+                                              : orig_state.get_code_hash();
+    if (effective_code_hash == NULL_HASH) {
+        return true;
+    }
+    KINET_ASSERT(state_tracer_ != nullptr);
+    return is_delegated(*state_, effective_code_hash, *state_tracer_);
+}
+
+uint256_t ReserveBalance::pretx_reserve(Address const &address)
+{
+    KINET_ASSERT(get_max_reserve_);
+    uint256_t const max_reserve = get_max_reserve_(address);
+    return std::min(max_reserve, state_->get_original_balance(address));
+}
+
+void ReserveBalance::update_violation_status(Address const &address)
+{
+    if (!tracking_enabled_) {
+        return;
+    }
+
+    auto &violation_threshold = violation_thresholds_[address];
+    if (allow_init_selfdestruct_exemption_ && state_->is_destructed(address) &&
+        state_->is_current_incarnation(address)) {
+        // Contracts that selfdestruct during init never get a code hash.
+        violation_threshold = uint256_t{0};
+        failed_.erase(address);
+        return;
+    }
+
+    if (!violation_threshold.has_value()) {
+        if (!subject_account(address)) {
+            violation_threshold = uint256_t{0};
+            failed_.erase(address);
+            return;
+        }
+
+        uint256_t reserve = pretx_reserve(address);
+        if (address == sender_) {
+            if (sender_can_dip_) {
+                violation_threshold = uint256_t{0};
+                failed_.erase(address);
+                return;
+            }
+            if (sender_gas_fees_ > reserve) {
+                // This currently only happens in the RPC path.
+                // If we later use a more permissive reserve-balance design that
+                // accounts for credits to non-delegated accounts, this could
+                // also occur during speculative execution with stale pre-tx
+                // data. In that case, a retry is guaranteed, so what we do here
+                // will not matter in such cases.
+                //
+                // For RPC, treat this as a transaction revert: keep the
+                // threshold unset and the sender marked failed for this
+                // transaction. This avoids underflow in the subtraction below.
+                violation_threshold.reset();
+                failed_.insert(address);
+                return;
+            }
+            reserve = reserve - sender_gas_fees_;
+        }
+        violation_threshold = reserve;
+    }
+
+    if (*violation_threshold == 0) {
+        failed_.erase(address);
+        return;
+    }
+
+    if (state_->get_balance(address) < *violation_threshold) {
+        failed_.insert(address);
+    }
+    else {
+        failed_.erase(address);
+    }
+}
+
+void ReserveBalance::on_credit(Address const &address)
+{
+    if (!tracking_enabled_) {
+        return;
+    }
+    if (failed_.contains(address)) {
+        update_violation_status(address);
+    }
+}
+
+void ReserveBalance::on_debit(Address const &address)
+{
+    update_violation_status(address);
+}
+
+void ReserveBalance::on_pop_reject(FailedSet const &accounts)
+{
+    if (!tracking_enabled_) {
+        return;
+    }
+    for (auto const &dirty_address : accounts) {
+        violation_thresholds_[dirty_address].reset();
+        update_violation_status(dirty_address);
+    }
+}
+
+void ReserveBalance::on_set_code(
+    Address const &address, byte_string_view const code)
+{
+    if (!tracking_enabled_) {
+        return;
+    }
+    if (!use_recent_code_hash_) {
+        return;
+    }
+    auto &violation_threshold = violation_thresholds_[address];
+    if (is_smart_contract_code(code)) {
+        violation_threshold = uint256_t{0};
+        failed_.erase(address);
+        return;
+    }
+    violation_threshold.reset();
+    update_violation_status(address);
+}
+
+template <Traits traits>
+void ReserveBalance::init_from_tx(
+    Address const &sender, Transaction const &tx,
+    std::optional<uint256_t> const &base_fee_per_gas, uint64_t i,
+    trace::StateTracer &state_tracer, ChainContext<traits> const &ctx)
+{
+    state_tracer_ = &state_tracer;
+
+    constexpr bool tracking_disabled = []() {
+        if constexpr (!is_kinet_trait_v<traits>) {
+            return true;
+        }
+        else {
+            return traits::kinet_rev() < KINET_FOUR;
+        }
+    }();
+
+    if constexpr (tracking_disabled) {
+        tracking_enabled_ = false;
+        use_recent_code_hash_ = false;
+        allow_init_selfdestruct_exemption_ = false;
+        sender_ = {};
+        sender_gas_fees_ = 0;
+        sender_can_dip_ = false;
+        get_max_reserve_ = {};
+        failed_.clear();
+        return;
+    }
+
+    KINET_ASSERT(i < ctx.senders.size());
+    KINET_ASSERT(i < ctx.authorities.size());
+    KINET_ASSERT(ctx.senders.size() == ctx.authorities.size());
+    use_recent_code_hash_ = traits::kinet_rev() >= KINET_EIGHT;
+    allow_init_selfdestruct_exemption_ = traits::kinet_rev() >= KINET_NINE;
+    bytes32_t const sender_code_hash =
+        use_recent_code_hash_
+            ? state_->get_code_hash(sender)
+            : state_->original_account_state(sender).get_code_hash();
+    bool const sender_can_dip = can_sender_dip_into_reserve<traits>(
+        sender, i, is_delegated(*state_, sender_code_hash, state_tracer), ctx);
+    tracking_enabled_ = true;
+    sender_ = sender;
+    sender_gas_fees_ = uint256_t{tx.gas_limit} *
+                       gas_price<traits>(tx, base_fee_per_gas.value_or(0));
+    sender_can_dip_ = sender_can_dip;
+    get_max_reserve_ = [](Address const &addr) {
+        return get_max_reserve<traits>(addr);
+    };
+    failed_.clear();
+    violation_thresholds_.clear();
+}
+
+EXPLICIT_KINET_TRAITS_MEMBER(ReserveBalance::init_from_tx);
+
+template <Traits traits>
+    requires is_kinet_trait_v<traits>
+void init_reserve_balance_context(
+    State &state, Address const &sender, Transaction const &tx,
+    std::optional<uint256_t> const &base_fee_per_gas, uint64_t i,
+    trace::StateTracer &state_tracer, ChainContext<traits> const &ctx)
+{
+    state.rb_.init_from_tx<traits>(
+        sender, tx, base_fee_per_gas, i, state_tracer, ctx);
+}
+
+EXPLICIT_KINET_TRAITS(init_reserve_balance_context);
+
+template <Traits traits>
+bool revert_transaction(
+    Address const &sender, Transaction const &tx,
+    uint256_t const &base_fee_per_gas, uint64_t const i, State &state,
+    trace::StateTracer &state_tracer, ChainContext<traits> const &ctx)
+{
+    if constexpr (traits::kinet_rev() >= KINET_FOUR) {
+        return dipped_into_reserve<traits>(
+            sender, tx, base_fee_per_gas, i, state_tracer, ctx, state);
+    }
+    else if constexpr (traits::kinet_rev() >= KINET_ZERO) {
+        return false;
+    }
+}
+
+EXPLICIT_KINET_TRAITS(revert_transaction);
+
+template <Traits traits>
+bool revert_transaction_cached(State &state)
+{
+    if constexpr (traits::kinet_rev() >= KINET_FOUR) {
+        return dipped_into_reserve_cached(state.rb_);
+    }
+    else if constexpr (traits::kinet_rev() >= KINET_ZERO) {
+        return false;
+    }
+}
+
+EXPLICIT_KINET_TRAITS(revert_transaction_cached);
+
+template <Traits traits>
+    requires is_kinet_trait_v<traits>
+bool can_sender_dip_into_reserve(
+    Address const &sender, uint64_t const i, bool const sender_is_delegated,
+    ChainContext<traits> const &ctx)
+{
+    if (sender_is_delegated) { // delegated accounts cannot dip
+        return false;
+    }
+
+    // check pending blocks
+    if (ctx.grandparent_senders_and_authorities.contains(sender) ||
+        ctx.parent_senders_and_authorities.contains(sender)) {
+        return false;
+    }
+
+    // check current block
+    if (ctx.senders_and_authorities.contains(sender)) {
+        for (size_t j = 0; j <= i; ++j) {
+            if (j < i && sender == ctx.senders.at(j)) {
+                return false;
+            }
+            if (std::ranges::contains(ctx.authorities.at(j), sender)) {
+                return false;
+            }
+        }
+    }
+
+    return true; // Allow dipping into reserve if no restrictions found
+}
+
+EXPLICIT_KINET_TRAITS(can_sender_dip_into_reserve);
+
+template <Traits traits>
+uint256_t get_max_reserve(Address const &)
+{
+    // TODO: implement precompile (support reading from orig)
+    return uint256_t{
+               kinet_default_max_reserve_balance_mon(traits::kinet_rev())} *
+           ETHER;
+}
+
+EXPLICIT_KINET_TRAITS(get_max_reserve);
+
+KINET_NAMESPACE_END

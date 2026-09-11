@@ -1,0 +1,162 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <event.hpp>
+
+#include <category/core/assert.h>
+#include <category/core/cleanup.h> // NOLINT(misc-include-cleaner)
+#include <category/core/config.hpp>
+#include <category/core/event/event_iterator.h>
+#include <category/core/event/event_ring.h>
+#include <category/core/event/event_ring_util.h>
+#include <category/core/event/owned_event_ring.hpp>
+#include <category/execution/ethereum/event/exec_event_ctypes.h>
+#include <category/execution/ethereum/event/exec_event_recorder.hpp>
+
+#include <gtest/gtest.h>
+#include <kinet/test/config.hpp>
+
+#include <cerrno>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+
+#include <fcntl.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+KINET_TEST_NAMESPACE_BEGIN
+
+void find_execution_events(
+    kinet_event_ring const *const event_ring, kinet_event_iterator *const iter,
+    ExecutionEvents *const exec_events)
+{
+    kinet_event_descriptor event;
+
+ConsumeMore:
+    ASSERT_EQ(kinet_event_iterator_try_next(iter, &event), KINET_EVENT_SUCCESS);
+    ASSERT_NE(event.event_type, KINET_EXEC_EVM_ERROR);
+    ASSERT_TRUE(kinet_event_ring_payload_check(event_ring, &event));
+    void const *const payload =
+        kinet_event_ring_payload_peek(event_ring, &event);
+
+    switch (event.event_type) {
+    case KINET_EXEC_BLOCK_START:
+        ASSERT_FALSE(exec_events->block_start);
+        exec_events->block_start = {
+            event,
+            reinterpret_cast<kinet_exec_block_start const *>(payload),
+            event_ring};
+        break;
+
+    case KINET_EXEC_BLOCK_END:
+        ASSERT_FALSE(exec_events->block_end);
+        exec_events->block_end = {
+            event,
+            reinterpret_cast<kinet_exec_block_end const *>(payload),
+            event_ring};
+        return;
+
+    case KINET_EXEC_BLOCK_REJECT:
+        ASSERT_FALSE(exec_events->block_reject_code);
+        exec_events->block_reject_code = {
+            event,
+            reinterpret_cast<kinet_exec_block_reject const *>(payload),
+            event_ring};
+        return;
+
+    case KINET_EXEC_TXN_REJECT:
+        ASSERT_FALSE(exec_events->txn_reject_code);
+        exec_events->txn_reject_code = {
+            event,
+            reinterpret_cast<kinet_exec_txn_reject const *>(payload),
+            event_ring};
+        return;
+
+    case KINET_EXEC_TXN_HEADER_START:
+        exec_events->txn_inputs.emplace_back(
+            event,
+            reinterpret_cast<kinet_exec_txn_header_start const *>(payload),
+            event_ring);
+        break;
+
+    case KINET_EXEC_TXN_EVM_OUTPUT:
+        exec_events->txn_evm_outputs.emplace_back(
+            event,
+            reinterpret_cast<kinet_exec_txn_evm_output const *>(payload),
+            event_ring);
+        break;
+
+    default:
+        break;
+    }
+
+    // Look for more events until we find the end of the block (either
+    // BLOCK_END or one of the other terminating events, e.g. BLOCK_REJECT)
+    goto ConsumeMore;
+}
+
+std::unique_ptr<OwnedEventRing>
+init_exec_event_ring(std::string const event_ring_path)
+{
+    constexpr uint8_t DESCRIPTORS_SHIFT = 20;
+    constexpr uint8_t PAYLOAD_BUF_SHIFT = 28; // 256 MiB
+    constexpr mode_t CREATE_MODE = S_IRUSR | S_IWUSR;
+    constexpr char MEMFD_NAME[] = "exec_event_test";
+
+    int ring_fd [[gnu::cleanup(cleanup_close)]] =
+        std::empty(event_ring_path) ? memfd_create(MEMFD_NAME, 0)
+                                    : open(
+                                          event_ring_path.c_str(),
+                                          O_CREAT | O_EXCL | O_RDWR,
+                                          CREATE_MODE);
+
+    KINET_ASSERT(ring_fd != -1);
+    kinet_event_ring_simple_config const simple_cfg = {
+        .descriptors_shift = DESCRIPTORS_SHIFT,
+        .payload_buf_shift = PAYLOAD_BUF_SHIFT,
+        .context_large_pages = 0,
+        .content_type = KINET_EVENT_CONTENT_TYPE_EXEC,
+        .schema_hash = g_kinet_exec_event_schema_hash};
+    int rc = kinet_event_ring_init_simple(&simple_cfg, ring_fd, 0, MEMFD_NAME);
+    KINET_ASSERT_PRINTF(
+        rc == 0,
+        "event library error -- %s",
+        kinet_event_ring_get_last_error());
+
+    // mmap the event ring into this process' address space
+    kinet_event_ring exec_ring;
+    rc = kinet_event_ring_mmap(
+        &exec_ring,
+        PROT_READ | PROT_WRITE,
+        MAP_POPULATE,
+        ring_fd,
+        0,
+        MEMFD_NAME);
+    KINET_ASSERT_PRINTF(
+        rc == 0,
+        "event library error -- %s",
+        kinet_event_ring_get_last_error());
+
+    int const owned_fd = dup(ring_fd);
+    KINET_ASSERT_PRINTF(
+        owned_fd != -1, "dup(2) failed: %s (%d)", strerror(errno), errno);
+    return std::make_unique<OwnedEventRing>(
+        owned_fd, event_ring_path, exec_ring);
+}
+
+KINET_TEST_NAMESPACE_END

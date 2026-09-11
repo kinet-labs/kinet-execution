@@ -1,0 +1,334 @@
+# Copyright (C) 2025 Kinet Labs, Inc.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+cmake_minimum_required(VERSION 3.27)
+
+cmake_policy(SET CMP0144 NEW) # find_package uses upper-case _ROOT variables
+
+project(kinet)
+
+set(CATEGORY_MAIN_DIR ${PROJECT_SOURCE_DIR})
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 15)
+    message(FATAL_ERROR "GCC version 15 or higher is required.")
+  endif()
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19)
+    message(FATAL_ERROR "Clang version 19 or higher is required.")
+  endif()
+endif()
+
+if(BUILD_SHARED_LIBS)
+  # BUILD_SHARED_LIBS=ON does not automatically set -fPIC, leading to
+  # relocations being emitted in object files that can't be patched
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+option(KINET_COMPILER_COVERAGE "Build with coverage" OFF)
+option(KINET_COMPILER_TESTING "Build compiler tests" OFF)
+option(KINET_COMPILER_BENCHMARKS "Build compiler benchmarks" OFF)
+option(KINET_COMPILER_DUMP_ASM "Dump assembly files into build/asm" OFF)
+option(KINET_COMPILER_STATS "Print statistics about the compiler" OFF)
+option(KINET_COMPILER_HOT_PATH_STATS "Print statistics about the vm" OFF)
+
+include(cmake/test.cmake)
+
+# ##############################################################################
+# deps
+# ##############################################################################
+
+set(THIRD_PARTY_DIR "${PROJECT_SOURCE_DIR}/third_party")
+
+include(cmake/compile_options.cmake)
+
+find_package(Boost REQUIRED COMPONENTS context filesystem json CONFIG)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(brotli REQUIRED IMPORTED_TARGET libbrotlienc libbrotlidec)
+pkg_check_modules(crypto++ REQUIRED IMPORTED_TARGET libcrypto++)
+pkg_check_modules(zstd REQUIRED IMPORTED_TARGET libzstd)
+
+# ankerl
+add_library(ankerl_hash INTERFACE)
+target_include_directories(ankerl_hash INTERFACE "third_party/ankerl")
+
+# asmjit
+set(ASMJIT_STATIC ON)
+add_subdirectory(third_party/asmjit)
+
+# BLAKE3
+add_subdirectory(third_party/BLAKE3/c)
+set_target_properties(blake3 PROPERTIES C_VISIBILITY_PRESET default)
+
+# blst
+set(DOWNLOAD_BLST OFF)
+include(cmake/blst.cmake)
+
+# c-kzg-4844
+add_subdirectory("third_party/c-kzg-4844-builder")
+
+# cli11
+find_package(CLI11 REQUIRED)
+
+# concurrentqueue
+add_subdirectory("third_party/concurrentqueue")
+
+# cthash
+add_subdirectory("third_party/cthash")
+
+# ethash
+# No kinet code uses ethash: hashing goes through category/crypto/keccak.h and
+# the digest type is kinet_hash256 (category/crypto/hash256.h). It is still
+# configured because silkpre links ethash::keccak privately. Retiring the
+# submodule means finishing the silkpre -> silkpre_vendor migration.
+set(ETHASH_TESTING NO)
+add_subdirectory("third_party/ethash")
+# ethash carries clang::no_sanitize attributes that GCC ignores and warns about.
+# Match the narrow, GNU-only form kinet_compile_options() uses above.
+target_compile_options(
+  ethash PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wno-attributes=clang::no_sanitize>)
+
+# fiber (boost)
+# Boost.Fiber's CMakeLists.txt expects granular Boost targets from the
+# superproject build. The system-installed Boost only provides Boost::headers
+# for header-only libs. Create shim targets so fiber can link them.
+foreach(_boost_hdr_lib assert config core intrusive predef smart_ptr algorithm format)
+  if(NOT TARGET Boost::${_boost_hdr_lib})
+    add_library(boost_${_boost_hdr_lib} INTERFACE)
+    target_link_libraries(boost_${_boost_hdr_lib} INTERFACE Boost::headers)
+    add_library(Boost::${_boost_hdr_lib} ALIAS boost_${_boost_hdr_lib})
+  endif()
+endforeach()
+add_subdirectory("third_party/fiber" SYSTEM)
+# Boost.Fiber triggers warnings under C++23 strict flags.
+target_compile_options(boost_fiber PRIVATE -Wno-deprecated-declarations -Wno-conversion)
+# Some upstream fiber tests include <boost/bind.hpp>, which emits a #pragma
+# message about global-namespace placeholders. It's a raw message (not a
+# deprecation warning), so -Wno-* can't suppress it; retain the legacy
+# behavior to silence it. The test subdirectory is only traversed under the
+# same condition fiber itself uses, so mirror it before querying the targets.
+if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fiber/test/CMakeLists.txt")
+  get_property(_fiber_test_targets DIRECTORY "third_party/fiber/test"
+    PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_t ${_fiber_test_targets})
+    target_compile_definitions(${_t} PRIVATE BOOST_BIND_GLOBAL_PLACEHOLDERS)
+  endforeach()
+endif()
+
+# immer
+option(immer_BUILD_TESTS OFF)
+option(immer_BUILD_EXAMPLES OFF)
+option(immer_BUILD_EXTRAS OFF)
+add_subdirectory("third_party/immer" SYSTEM)
+
+# intx
+add_subdirectory("third_party/intx")
+
+# evmc
+set(HUNTER_ENABLED OFF)
+add_subdirectory("third_party/evmc")
+
+# komihash
+add_library(komihash INTERFACE)
+target_include_directories(komihash INTERFACE "third_party/komihash")
+
+# magic_enum
+add_subdirectory("third_party/magic_enum")
+
+# nanobench
+add_subdirectory("third_party/nanobench")
+
+# nlohmann_json
+add_subdirectory("third_party/nlohmann_json" SYSTEM)
+
+# quill
+add_subdirectory("third_party/quill")
+# hide warnings from quill
+include_directories(SYSTEM ${CMAKE_CURRENT_SOURCE_DIR}/third_party/quill/include)
+
+# silkpre
+set(OPTIONAL_BUILD_TESTS OFF)
+set(OLD_CMAKE_POLICY_VERSION_MINIMUM "${CMAKE_POLICY_VERSION_MINIMUM}")
+set(CMAKE_POLICY_VERSION_MINIMUM "3.5")
+add_subdirectory(third_party/silkpre)
+set(CMAKE_POLICY_VERSION_MINIMUM "${OLD_CMAKE_POLICY_VERSION_MINIMUM}")
+# undo the injection of ccache silkpre/ff does
+set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE)
+set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK)
+# libff (pulled in by silkpre) trips several warnings under our flags: unused
+# parameters/constants in stubbed-out code, and an uninitialized timespec in its
+# profiling clock helper (only flagged once the optimizer runs).
+target_compile_options(
+  ff
+  PRIVATE -Wno-unused-parameter -Wno-unused-const-variable -Wno-uninitialized)
+
+# tbb
+find_package(TBB REQUIRED)
+
+# unordered_dense
+add_subdirectory("third_party/unordered_dense")
+
+# ##############################################################################
+# unit tests
+# ##############################################################################
+
+set(TEST_DATA_DIR "${PROJECT_SOURCE_DIR}/test")
+set(VM_DATA_DIR "${PROJECT_SOURCE_DIR}/test/vm/data")
+configure_file(cmake/test_resource_data.h.in test/test_resource_data.h @ONLY)
+
+set(TOP_CURRENT_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}")
+function(kinet_add_test target)
+  cmake_parse_arguments(AT "NO_CUSTOM_MAIN" "" "PROPERTIES" ${ARGN})
+  # Exactly one main provider per branch: gtest's main for NO_CUSTOM_MAIN,
+  # otherwise kinet_gtest_main. Linking both would make the resolution of
+  # main order-dependent between the two archives.
+  if(AT_NO_CUSTOM_MAIN)
+    add_executable(${target} ${AT_UNPARSED_ARGUMENTS})
+    target_link_libraries(${target} GTest::Main)
+  else()
+    add_executable(${target} ${AT_UNPARSED_ARGUMENTS})
+    target_include_directories(
+      ${target}
+      PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/test/unit/common/include")
+    target_link_libraries(${target} kinet_gtest_main)
+  endif()
+  kinet_compile_options(${target})
+  target_compile_options(${target} PUBLIC "-Wno-missing-field-initializers"
+  )# TODO
+  target_include_directories(${target} PRIVATE "${TOP_CURRENT_BINARY_DIR}/test")
+  target_link_libraries(${target} kinet_execution GTest::GTest)
+  gtest_discover_tests(
+    ${target} DISCOVERY_MODE PRE_TEST
+    PROPERTIES ENVIRONMENT ASAN_OPTIONS=abort_on_error=1 ENVIRONMENT
+               UBSAN_OPTIONS=halt_on_error=1,print_stacktrace=1 ENVIRONMENT
+               TSAN_OPTIONS=external_symbolizer_path=/usr/bin/llvm-symbolizer
+               ${AT_PROPERTIES})
+endfunction()
+
+function(kinet_add_test_folder target)
+  cmake_parse_arguments(ATF "" "" "EXCLUDE" ${ARGN})
+  file(GLOB_RECURSE test_files CONFIGURE_DEPENDS ${target}/test_*.cpp
+       ${target}/*_test.cpp)
+  if(ATF_EXCLUDE)
+    list(REMOVE_ITEM test_files ${ATF_EXCLUDE})
+  endif()
+  foreach(test_file ${test_files})
+    get_filename_component(test_name ${test_file} NAME_WLE)
+    kinet_add_test(${test_name} ${test_file})
+  endforeach()
+endfunction()
+
+function(kinet_add_test_death target)
+  cmake_parse_arguments(ADD_DEATH_TEST "" "FAIL_REGEX"
+                        "SOURCES;LINK_LIBRARIES;TEST_PROPERTIES" ${ARGN})
+  if(NOT ADD_DEATH_TEST_FAIL_REGEX)
+    message(FATAL_ERROR "FATAL: FAIL_REGEX is mandatory")
+  endif()
+  add_executable(${target} ${ADD_DEATH_TEST_SOURCES})
+  kinet_compile_options(${target})
+  target_link_libraries(${target} PUBLIC GTest::gtest_main
+                                         ${ADD_DEATH_TEST_LINK_LIBRARIES})
+  add_test(NAME "${PROJECT_NAME}/${target}" COMMAND ${CMAKE_COMMAND} -E env
+                                                    $<TARGET_FILE:${target}>)
+  set_tests_properties(
+    "${PROJECT_NAME}/${target}"
+    PROPERTIES PASS_REGULAR_EXPRESSION
+               "${ADD_DEATH_TEST_FAIL_REGEX}"
+               ${ADD_DEATH_TEST_TEST_PROPERTIES}
+               ENVIRONMENT
+               ASAN_OPTIONS=abort_on_error=1
+               ENVIRONMENT
+               UBSAN_OPTIONS=halt_on_error=1,print_stacktrace=1
+               ENVIRONMENT
+               TSAN_OPTIONS=external_symbolizer_path=/usr/bin/llvm-symbolizer)
+endfunction()
+
+# ##############################################################################
+# version
+# ##############################################################################
+
+# Embedded in --help output of the C++ binaries. Honors a build-time override
+# (e.g. set by CI) so containerized builds without a .git directory can still
+# stamp the binary.
+if(DEFINED ENV{GIT_COMMIT_HASH})
+  set(GIT_COMMIT_HASH $ENV{GIT_COMMIT_HASH})
+else()
+  execute_process(
+    COMMAND git rev-parse HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_COMMIT_HASH
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+endif()
+
+# ##############################################################################
+# libs
+# ##############################################################################
+
+add_subdirectory("category/async")
+# crypto before core: kinet_core links kinet_crypto for keccak256()
+add_subdirectory("category/crypto")
+add_subdirectory("category/core")
+add_subdirectory("category/mpt")
+add_subdirectory("category/event")
+add_subdirectory("category/execution")
+add_subdirectory("category/rpc")
+add_subdirectory("category/statesync")
+add_subdirectory("category/vm")
+
+# Assemble all the object libraries into complete kinet runtime library,
+# kinet_execution
+add_library(kinet_execution)
+target_link_libraries(
+  kinet_execution
+  PUBLIC kinet_core
+         kinet_async
+         kinet_trie
+         kinet_execution_ethereum
+         kinet_execution_native
+         kinet_execution_runloop
+         kinet_precompiles
+         kinet_rpc
+         kinet_statesync
+         kinet-vm
+         kinet-vm-compiler
+         kinet-vm-evm
+         kinet-vm-interpreter
+         kinet-vm-runtime
+         kinet-vm-utils)
+
+# ##############################################################################
+# cmds
+# ##############################################################################
+
+add_subdirectory(${PROJECT_SOURCE_DIR}/cmd)
+
+# ##############################################################################
+# unit tests
+# ##############################################################################
+
+add_subdirectory(${PROJECT_SOURCE_DIR}/test/utils)
+add_subdirectory(${PROJECT_SOURCE_DIR}/test/ethereum_test)
+add_subdirectory(${PROJECT_SOURCE_DIR}/test/unit/common)
+add_subdirectory(${PROJECT_SOURCE_DIR}/test/vm)
+
+# ##############################################################################
+# utilities
+# ##############################################################################
+
+if(UTILS_CLANG_TIDY_AUTO_CONST)
+  add_subdirectory(${PROJECT_SOURCE_DIR}/utils)
+endif()

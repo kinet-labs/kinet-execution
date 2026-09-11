@@ -1,0 +1,679 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/mpt/config.hpp>
+
+#include <category/core/assert.h>
+#include <category/core/bytes.hpp>
+#include <category/mpt/util.hpp>
+
+#include <category/async/config.hpp>
+#include <category/core/detail/start_lifetime_as_polyfill.hpp>
+
+#include "unsigned_20.hpp"
+
+#include <atomic>
+#include <type_traits>
+
+KINET_MPT_NAMESPACE_BEGIN
+class DbMetadataContext;
+class UpdateAux;
+
+namespace test
+{
+    struct DbMetadataTestAccess; // test-only access to ring internals
+}
+
+namespace detail
+{
+    struct db_metadata;
+#ifndef __clang__
+    constexpr bool bitfield_layout_check()
+    {
+        /* Make sure reserved0_ definitely lives at offset +3
+         */
+        constexpr struct
+        {
+            uint64_t chunk_info_count : 20;
+            uint64_t unused0_ : 36;
+            uint64_t reserved0_ : 8;
+        } v{.reserved0_ = 1};
+
+        struct type
+        {
+            uint8_t x[sizeof(v)];
+        };
+
+        constexpr type ret = std::bit_cast<type>(v);
+        return ret.x[sizeof(v) - 1]; // last byte
+    }
+#endif
+    inline void
+    db_copy(db_metadata *dest, db_metadata const *src, size_t bytes);
+
+    // In-place relocation of one metadata copy's fixed-header fields from the
+    // KINET007 layout to KINET008, rewriting the magic on success. chunk_count
+    // is the seq-chunk count (== chunk_info[] length). The caller is
+    // responsible for holding the copy's hold_dirty, healing dirty copies from
+    // a clean sibling beforehand, and flushing afterward. Exposed for unit
+    // tests that exercise large chunk_count layouts the constructor cannot
+    // reach without an impractically large pool.
+    void migrate_kinet007_to_kinet008(db_metadata *m, uint32_t chunk_count);
+
+    // For the memory map of the first conventional chunk
+    struct db_metadata
+    {
+        static constexpr char const *MAGIC = "KINET008";
+        static constexpr unsigned MAGIC_STRING_LEN = 8;
+        // Previous magic supported via on-the-fly migration (see
+        // DbMetadataContext constructor).
+        static constexpr char const *PREVIOUS_MAGIC = "KINET007";
+
+        friend class KINET_MPT_NAMESPACE::DbMetadataContext;
+        friend class KINET_MPT_NAMESPACE::UpdateAux;
+        friend inline void
+        db_copy(db_metadata *dest, db_metadata const *src, size_t bytes);
+
+        // Needed to please the compiler in db_copy()
+        db_metadata &operator=(db_metadata const &) = default;
+
+        char magic[MAGIC_STRING_LEN];
+        uint64_t chunk_info_count : 20; // items in chunk_info below
+        uint64_t unused0_ : 36; // next item MUST be on a byte boundary
+        uint64_t reserved_for_is_dirty_ : 8; // for is_dirty below
+        // DO NOT INSERT ANYTHING IN HERE
+        uint64_t capacity_in_free_list; // used to detect when free space is
+                                        // running low
+
+        // Thread safe ring buffer containing root offsets on disk. One thread
+        // is both the producer and the consumer. Other threads may query
+        // relative to the front of the buffer. In the context of TrieDb, this
+        // design works well, because this min is always known to be stored N
+        // elements before the max, so no special handling is required when the
+        // ring buffer is under capacity.
+        //
+        // Two physically-distinct rings of this type live in db_metadata:
+        // `root_offsets` (ring_a) and `secondary_timeline` (ring_b). Which one
+        // is the logical primary is selected by `primary_ring_idx` below.
+        // SIZE_-1 caps the per-ring cnv_chunks[] list length (vastly over-
+        // provisioned vs. real pools that use at most a handful per ring).
+        struct root_offsets_ring_t
+        {
+            static constexpr size_t SIZE_ = 32;
+
+            friend class KINET_MPT_NAMESPACE::DbMetadataContext;
+            friend inline void
+            db_copy(db_metadata *dest, db_metadata const *src, size_t bytes);
+            friend struct KINET_MPT_NAMESPACE::test::DbMetadataTestAccess;
+
+        private:
+            uint64_t version_lower_bound_;
+            uint64_t
+                next_version_; // all bits zero turns into INVALID_BLOCK_NUM
+
+            struct
+            {
+                uint32_t high_bits_all_set; // All bits one to deliberately
+                                            // break older codebases
+                uint32_t cnv_chunks_len; // How long the following list is
+
+                struct
+                {
+                    uint32_t high_bits_all_set; // All bits one to deliberately
+                                                // break older codebases
+                    uint32_t cnv_chunk_id; // The read-write chunk id
+                } cnv_chunks[SIZE_ - 1];
+            } storage_;
+
+        public:
+            // Mutated only by offline shrink/grow; concurrent readers must use
+            // the atomic accessor in root_offsets_delegator. Plain access here
+            // is for offline/single-threaded callers (CLI restore, tests,
+            // init).
+            uint32_t cnv_chunks_len() const noexcept
+            {
+                return storage_.cnv_chunks_len;
+            }
+
+            uint32_t cnv_chunk_id(uint32_t const k) const noexcept
+            {
+                return storage_.cnv_chunks[k].cnv_chunk_id;
+            }
+
+            void restore_from(root_offsets_ring_t const &other) noexcept
+            {
+                version_lower_bound_ = other.version_lower_bound_;
+                next_version_ = other.next_version_;
+                storage_ = other.storage_;
+            }
+        } root_offsets;
+
+        // Mutable per-timeline state that travels with the physical ring on
+        // promote (the role label flips, but the values stay attached to the
+        // data). Kept as a sibling of root_offsets_ring_t so the ring struct
+        // describes only the chunk storage. Read/written under hold_dirty.
+        struct timeline_state_t
+        {
+            // Last upsert's auto-expire version threshold for this timeline.
+            // Accessed atomically via std::atomic_ref<int64_t>.
+            int64_t auto_expire_version_;
+            // mpt::state_machine_kind for the timeline currently bound to
+            // this physical ring. Stamped at pool create time by kinet-mpt
+            // --state-machine, and on activate-secondary for whichever ring
+            // hosts the secondary at that moment. Read by mpt::Db ctor to
+            // pick the right StateMachine via the registry in
+            // state_machine_kind.hpp.
+            uint8_t state_machine_kind_;
+            uint8_t reserved_sm_[7]; // alignment + future per-ring scalars
+        } root_offsets_state;
+
+        struct db_offsets_info_t
+        {
+            // starting offsets of current wip db block's contents. all
+            // contents starting this point are not yet validated, and
+            // should be rewound if restart.
+            chunk_offset_t start_of_wip_offset_fast;
+            chunk_offset_t start_of_wip_offset_slow;
+
+            db_offsets_info_t() = delete;
+            db_offsets_info_t(db_offsets_info_t const &) = delete;
+            db_offsets_info_t(db_offsets_info_t &&) = delete;
+            db_offsets_info_t &operator=(db_offsets_info_t const &) =
+                default; // purely to please the compiler
+            db_offsets_info_t &operator=(db_offsets_info_t &&) = delete;
+            ~db_offsets_info_t() = default;
+
+            constexpr db_offsets_info_t(
+                chunk_offset_t const start_of_wip_offset_fast_,
+                chunk_offset_t const start_of_wip_offset_slow_)
+                : start_of_wip_offset_fast(start_of_wip_offset_fast_)
+                , start_of_wip_offset_slow(start_of_wip_offset_slow_)
+            {
+            }
+
+            void store(db_offsets_info_t const &o)
+            {
+                start_of_wip_offset_fast = o.start_of_wip_offset_fast;
+                start_of_wip_offset_slow = o.start_of_wip_offset_slow;
+            }
+        } db_offsets;
+
+        /* NOTE Remember to update the DB restore implementation in the CLI
+        tool if you modify anything after this!
+        */
+        // cannot use atomic_uint64_t here because db_metadata has to be
+        // trivially copyable for db_copy().
+        uint64_t history_length;
+        uint64_t latest_finalized_version;
+        uint64_t latest_verified_version;
+        uint64_t latest_voted_version;
+        uint64_t latest_proposed_version;
+        bytes32_t latest_voted_block_id;
+        bytes32_t latest_proposed_block_id;
+
+        // Ring B: second physical root-offsets ring, structurally identical
+        // to root_offsets (ring_a). Both rings have the same header type,
+        // but physically ring_a's cnv_chunks list is populated at pool init
+        // (all ring chunks go to it) while ring_b starts empty. On
+        // activate_secondary_header, ring_a atomically shrinks and the
+        // freed chunks are handed to ring_b; on deactivate they return.
+        root_offsets_ring_t secondary_timeline;
+        timeline_state_t secondary_timeline_state;
+
+        // Which physical ring is the logical primary:
+        //   0 = root_offsets (ring_a), 1 = secondary_timeline (ring_b).
+        // Promote flips this byte atomically on both metadata copies. Headers
+        // and physical storage stay attached to their rings — only the role
+        // label moves.
+        uint8_t primary_ring_idx;
+        // 1 = secondary role is currently active (the non-primary ring holds
+        // valid data and is being read/written). 0 = inactive; the non-
+        // primary ring's header/data are garbage.
+        uint8_t secondary_timeline_active_;
+        // Pads the two role bytes out to 16 and reserves room for future
+        // per-timeline role fields without bumping the metadata magic.
+        uint8_t reserved_timeline_[14];
+
+        // Intent log for crash-safe metadata transitions (ring shrink/grow
+        // and primary-role promote). Stamped + msync'd before the mutation;
+        // cleared + msync'd after the (idempotent) body completes. On open,
+        // a nonzero op_kind triggers replay.
+        enum pending_op_kind : uint32_t
+        {
+            PENDING_OP_NONE = 0,
+            PENDING_OP_ACTIVATE = 1, // activate_secondary_header
+            PENDING_OP_DEACTIVATE = 2, // deactivate_secondary_header
+            PENDING_OP_PROMOTE = 3, // promote_secondary_to_primary_header
+        };
+
+        struct pending_shrink_grow_t
+        {
+            uint32_t op_kind; // pending_op_kind
+            // op-specific param: target primary cnv_chunks_len for
+            // ACTIVATE/DEACTIVATE; target primary_ring_idx for PROMOTE.
+            uint32_t op_param;
+        } pending_shrink_grow;
+
+        static_assert(sizeof(pending_shrink_grow_t) == 8);
+
+        // padding for adding future atomics without requiring DB reset.
+        // Sized so sizeof(db_metadata) stays at 4480 regardless of how
+        // timeline_state_t grows in subsequent PRs.
+        uint8_t future_variables_unused
+            [4040 - sizeof(root_offsets_ring_t) - 2 * sizeof(timeline_state_t) -
+             16 - sizeof(pending_shrink_grow_t)];
+
+        // used to know if the metadata was being
+        // updated when the process suddenly exited
+        std::atomic_ref<uint8_t> is_dirty() noexcept
+        {
+            static_assert(sizeof(std::atomic<uint8_t>) == sizeof(uint8_t));
+#ifndef __clang__
+            static_assert(bitfield_layout_check());
+#endif
+            return std::atomic_ref<uint8_t>(*start_lifetime_as<uint8_t>(
+                (std::byte *)&capacity_in_free_list - 1));
+        }
+
+        struct id_pair
+        {
+            uint32_t begin, end;
+        } free_list, fast_list, slow_list;
+
+        // Sentinel for a "no chunk" slot: a full-width uint32, distinct from
+        // the 20-bit chunk_info_t::INVALID_CHUNK_ID node id used in the
+        // prev/next links. Used both for id_pair begin/end (empty
+        // free/fast/slow lists) and for empty slots in
+        // root_offsets_ring_t::storage_.cnv_chunks[] (an empty ring slot is
+        // NULL_CHUNK, never 0 — cnv chunk 0 holds db_metadata, so 0 would alias
+        // it).
+        static constexpr uint32_t NULL_CHUNK = UINT32_MAX;
+
+        struct chunk_info_t
+        {
+            static constexpr uint32_t INVALID_CHUNK_ID = 0xfffff;
+            uint64_t prev_chunk_id : 20; // same bits as from chunk_offset_t
+            uint64_t in_fast_list : 1;
+            uint64_t in_slow_list : 1;
+            uint64_t insertion_count0_ : 10; // align next to 8 bit boundary
+                                             // to aid codegen
+            uint64_t next_chunk_id : 20; // same bits as from chunk_offset_t
+            uint64_t unused0_ : 2;
+            uint64_t insertion_count1_ : 10;
+
+            uint32_t index(db_metadata const *const parent) const noexcept
+            {
+                auto const ret = uint32_t(this - parent->chunk_info);
+                KINET_ASSERT(ret < parent->chunk_info_count);
+                return ret;
+            }
+
+            unsigned_20 insertion_count() const noexcept
+            {
+                return uint32_t(insertion_count1_ << 10) |
+                       uint32_t(insertion_count0_);
+            }
+
+            chunk_info_t const *
+            prev(db_metadata const *const parent) const noexcept
+            {
+                if (prev_chunk_id == INVALID_CHUNK_ID) {
+                    return nullptr;
+                }
+                return parent->at(prev_chunk_id);
+            }
+
+            chunk_info_t const *
+            next(db_metadata const *const parent) const noexcept
+            {
+                if (next_chunk_id == INVALID_CHUNK_ID) {
+                    return nullptr;
+                }
+                return parent->at(next_chunk_id);
+            }
+        };
+#ifdef __clang__
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wc99-extensions"
+#elif defined __GNUC__
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wpedantic"
+#endif
+        chunk_info_t chunk_info[];
+#ifdef __clang__
+    #pragma clang diagnostic pop
+#elif defined __GNUC__
+    #pragma GCC diagnostic pop
+#endif
+        static_assert(sizeof(chunk_info_t) == 8);
+        static_assert(std::is_trivially_copyable_v<chunk_info_t>);
+        // chunk_info[] lives in cross-process shared memory and is accessed
+        // via std::atomic_ref<chunk_info_t>; require lock-free so it uses
+        // direct atomic instructions rather than a per-process lock table.
+        static_assert(std::atomic_ref<chunk_info_t>::is_always_lock_free);
+
+        auto hold_dirty() noexcept
+        {
+            static_assert(sizeof(std::atomic<uint8_t>) == sizeof(uint8_t));
+
+            struct holder_t
+            {
+                db_metadata *parent;
+
+                explicit holder_t(db_metadata *const p)
+                    : parent(p)
+                {
+                    parent->is_dirty().store(1, std::memory_order_release);
+                }
+
+                holder_t(holder_t const &) = delete;
+
+                holder_t(holder_t &&o) noexcept
+                    : parent(o.parent)
+                {
+                    o.parent = nullptr;
+                }
+
+                ~holder_t()
+                {
+                    if (parent != nullptr) {
+                        parent->is_dirty().store(0, std::memory_order_release);
+                    }
+                }
+            };
+
+            return holder_t(this);
+        }
+
+        chunk_info_t const *at(uint32_t const idx) const noexcept
+        {
+            KINET_ASSERT(idx < chunk_info_count);
+            return &chunk_info[idx];
+        }
+
+        chunk_info_t atomic_load_chunk_info(
+            uint32_t const idx, std::memory_order const load_ord =
+                                    std::memory_order_seq_cst) const noexcept
+        {
+            // at() is const-qualified, but chunk_info[] is mutable shared
+            // memory; std::atomic_ref gains a const-qualified form only in
+            // C++26 (P3323R1), so a const_cast is required here for now.
+            // TODO(C++26/P3323): use std::atomic_ref<chunk_info_t const> and
+            // drop the const_cast.
+            return std::atomic_ref<chunk_info_t>(
+                       *const_cast<chunk_info_t *>(at(idx)))
+                .load(load_ord);
+        }
+
+        chunk_info_t const *free_list_begin() const noexcept
+        {
+            if (free_list.begin == NULL_CHUNK) {
+                return nullptr;
+            }
+            return at(free_list.begin);
+        }
+
+        chunk_info_t const *free_list_end() const noexcept
+        {
+            if (free_list.end == NULL_CHUNK) {
+                return nullptr;
+            }
+            return at(free_list.end);
+        }
+
+        chunk_info_t const *fast_list_begin() const noexcept
+        {
+            if (fast_list.begin == NULL_CHUNK) {
+                return nullptr;
+            }
+            return at(fast_list.begin);
+        }
+
+        chunk_info_t const *fast_list_end() const noexcept
+        {
+            if (fast_list.end == NULL_CHUNK) {
+                return nullptr;
+            }
+            return at(fast_list.end);
+        }
+
+        chunk_info_t const *slow_list_begin() const noexcept
+        {
+            if (slow_list.begin == NULL_CHUNK) {
+                return nullptr;
+            }
+            return at(slow_list.begin);
+        }
+
+        chunk_info_t const *slow_list_end() const noexcept
+        {
+            if (slow_list.end == NULL_CHUNK) {
+                return nullptr;
+            }
+            return at(slow_list.end);
+        }
+
+    private:
+        chunk_info_t *at_(uint32_t const idx) noexcept
+        {
+            KINET_ASSERT(idx < chunk_info_count);
+            return &chunk_info[idx];
+        }
+
+        void append_(id_pair &list, chunk_info_t *const i) noexcept
+        {
+            // Insertion count is assigned to chunk_info_t *i atomically
+            auto const g = hold_dirty();
+            chunk_info_t info;
+            info.in_fast_list = (&list == &fast_list);
+            info.in_slow_list = (&list == &slow_list);
+            info.insertion_count0_ = info.insertion_count1_ = 0;
+            info.next_chunk_id = chunk_info_t::INVALID_CHUNK_ID;
+            if (list.end == NULL_CHUNK) {
+                KINET_ASSERT(list.begin == NULL_CHUNK);
+                info.prev_chunk_id = chunk_info_t::INVALID_CHUNK_ID;
+                list.begin = list.end = i->index(this);
+            }
+            else {
+                KINET_ASSERT((list.end & ~0xfffffU) == 0);
+                info.prev_chunk_id = list.end & 0xfffffU;
+                auto *tail = at_(list.end);
+                uint32_t const insertion_count =
+                    uint32_t(tail->insertion_count()) + 1;
+                // Strict less-than because MAX_COUNT is reserved for
+                // INVALID_VIRTUAL_OFFSET so that no valid virtual offset
+                // compacts to INVALID_COMPACT_VIRTUAL_OFFSET.
+                KINET_ASSERT(
+                    insertion_count < virtual_chunk_offset_t::MAX_COUNT,
+                    "Chunk count overflow detected. The 20-bit address "
+                    "space for chunk count has been exhausted. Please "
+                    "perform a database reset. TODO: expand the address "
+                    "space.");
+                info.insertion_count0_ = insertion_count & 0x3ff;
+                info.insertion_count1_ = insertion_count >> 10 & 0x3ff;
+                KINET_ASSERT(
+                    tail->next_chunk_id == chunk_info_t::INVALID_CHUNK_ID);
+                list.end = tail->next_chunk_id = i->index(this) & 0xfffffU;
+            }
+            std::atomic_ref<chunk_info_t>(*i).store(
+                info, std::memory_order_release);
+        }
+
+        void remove_(chunk_info_t *const i) noexcept
+        {
+            auto get_list = [&]() -> id_pair & {
+                if (i->in_fast_list) {
+                    return fast_list;
+                }
+                if (i->in_slow_list) {
+                    return slow_list;
+                }
+                return free_list;
+            };
+            auto const g = hold_dirty();
+            if (i->prev_chunk_id == chunk_info_t::INVALID_CHUNK_ID &&
+                i->next_chunk_id == chunk_info_t::INVALID_CHUNK_ID) {
+                id_pair &list = get_list();
+                KINET_ASSERT(list.begin == i->index(this));
+                KINET_ASSERT(list.end == i->index(this));
+                list.begin = list.end = NULL_CHUNK;
+#ifndef NDEBUG
+                i->in_fast_list = i->in_slow_list = false;
+#endif
+                return;
+            }
+            if (i->prev_chunk_id == chunk_info_t::INVALID_CHUNK_ID) {
+                id_pair &list = get_list();
+                KINET_ASSERT(list.begin == i->index(this));
+                auto *next = at_(i->next_chunk_id);
+                next->prev_chunk_id = chunk_info_t::INVALID_CHUNK_ID;
+                list.begin = next->index(this);
+#ifndef NDEBUG
+                i->in_fast_list = i->in_slow_list = false;
+                i->next_chunk_id = chunk_info_t::INVALID_CHUNK_ID;
+#endif
+                return;
+            }
+            if (i->next_chunk_id == chunk_info_t::INVALID_CHUNK_ID) {
+                id_pair &list = get_list();
+                KINET_ASSERT(list.end == i->index(this));
+                auto *prev = at_(i->prev_chunk_id);
+                prev->next_chunk_id = chunk_info_t::INVALID_CHUNK_ID;
+                list.end = prev->index(this);
+#ifndef NDEBUG
+                i->in_fast_list = i->in_slow_list = false;
+                i->prev_chunk_id = chunk_info_t::INVALID_CHUNK_ID;
+#endif
+                return;
+            }
+            KINET_ASSERT(
+                "remove_() has had mid-list removals explicitly disabled to "
+                "prevent insertion count becoming inaccurate" == nullptr);
+            auto *prev = at_(i->prev_chunk_id);
+            auto *next = at_(i->next_chunk_id);
+            prev->next_chunk_id = next->index(this) & 0xfffffU;
+            next->prev_chunk_id = prev->index(this) & 0xfffffU;
+#ifndef NDEBUG
+            i->in_fast_list = i->in_slow_list = false;
+            i->prev_chunk_id = i->next_chunk_id =
+                chunk_info_t::INVALID_CHUNK_ID;
+#endif
+        }
+
+        void free_capacity_add_(uint64_t const bytes) noexcept
+        {
+            auto const g = hold_dirty();
+            capacity_in_free_list += bytes;
+        }
+
+        void free_capacity_sub_(uint64_t const bytes) noexcept
+        {
+            auto const g = hold_dirty();
+            capacity_in_free_list -= bytes;
+        }
+
+        void advance_db_offsets_to_(
+            db_offsets_info_t const &offsets_to_apply) noexcept
+        {
+            auto const g = hold_dirty();
+            db_offsets.store(offsets_to_apply);
+        }
+    };
+
+    static_assert(std::is_trivially_copyable_v<db_metadata>);
+    static_assert(std::is_trivially_copy_assignable_v<db_metadata>);
+    // The fixed-header size is pinned so that adding or shrinking a
+    // field in the header is a conscious decision. The actual mmap
+    // region is sizeof(db_metadata) + chunk_count * sizeof(chunk_info_t)
+    // and must fit in cnv.capacity()/2 (copy 0 at offset 0, copy 1 at
+    // cnv.capacity()/2); enlarging the fixed header eats into the
+    // chunk_info[] budget for any given chunk_count.
+    static_assert(sizeof(db_metadata) == 4480);
+    static_assert(alignof(db_metadata) == 8);
+
+    inline void atomic_memcpy(
+        void *__restrict__ const dest_, void const *__restrict__ const src_,
+        size_t bytes,
+        std::memory_order const load_ord = std::memory_order_acquire,
+        std::memory_order const store_ord = std::memory_order_release)
+    {
+        KINET_ASSERT((((uintptr_t)dest_) & 7) == 0);
+        KINET_ASSERT((((uintptr_t)src_) & 7) == 0);
+        KINET_ASSERT((((uintptr_t)bytes) & 7) == 0);
+        auto *dest = reinterpret_cast<uint64_t *>(dest_);
+        // src_ is const but aliases mutable shared memory; std::atomic_ref
+        // gains a const-qualified form only in C++26 (P3323R1), so cast the
+        // const away for now.
+        // TODO(C++26/P3323): use std::atomic_ref<uint64_t const>, drop cast.
+        auto *src = reinterpret_cast<uint64_t *>(const_cast<void *>(src_));
+        while (bytes >= 64) {
+            auto const a0 = std::atomic_ref<uint64_t>(*src++).load(load_ord);
+            auto const a1 = std::atomic_ref<uint64_t>(*src++).load(load_ord);
+            auto const a2 = std::atomic_ref<uint64_t>(*src++).load(load_ord);
+            auto const a3 = std::atomic_ref<uint64_t>(*src++).load(load_ord);
+            auto const a4 = std::atomic_ref<uint64_t>(*src++).load(load_ord);
+            auto const a5 = std::atomic_ref<uint64_t>(*src++).load(load_ord);
+            auto const a6 = std::atomic_ref<uint64_t>(*src++).load(load_ord);
+            auto const a7 = std::atomic_ref<uint64_t>(*src++).load(load_ord);
+            std::atomic_ref<uint64_t>(*dest++).store(a0, store_ord);
+            std::atomic_ref<uint64_t>(*dest++).store(a1, store_ord);
+            std::atomic_ref<uint64_t>(*dest++).store(a2, store_ord);
+            std::atomic_ref<uint64_t>(*dest++).store(a3, store_ord);
+            std::atomic_ref<uint64_t>(*dest++).store(a4, store_ord);
+            std::atomic_ref<uint64_t>(*dest++).store(a5, store_ord);
+            std::atomic_ref<uint64_t>(*dest++).store(a6, store_ord);
+            std::atomic_ref<uint64_t>(*dest++).store(a7, store_ord);
+            bytes -= 64;
+        }
+        for (size_t n = 0; n < bytes; n += 8) {
+            std::atomic_ref<uint64_t>(*dest++).store(
+                std::atomic_ref<uint64_t>(*src++).load(load_ord), store_ord);
+        }
+    }
+
+    /* A dirty bit setting memcpy implementation, so the dirty bit gets held
+    high during the memory copy.
+    */
+    inline void db_copy(
+        db_metadata *const dest, db_metadata const *const src,
+        size_t const bytes)
+    {
+        alignas(db_metadata) std::byte buffer[sizeof(db_metadata)];
+        memcpy(buffer, src, sizeof(db_metadata));
+        auto *intr = start_lifetime_as<db_metadata>(buffer);
+        KINET_ASSERT(intr->is_dirty().load(std::memory_order_acquire) == false);
+        auto const g1 = intr->hold_dirty();
+        auto const g2 = dest->hold_dirty();
+        dest->root_offsets.next_version_ = 0; // INVALID_BLOCK_NUM
+        auto const old_next_version = intr->root_offsets.next_version_;
+        intr->root_offsets.next_version_ = 0; // INVALID_BLOCK_NUM
+        dest->secondary_timeline.next_version_ = 0;
+        auto const old_secondary_next = intr->secondary_timeline.next_version_;
+        intr->secondary_timeline.next_version_ = 0;
+        atomic_memcpy((void *)dest, buffer, sizeof(db_metadata));
+        atomic_memcpy(
+            ((std::byte *)dest) + sizeof(db_metadata),
+            ((std::byte const *)src) + sizeof(db_metadata),
+            bytes - sizeof(db_metadata));
+        std::atomic_ref<uint64_t>(dest->root_offsets.next_version_)
+            .store(old_next_version, std::memory_order_release);
+        std::atomic_ref<uint64_t>(dest->secondary_timeline.next_version_)
+            .store(old_secondary_next, std::memory_order_release);
+    };
+}
+
+KINET_MPT_NAMESPACE_END

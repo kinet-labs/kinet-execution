@@ -1,0 +1,2521 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <test_resource_data.h>
+
+#include <category/core/address.hpp>
+#include <category/core/assert.h>
+#include <category/core/blake3.hpp>
+#include <category/core/byte_string.hpp>
+#include <category/core/bytes.hpp>
+#include <category/core/keccak.hpp>
+#include <category/core/log.hpp>
+#include <category/execution/ethereum/core/account.hpp>
+#include <category/execution/ethereum/core/fmt/bytes_fmt.hpp>
+#include <category/execution/ethereum/core/fmt/int_fmt.hpp>
+#include <category/execution/ethereum/db/db.hpp>
+#include <category/execution/ethereum/db/trie_db.hpp>
+#include <category/execution/ethereum/db/util.hpp>
+#include <category/execution/ethereum/state2/block_state.hpp>
+#include <category/execution/ethereum/state2/state_deltas.hpp>
+#include <category/execution/ethereum/state3/state.hpp>
+#include <category/mpt/db.hpp>
+#include <category/mpt/ondisk_db_config.hpp>
+#include <category/mpt/util.hpp>
+#include <category/vm/code.hpp>
+#include <category/vm/vm.hpp>
+#include <kinet/test/traits_test.hpp>
+
+#include <evmc/evmc.h>
+#include <evmc/evmc.hpp>
+
+#include <quill/std/Optional.h>
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <optional>
+#include <random>
+#include <set>
+#include <string>
+#include <utility>
+
+using namespace kinet;
+using namespace kinet::test;
+using namespace kinet::literals;
+
+namespace
+{
+
+    constexpr auto a = 0x5353535353535353535353535353535353535353_address;
+    constexpr auto b = 0xbebebebebebebebebebebebebebebebebebebebe_address;
+    constexpr auto c = 0xa5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5_address;
+    constexpr auto key1 =
+        0x00000000000000000000000000000000000000000000000000000000cafebabe_bytes32;
+    constexpr auto key2 =
+        0x1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c_bytes32;
+    constexpr auto key3 =
+        0x5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b_bytes32;
+    constexpr auto value1 =
+        0x0000000000000000000000000000000000000000000000000000000000000003_bytes32;
+    constexpr auto value2 =
+        0x0000000000000000000000000000000000000000000000000000000000000007_bytes32;
+    constexpr auto value3 =
+        0x000000000000000000000000000000000000000000000000000000000000000a_bytes32;
+    constexpr auto null =
+        0x0000000000000000000000000000000000000000000000000000000000000000_bytes32;
+    constexpr auto hash1 =
+        0x1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c_bytes32;
+    constexpr auto code_hash1 =
+        0x00000000000000000000000000000000000000000000000000000000cafebabe_bytes32;
+    constexpr auto code_hash2 =
+        0x1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c_bytes32;
+    constexpr auto code1 =
+        byte_string{0x65, 0x74, 0x68, 0x65, 0x72, 0x6d, 0x69};
+    auto const icode1 = vm::make_shared_intercode(code1);
+    constexpr auto code2 =
+        byte_string{0x6e, 0x65, 0x20, 0x2d, 0x20, 0x45, 0x55, 0x31, 0x34};
+    auto const icode2 = vm::make_shared_intercode(code2);
+
+    struct InMemoryStateTestBase
+    {
+        mpt::Db db{std::make_unique<InMemoryMachine>()};
+        TrieDb tdb{db};
+        vm::VM vm;
+    };
+
+    struct OnDiskStateTest : public ::testing::Test
+    {
+        mpt::Db db{std::make_unique<OnDiskMachine>(), mpt::OnDiskDbConfig{}};
+        TrieDb tdb{db};
+        vm::VM vm;
+
+        explicit OnDiskStateTest(bool const cache = false)
+            : tdb{db, cache}
+        {
+        }
+    };
+
+    struct PageEncodedOnDiskStateTest : public ::testing::Test
+    {
+        mpt::Db db{/* use the page encoded state machine*/
+                   std::make_unique<KinetOnDiskMachine>(),
+                   mpt::OnDiskDbConfig{}};
+        TrieDb tdb{db};
+        vm::VM vm;
+
+        explicit PageEncodedOnDiskStateTest(bool const cache = false)
+            : tdb{db, cache}
+        {
+        }
+    };
+
+    template <typename T>
+    struct OnDiskTestSuite : public T
+    {
+    };
+
+    using OnDiskTestTypes =
+        ::testing::Types<OnDiskStateTest, PageEncodedOnDiskStateTest>;
+    TYPED_TEST_SUITE(OnDiskTestSuite, OnDiskTestTypes);
+
+    struct OnDiskStateTestCached : public OnDiskStateTest
+    {
+        OnDiskStateTestCached()
+            : OnDiskStateTest(/*cache=*/true)
+        {
+        }
+    };
+
+    struct PageEncodedOnDiskStateTestCached : public PageEncodedOnDiskStateTest
+    {
+        PageEncodedOnDiskStateTestCached()
+            : PageEncodedOnDiskStateTest(/*cache=*/true)
+        {
+        }
+    };
+
+    template <typename T>
+    struct OnDiskCachedTestSuite : public T
+    {
+    };
+
+    using OnDiskCachedTestTypes = ::testing::Types<
+        OnDiskStateTestCached, PageEncodedOnDiskStateTestCached>;
+    TYPED_TEST_SUITE(OnDiskCachedTestSuite, OnDiskCachedTestTypes);
+
+    struct InMemoryStateTest
+        : public InMemoryStateTestBase
+        , public ::testing::Test
+    {
+    };
+
+    template <typename T>
+    struct InMemoryStateTraitsTest : public TraitsTest<T>
+    {
+        static std::unique_ptr<mpt::StateMachine> make_machine()
+        {
+            if constexpr (TraitsTest<T>::Trait::mip_8_active()) {
+                return std::make_unique<KinetInMemoryMachine>();
+            }
+            else {
+                return std::make_unique<InMemoryMachine>();
+            }
+        }
+
+        mpt::Db db{make_machine()};
+        TrieDb tdb{db};
+        vm::VM vm;
+    };
+
+    template <bool page_encoded>
+    struct TwoOnDisk : public ::testing::Test
+    {
+        mpt::Db db1{
+            page_encoded ? std::make_unique<KinetOnDiskMachine>()
+                         : std::make_unique<OnDiskMachine>(),
+            mpt::OnDiskDbConfig{.file_size_db = 8}};
+        mpt::Db db2{
+            page_encoded ? std::make_unique<KinetOnDiskMachine>()
+                         : std::make_unique<OnDiskMachine>(),
+            mpt::OnDiskDbConfig{.file_size_db = 8}};
+        // baseline noncaching db for tdb1
+        TrieDb tdb1{db1};
+        TrieDb tdb2{db2, /*enable_multiblock_cache=*/true};
+        vm::VM vm;
+    };
+
+    template <typename T>
+    struct TwoOnDiskSuite : public T
+    {
+    };
+
+    using TwoOnDiskTypes = ::testing::Types<TwoOnDisk<false>, TwoOnDisk<true>>;
+    TYPED_TEST_SUITE(TwoOnDiskSuite, TwoOnDiskTypes);
+}
+
+DEFINE_TRAITS_FIXTURE(InMemoryStateTraitsTest);
+
+TEST_F(InMemoryStateTest, access_account)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 10'000}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+
+    EXPECT_EQ(s.access_account(a), EVMC_ACCESS_COLD);
+    EXPECT_EQ(s.access_account(a), EVMC_ACCESS_WARM);
+    EXPECT_EQ(s.access_account(b), EVMC_ACCESS_COLD);
+    EXPECT_EQ(s.access_account(b), EVMC_ACCESS_WARM);
+}
+
+TEST_F(InMemoryStateTest, account_exists)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 10'000}}}}}),
+        Code{},
+        BlockHeader{});
+
+    EXPECT_TRUE(this->tdb.read_account(a).has_value());
+
+    State s{bs, Incarnation{1, 1}};
+
+    EXPECT_TRUE(s.account_exists(a));
+    EXPECT_FALSE(s.account_exists(b));
+}
+
+TEST_F(InMemoryStateTest, create_contract)
+{
+    BlockState bs{this->tdb, this->vm};
+
+    State s{bs, Incarnation{1, 1}};
+    s.create_contract(a);
+    EXPECT_TRUE(s.account_exists(a));
+
+    // allow pre-existing empty account
+    EXPECT_FALSE(s.account_exists(b));
+    s.create_contract(b);
+    EXPECT_TRUE(s.account_exists(b));
+}
+
+TEST_F(InMemoryStateTest, get_balance)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 10'000}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+
+    EXPECT_EQ(s.get_balance(a), 10'000);
+    EXPECT_EQ(s.get_balance(b), 0);
+    EXPECT_EQ(s.get_balance(c), 0);
+}
+
+TEST_F(InMemoryStateTest, add_to_balance)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{.account = {std::nullopt, Account{.balance = 1}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    s.add_to_balance(a, 10'000);
+    s.add_to_balance(b, 20'000);
+
+    EXPECT_EQ(s.get_balance(a), 10'001);
+    EXPECT_EQ(s.get_balance(b), 20'000);
+}
+
+TEST_F(InMemoryStateTest, get_nonce)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a, StateDelta{.account = {std::nullopt, Account{.nonce = 2}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+
+    EXPECT_EQ(s.get_nonce(a), 2);
+    EXPECT_EQ(s.get_nonce(b), 0);
+    EXPECT_EQ(s.get_nonce(c), 0);
+}
+
+TEST_F(InMemoryStateTest, set_nonce)
+{
+    BlockState bs{this->tdb, this->vm};
+
+    State s{bs, Incarnation{1, 1}};
+    s.set_nonce(b, 1);
+
+    EXPECT_EQ(s.get_nonce(b), 1);
+}
+
+TEST_F(InMemoryStateTest, get_code_hash)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.code_hash = hash1}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+
+    EXPECT_EQ(s.get_code_hash(a), hash1);
+    EXPECT_EQ(s.get_code_hash(b), NULL_HASH);
+    EXPECT_EQ(s.get_code_hash(c), NULL_HASH);
+}
+
+TEST_F(InMemoryStateTest, set_code_sets_code_hash)
+{
+    BlockState bs{this->tdb, this->vm};
+
+    State s{bs, Incarnation{1, 1}};
+    s.create_contract(b);
+    s.set_code(b, code1);
+
+    EXPECT_EQ(s.get_code_hash(b), to_bytes(keccak256(code1)));
+}
+
+TYPED_TEST(InMemoryStateTraitsTest, selfdestruct)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 18'000}}}},
+             {c,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 38'000}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    s.create_contract(b);
+    s.add_to_balance(b, 28'000);
+
+    EXPECT_EQ(
+        s.selfdestruct<typename TestFixture::Trait>(a, c),
+        std::make_pair(true, 18'000));
+    EXPECT_EQ(s.get_balance(a), 0);
+    EXPECT_EQ(s.get_balance(c), 56'000);
+    EXPECT_EQ(
+        s.selfdestruct<typename TestFixture::Trait>(a, c),
+        std::make_pair(false, 0));
+
+    EXPECT_EQ(
+        s.selfdestruct<typename TestFixture::Trait>(b, c),
+        std::make_pair(true, 28'000));
+    EXPECT_EQ(s.get_balance(b), 0);
+    EXPECT_EQ(s.get_balance(c), 84'000);
+    EXPECT_EQ(
+        s.selfdestruct<typename TestFixture::Trait>(b, c),
+        std::make_pair(false, 0));
+
+    s.destruct_suicides<typename TestFixture::Trait>();
+    if constexpr (TestFixture::Trait::evm_rev() >= KINET_ETH_CANCUN) {
+        EXPECT_TRUE(s.account_exists(a));
+    }
+    else {
+        EXPECT_FALSE(s.account_exists(a));
+    }
+    EXPECT_FALSE(s.account_exists(b));
+}
+
+TYPED_TEST(InMemoryStateTraitsTest, selfdestruct_separate_tx)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account =
+                      {std::nullopt,
+                       Account{
+                           .balance = 18'000,
+                           .incarnation = Incarnation{1, 1}}}}},
+             {c,
+              StateDelta{
+                  .account =
+                      {std::nullopt,
+                       Account{
+                           .balance = 38'000,
+                           .incarnation = Incarnation{1, 1}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 2}};
+
+    EXPECT_EQ(
+        s.selfdestruct<typename TestFixture::Trait>(a, c),
+        std::make_pair(true, 18'000));
+    EXPECT_EQ(s.get_balance(a), 0);
+    EXPECT_EQ(s.get_balance(c), 56'000);
+    EXPECT_EQ(
+        s.selfdestruct<typename TestFixture::Trait>(a, c),
+        std::make_pair(false, 0));
+
+    s.destruct_suicides<typename TestFixture::Trait>();
+    if constexpr (TestFixture::Trait::evm_rev() >= KINET_ETH_CANCUN) {
+        EXPECT_TRUE(s.account_exists(a));
+    }
+    else {
+        EXPECT_FALSE(s.account_exists(a));
+    }
+}
+
+TYPED_TEST(InMemoryStateTraitsTest, selfdestruct_same_tx)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account =
+                      {std::nullopt,
+                       Account{
+                           .balance = 18'000,
+                           .incarnation = Incarnation{1, 1}}}}},
+             {c,
+              StateDelta{
+                  .account =
+                      {std::nullopt,
+                       Account{
+                           .balance = 38'000,
+                           .incarnation = Incarnation{1, 1}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+
+    EXPECT_EQ(
+        s.selfdestruct<typename TestFixture::Trait>(a, c),
+        std::make_pair(true, 18'000));
+    EXPECT_EQ(s.get_balance(a), 0);
+    EXPECT_EQ(s.get_balance(c), 56'000);
+    EXPECT_EQ(
+        s.selfdestruct<typename TestFixture::Trait>(a, c),
+        std::make_pair(false, 0));
+
+    s.destruct_suicides<typename TestFixture::Trait>();
+    EXPECT_FALSE(s.account_exists(a));
+}
+
+TYPED_TEST(InMemoryStateTraitsTest, selfdestruct_self_separate_tx)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 18'000}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+
+    // Balance is burned when self-destructing with the beneficiary being self.
+    // But the trace contains the initial balance, not the balance actually
+    // transferred.
+    EXPECT_EQ(
+        s.selfdestruct<typename TestFixture::Trait>(a, a),
+        std::make_pair(true, 18'000));
+    uint256_t const balance_after_selfdestruct = s.get_balance(a);
+    s.destruct_suicides<typename TestFixture::Trait>();
+
+    if constexpr (TestFixture::Trait::evm_rev() < KINET_ETH_CANCUN) {
+        // Pre-cancun behavior
+        EXPECT_EQ(balance_after_selfdestruct, 0);
+        EXPECT_FALSE(s.account_exists(a));
+    }
+    else {
+        // Post-cancun behavior
+        EXPECT_EQ(balance_after_selfdestruct, 18'000); // no ether burned
+        EXPECT_TRUE(s.account_exists(a));
+    }
+}
+
+TYPED_TEST(InMemoryStateTraitsTest, selfdestruct_self_same_tx)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account =
+                      {std::nullopt,
+                       Account{
+                           .balance = 18'000,
+                           .incarnation = Incarnation{1, 1}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+
+    // Behavior doesn't change in cancun if in same txn
+    EXPECT_EQ(
+        s.selfdestruct<typename TestFixture::Trait>(a, a),
+        std::make_pair(true, 18'000));
+    EXPECT_EQ(s.get_balance(a), 0);
+
+    s.destruct_suicides<typename TestFixture::Trait>();
+    EXPECT_FALSE(s.account_exists(a));
+}
+
+TYPED_TEST(InMemoryStateTraitsTest, selfdestruct_merge_incarnation)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 18'000}},
+                  .storage = {{key1, {bytes32_t{}, value1}}}}}}),
+        Code{},
+        BlockHeader{});
+    {
+        State s1{bs, Incarnation{1, 1}};
+
+        s1.selfdestruct<typename TestFixture::Trait>(a, a);
+        s1.destruct_suicides<typename TestFixture::Trait>();
+
+        EXPECT_TRUE(bs.can_merge(s1));
+        bs.merge(s1);
+    }
+    {
+        State s2{bs, Incarnation{1, 2}};
+        if constexpr (TestFixture::Trait::evm_rev() >= KINET_ETH_CANCUN) {
+            EXPECT_TRUE(s2.account_exists(a));
+        }
+        else {
+            EXPECT_FALSE(s2.account_exists(a));
+        }
+        s2.create_contract(a);
+        EXPECT_EQ(s2.get_storage(a, key1), bytes32_t{});
+    }
+}
+
+TYPED_TEST(InMemoryStateTraitsTest, selfdestruct_merge_create_incarnation)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 18'000}},
+                  .storage = {{key1, {bytes32_t{}, value1}}}}}}),
+        Code{},
+        BlockHeader{});
+    {
+        State s1{bs, Incarnation{1, 1}};
+
+        s1.selfdestruct<typename TestFixture::Trait>(a, b);
+        s1.destruct_suicides<typename TestFixture::Trait>();
+
+        EXPECT_TRUE(bs.can_merge(s1));
+        bs.merge(s1);
+    }
+    {
+        State s2{bs, Incarnation{1, 2}};
+        if constexpr (TestFixture::Trait::evm_rev() >= KINET_ETH_CANCUN) {
+            EXPECT_TRUE(s2.account_exists(a));
+        }
+        else {
+            EXPECT_FALSE(s2.account_exists(a));
+        }
+        s2.create_contract(a);
+        EXPECT_EQ(s2.get_storage(a, key1), bytes32_t{});
+
+        s2.set_storage(a, key1, value2);
+        s2.set_storage(a, key2, value1);
+
+        EXPECT_EQ(s2.get_storage(a, key1), value2);
+        EXPECT_EQ(s2.get_storage(a, key2), value1);
+
+        EXPECT_TRUE(bs.can_merge(s2));
+        bs.merge(s2);
+    }
+    {
+        State s3{bs, Incarnation{1, 3}};
+        EXPECT_TRUE(s3.account_exists(a));
+        EXPECT_EQ(s3.get_storage(a, key1), value2);
+        EXPECT_EQ(s3.get_storage(a, key2), value1);
+    }
+}
+
+TYPED_TEST(InMemoryStateTraitsTest, selfdestruct_merge_commit_incarnation)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 18'000}},
+                  .storage = {{key1, {bytes32_t{}, value1}}}}}}),
+        Code{},
+        BlockHeader{});
+    {
+        State s1{bs, Incarnation{1, 1}};
+
+        s1.selfdestruct<typename TestFixture::Trait>(a, a);
+        s1.destruct_suicides<typename TestFixture::Trait>();
+
+        EXPECT_TRUE(bs.can_merge(s1));
+        bs.merge(s1);
+    }
+    {
+        State s2{bs, Incarnation{1, 2}};
+        s2.create_contract(a);
+        bs.merge(s2);
+    }
+    {
+        auto [released_state, released_code, _] = std::move(bs).release();
+        commit_simple(
+            this->tdb,
+            *released_state,
+            released_code,
+            bytes32_t{1},
+            BlockHeader{.number = 1},
+            {},
+            {},
+            {},
+            {},
+            {},
+            std::nullopt);
+        this->tdb.finalize(1, bytes32_t{1});
+        this->tdb.set_block_and_prefix(1);
+        EXPECT_EQ(
+            this->tdb.read_storage(a, Incarnation{1, 2}, key1), bytes32_t{});
+    }
+}
+
+TYPED_TEST(
+    InMemoryStateTraitsTest, selfdestruct_merge_create_commit_incarnation)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{}},
+                  .storage =
+                      {{key1, {bytes32_t{}, value2}},
+                       {key3, {bytes32_t{}, value3}}}}}}),
+        Code{},
+        BlockHeader{});
+    {
+        State s1{bs, Incarnation{1, 1}};
+
+        s1.selfdestruct<typename TestFixture::Trait>(a, a);
+        s1.destruct_suicides<typename TestFixture::Trait>();
+
+        EXPECT_TRUE(bs.can_merge(s1));
+        bs.merge(s1);
+    }
+    {
+        State s2{bs, Incarnation{1, 2}};
+        s2.add_to_balance(a, 1000);
+
+        s2.set_storage(a, key1, value1);
+        s2.set_storage(a, key2, value2);
+
+        EXPECT_TRUE(bs.can_merge(s2));
+        bs.merge(s2);
+    }
+    {
+        auto [released_state, released_code, _] = std::move(bs).release();
+        commit_simple(
+            this->tdb,
+            *released_state,
+            released_code,
+            bytes32_t{1},
+            BlockHeader{.number = 1},
+            {},
+            {},
+            {},
+            {},
+            {},
+            std::nullopt);
+        this->tdb.finalize(1, bytes32_t{1});
+        this->tdb.set_block_and_prefix(1);
+        EXPECT_EQ(this->tdb.read_storage(a, Incarnation{1, 2}, key1), value1);
+        EXPECT_EQ(this->tdb.read_storage(a, Incarnation{1, 2}, key2), value2);
+        if constexpr (TestFixture::Trait::evm_rev() >= KINET_ETH_CANCUN) {
+            EXPECT_EQ(
+                this->tdb.read_storage(a, Incarnation{1, 2}, key3), value3);
+
+            if constexpr (TestFixture::Trait::mip_8_active()) {
+                // Page-encoded storage produces a different state root.
+                EXPECT_EQ(
+                    this->tdb.state_root(),
+                    0x8249283C79A69C21B7EFAD8F4AB8904CA55FE2F5016110096F7C7624378CDBA7_bytes32);
+            }
+            else {
+                EXPECT_EQ(
+                    this->tdb.state_root(),
+                    0x425AE06EDEDEC27A17412E8A2BC2F148A4AF94EE510FFB7AEA81E1ABF5450768_bytes32);
+            }
+        }
+        else {
+            EXPECT_EQ(this->tdb.read_storage(a, Incarnation{1, 2}, key3), null);
+            EXPECT_EQ(
+                this->tdb.state_root(),
+                0x5B853ED6066181BF0E0D405DA0926FD7707446BCBE670DE13C9EDA7A84F6A401_bytes32);
+        }
+    }
+}
+
+TYPED_TEST(
+    InMemoryStateTraitsTest,
+    selfdestruct_create_destroy_create_commit_incarnation)
+{
+    BlockState bs{this->tdb, this->vm};
+    {
+        State s1{bs, Incarnation{1, 1}};
+
+        s1.create_contract(a);
+        s1.set_storage(a, key1, value1);
+        s1.selfdestruct<typename TestFixture::Trait>(a, b);
+        s1.destruct_suicides<typename TestFixture::Trait>();
+
+        EXPECT_TRUE(bs.can_merge(s1));
+        bs.merge(s1);
+    }
+    {
+        State s2{bs, Incarnation{1, 2}};
+        s2.create_contract(a);
+
+        s2.set_storage(a, key2, value3);
+
+        EXPECT_TRUE(bs.can_merge(s2));
+        bs.merge(s2);
+    }
+    {
+        auto [released_state, released_code, _] = std::move(bs).release();
+        commit_simple(
+            this->tdb,
+            *released_state,
+            released_code,
+            NULL_HASH_BLAKE3,
+            BlockHeader{.number = 0},
+            {},
+            {},
+            {},
+            {},
+            {},
+            std::nullopt);
+        this->tdb.finalize(0, NULL_HASH_BLAKE3);
+        this->tdb.set_block_and_prefix(0);
+        EXPECT_EQ(
+            this->tdb.read_storage(a, Incarnation{1, 2}, key1), bytes32_t{});
+        EXPECT_EQ(this->tdb.read_storage(a, Incarnation{1, 2}, key2), value3);
+    }
+}
+
+// First SELFDESTRUCT of a pre-state account: the slots that were observed
+// during the block (before the destruct cleared them from the BlockState's
+// storage cache) must end up in self_destruct_storage_reads_[addr].
+TYPED_TEST(
+    InMemoryStateTraitsTest, self_destruct_storage_reads_capture_first_destruct)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 18'000}},
+                  .storage = {{key1, {bytes32_t{}, value1}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    {
+        State s1{bs, Incarnation{1, 1}};
+        // Cold-read key1 to populate BlockState's storage cache for the
+        // pre-state incarnation. create_contract then bumps the
+        // incarnation so destruct_suicides actually resets the account
+        // under EIP-6780.
+        s1.access_account(a);
+        EXPECT_EQ(s1.get_storage(a, key1), value1);
+        s1.create_contract(a);
+        s1.selfdestruct<typename TestFixture::Trait>(a, b);
+        s1.destruct_suicides<typename TestFixture::Trait>();
+        EXPECT_TRUE(bs.can_merge(s1));
+        bs.merge(s1);
+    }
+
+    auto [_state, _code, self_destruct_reads] = std::move(bs).release();
+
+    ASSERT_TRUE(self_destruct_reads.contains(a));
+    auto const &slots = self_destruct_reads.at(a);
+    EXPECT_EQ(slots.size(), 1u);
+    EXPECT_TRUE(slots.contains(key1));
+}
+
+// Destroy -> Create -> Destroy in the same block: the second SELFDESTRUCT
+// must not overwrite the slot set captured on the first destruct.
+TYPED_TEST(
+    InMemoryStateTraitsTest,
+    self_destruct_storage_reads_locked_after_first_destruct)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 18'000}},
+                  .storage = {{key1, {bytes32_t{}, value1}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    {
+        State s1{bs, Incarnation{1, 1}};
+        s1.access_account(a);
+        EXPECT_EQ(s1.get_storage(a, key1), value1);
+        s1.create_contract(a);
+        s1.selfdestruct<typename TestFixture::Trait>(a, b);
+        s1.destruct_suicides<typename TestFixture::Trait>();
+        EXPECT_TRUE(bs.can_merge(s1));
+        bs.merge(s1);
+    }
+    {
+        State s2{bs, Incarnation{1, 2}};
+        s2.create_contract(a);
+        s2.set_storage(a, key2, value2);
+        EXPECT_TRUE(bs.can_merge(s2));
+        bs.merge(s2);
+    }
+    {
+        State s3{bs, Incarnation{1, 3}};
+        s3.create_contract(a);
+        s3.set_storage(a, key3, value3);
+        s3.selfdestruct<typename TestFixture::Trait>(a, b);
+        s3.destruct_suicides<typename TestFixture::Trait>();
+        EXPECT_TRUE(bs.can_merge(s3));
+        bs.merge(s3);
+    }
+
+    auto [_state, _code, self_destruct_reads] = std::move(bs).release();
+
+    ASSERT_TRUE(self_destruct_reads.contains(a));
+    auto const &slots = self_destruct_reads.at(a);
+    EXPECT_EQ(slots.size(), 1u);
+    EXPECT_TRUE(slots.contains(key1));
+    EXPECT_FALSE(slots.contains(key2));
+    EXPECT_FALSE(slots.contains(key3));
+}
+
+// Same Destroy -> Create -> Destroy pattern as above, but with no slots
+// observed before the first destruct. The first destruct must still
+// create an empty sentinel entry; otherwise the second destruct would
+// see no entry and pollute the set with the re-created incarnation's
+// slots.
+TYPED_TEST(
+    InMemoryStateTraitsTest,
+    self_destruct_storage_reads_empty_first_destruct_locks_address)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 18'000}},
+                  .storage = {{key1, {bytes32_t{}, value1}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    {
+        State s1{bs, Incarnation{1, 1}};
+        s1.create_contract(a);
+        s1.selfdestruct<typename TestFixture::Trait>(a, b);
+        s1.destruct_suicides<typename TestFixture::Trait>();
+        EXPECT_TRUE(bs.can_merge(s1));
+        bs.merge(s1);
+    }
+    {
+        State s2{bs, Incarnation{1, 2}};
+        s2.create_contract(a);
+        s2.set_storage(a, key2, value2);
+        EXPECT_TRUE(bs.can_merge(s2));
+        bs.merge(s2);
+    }
+    {
+        State s3{bs, Incarnation{1, 3}};
+        s3.create_contract(a);
+        s3.selfdestruct<typename TestFixture::Trait>(a, b);
+        s3.destruct_suicides<typename TestFixture::Trait>();
+        EXPECT_TRUE(bs.can_merge(s3));
+        bs.merge(s3);
+    }
+
+    auto [_state, _code, self_destruct_reads] = std::move(bs).release();
+
+    ASSERT_TRUE(self_destruct_reads.contains(a));
+    EXPECT_TRUE(self_destruct_reads.at(a).empty());
+}
+
+// Account does not exist in pre-state: a within-block create+destroy
+// must NOT add it to self_destruct_storage_reads_.
+TYPED_TEST(
+    InMemoryStateTraitsTest,
+    self_destruct_storage_reads_skip_within_block_only_account)
+{
+    BlockState bs{this->tdb, this->vm};
+
+    {
+        State s1{bs, Incarnation{1, 1}};
+        s1.create_contract(a);
+        s1.set_storage(a, key1, value1);
+        s1.selfdestruct<typename TestFixture::Trait>(a, b);
+        s1.destruct_suicides<typename TestFixture::Trait>();
+        EXPECT_TRUE(bs.can_merge(s1));
+        bs.merge(s1);
+    }
+
+    auto [_state, _code, self_destruct_reads] = std::move(bs).release();
+
+    EXPECT_FALSE(self_destruct_reads.contains(a));
+}
+
+TEST_F(InMemoryStateTest, create_conflict_address_incarnation)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 18'000}},
+                  .storage = {{key1, {bytes32_t{}, value1}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s1{bs, Incarnation{1, 1}};
+
+    s1.create_contract(a);
+    s1.set_storage(a, key2, value2);
+
+    EXPECT_EQ(s1.get_storage(a, key1), bytes32_t{});
+    EXPECT_EQ(s1.get_storage(a, key2), value2);
+}
+
+TYPED_TEST(InMemoryStateTraitsTest, destruct_touched_dead)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 10'000}}}},
+             {b, StateDelta{.account = {std::nullopt, Account{}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(s.account_exists(a));
+    s.destruct_touched_dead();
+    s.destruct_suicides<typename TestFixture::Trait>();
+    EXPECT_TRUE(s.account_exists(a));
+    EXPECT_TRUE(s.account_exists(b));
+
+    s.subtract_from_balance(a, 10'000);
+    s.destruct_touched_dead();
+    s.destruct_suicides<typename TestFixture::Trait>();
+
+    EXPECT_FALSE(s.account_exists(a));
+    EXPECT_TRUE(s.account_exists(b));
+
+    s.touch(b);
+    s.destruct_touched_dead();
+    s.destruct_suicides<typename TestFixture::Trait>();
+    EXPECT_FALSE(s.account_exists(b));
+
+    s.add_to_balance(a, 0);
+    EXPECT_TRUE(s.account_exists(a));
+    s.destruct_touched_dead();
+    s.destruct_suicides<typename TestFixture::Trait>();
+    EXPECT_FALSE(s.account_exists(a));
+
+    s.subtract_from_balance(a, 0);
+    EXPECT_TRUE(s.account_exists(a));
+    s.destruct_touched_dead();
+    s.destruct_suicides<typename TestFixture::Trait>();
+    EXPECT_FALSE(s.account_exists(a));
+}
+
+// Storage
+TYPED_TEST(InMemoryStateTraitsTest, access_storage)
+{
+    using Trait = typename TestFixture::Trait;
+
+    BlockState bs{this->tdb, this->vm};
+
+    State s{bs, Incarnation{1, 1}};
+    EXPECT_EQ(s.access_storage<Trait>(a, key1), EVMC_ACCESS_COLD);
+    EXPECT_EQ(s.access_storage<Trait>(a, key1), EVMC_ACCESS_WARM);
+    EXPECT_EQ(s.access_storage<Trait>(b, key1), EVMC_ACCESS_COLD);
+    EXPECT_EQ(s.access_storage<Trait>(b, key1), EVMC_ACCESS_WARM);
+    EXPECT_EQ(s.access_storage<Trait>(a, key2), EVMC_ACCESS_COLD);
+    EXPECT_EQ(s.access_storage<Trait>(a, key2), EVMC_ACCESS_WARM);
+    EXPECT_EQ(s.access_storage<Trait>(b, key2), EVMC_ACCESS_COLD);
+    EXPECT_EQ(s.access_storage<Trait>(b, key2), EVMC_ACCESS_WARM);
+}
+
+TEST_F(InMemoryStateTest, get_storage)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{}},
+                  .storage =
+                      {{key1, {bytes32_t{}, value1}},
+                       {key2, {bytes32_t{}, value2}}}}},
+             {b,
+              StateDelta{
+                  .account = {std::nullopt, Account{}},
+                  .storage = {{key1, {bytes32_t{}, value1}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(s.account_exists(a));
+    EXPECT_TRUE(s.account_exists(b));
+    EXPECT_EQ(s.get_storage(a, key1), value1);
+    EXPECT_EQ(s.get_storage(a, key2), value2);
+    EXPECT_EQ(s.get_storage(a, key3), null);
+    EXPECT_EQ(s.get_storage(b, key1), value1);
+    EXPECT_EQ(s.get_storage(b, key2), null);
+    EXPECT_EQ(s.get_storage(b, key3), null);
+}
+
+TEST_F(InMemoryStateTest, set_storage_modified)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{}},
+                  .storage = {{key2, {bytes32_t{}, value2}}}}},
+             {b, StateDelta{.account = {std::nullopt, Account{}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(s.account_exists(a));
+    EXPECT_EQ(s.set_storage(a, key2, value3), EVMC_STORAGE_MODIFIED);
+    EXPECT_EQ(s.get_storage(a, key2), value3);
+}
+
+TEST_F(InMemoryStateTest, set_storage_deleted)
+{
+    BlockState bs{this->tdb, this->vm};
+
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{b,
+              StateDelta{
+                  .account = {std::nullopt, Account{}},
+                  .storage = {{key1, {bytes32_t{}, value1}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(s.account_exists(b));
+    EXPECT_EQ(s.set_storage(b, key1, null), EVMC_STORAGE_DELETED);
+    EXPECT_EQ(s.get_storage(b, key1), null);
+    EXPECT_EQ(s.set_storage(b, key1, null), EVMC_STORAGE_ASSIGNED);
+    EXPECT_EQ(s.get_storage(b, key1), null);
+    EXPECT_EQ(s.set_storage(b, key1, value2), EVMC_STORAGE_DELETED_ADDED);
+    EXPECT_EQ(s.get_storage(b, key1), value2);
+}
+
+TEST_F(InMemoryStateTest, set_storage_added)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas({{b, StateDelta{.account = {std::nullopt, Account{}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(s.account_exists(b));
+    EXPECT_EQ(s.set_storage(b, key1, value1), EVMC_STORAGE_ADDED);
+    EXPECT_EQ(s.get_storage(b, key1), value1);
+    EXPECT_EQ(s.set_storage(b, key1, value1), EVMC_STORAGE_ASSIGNED);
+    EXPECT_EQ(s.get_storage(b, key1), value1);
+    EXPECT_EQ(s.set_storage(b, key1, value2), EVMC_STORAGE_ASSIGNED);
+    EXPECT_EQ(s.get_storage(b, key1), value2);
+}
+
+TEST_F(InMemoryStateTest, set_storage_different_assigned)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{}},
+                  .storage = {{key2, {bytes32_t{}, value2}}}}},
+             {b, StateDelta{.account = {std::nullopt, Account{}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(s.account_exists(a));
+    EXPECT_EQ(s.set_storage(a, key2, value3), EVMC_STORAGE_MODIFIED);
+    EXPECT_EQ(s.get_storage(a, key2), value3);
+    EXPECT_EQ(s.set_storage(a, key2, value1), EVMC_STORAGE_ASSIGNED);
+    EXPECT_EQ(s.get_storage(a, key2), value1);
+}
+
+TEST_F(InMemoryStateTest, set_storage_unchanged_assigned)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{}},
+                  .storage = {{key2, {bytes32_t{}, value2}}}}},
+             {b, StateDelta{.account = {std::nullopt, Account{}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(s.account_exists(a));
+    EXPECT_EQ(s.set_storage(a, key2, value2), EVMC_STORAGE_ASSIGNED);
+    EXPECT_EQ(s.get_storage(a, key2), value2);
+}
+
+TEST_F(InMemoryStateTest, set_storage_added_deleted)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas({{b, StateDelta{.account = {std::nullopt, Account{}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(s.account_exists(b));
+    EXPECT_EQ(s.set_storage(b, key1, value1), EVMC_STORAGE_ADDED);
+    EXPECT_EQ(s.get_storage(b, key1), value1);
+    EXPECT_EQ(s.set_storage(b, key1, null), EVMC_STORAGE_ADDED_DELETED);
+    EXPECT_EQ(s.get_storage(b, key1), null);
+}
+
+TEST_F(InMemoryStateTest, set_storage_added_deleted_null)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas({{b, StateDelta{.account = {std::nullopt, Account{}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(s.account_exists(b));
+    EXPECT_EQ(s.set_storage(b, key1, null), EVMC_STORAGE_ASSIGNED);
+    EXPECT_EQ(s.get_storage(b, key1), null);
+    EXPECT_EQ(s.set_storage(b, key1, null), EVMC_STORAGE_ASSIGNED);
+    EXPECT_EQ(s.get_storage(b, key1), null);
+}
+
+TEST_F(InMemoryStateTest, set_storage_modify_delete)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{b,
+              StateDelta{
+                  .account = {std::nullopt, Account{}},
+                  .storage = {{key2, {bytes32_t{}, value2}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(s.account_exists(b));
+    EXPECT_EQ(s.set_storage(b, key2, value1), EVMC_STORAGE_MODIFIED);
+    EXPECT_EQ(s.get_storage(b, key2), value1);
+    EXPECT_EQ(s.set_storage(b, key2, null), EVMC_STORAGE_MODIFIED_DELETED);
+    EXPECT_EQ(s.get_storage(b, key2), null);
+}
+
+TEST_F(InMemoryStateTest, set_storage_delete_restored)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{b,
+              StateDelta{
+                  .account = {std::nullopt, Account{}},
+                  .storage = {{key2, {bytes32_t{}, value2}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(s.account_exists(b));
+    EXPECT_EQ(s.set_storage(b, key2, null), EVMC_STORAGE_DELETED);
+    EXPECT_EQ(s.get_storage(b, key2), null);
+    EXPECT_EQ(s.set_storage(b, key2, value2), EVMC_STORAGE_DELETED_RESTORED);
+    EXPECT_EQ(s.get_storage(b, key2), value2);
+}
+
+TEST_F(InMemoryStateTest, set_storage_modified_restored)
+{
+    BlockState bs{this->tdb, this->vm};
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{b,
+              StateDelta{
+                  .account = {std::nullopt, Account{}},
+                  .storage = {{key2, {bytes32_t{}, value2}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(s.account_exists(b));
+    EXPECT_EQ(s.set_storage(b, key2, value1), EVMC_STORAGE_MODIFIED);
+    EXPECT_EQ(s.get_storage(b, key2), value1);
+    EXPECT_EQ(s.set_storage(b, key2, value2), EVMC_STORAGE_MODIFIED_RESTORED);
+    EXPECT_EQ(s.get_storage(b, key2), value2);
+}
+
+// Code
+TEST_F(InMemoryStateTest, get_code_size)
+{
+    BlockState bs{this->tdb, this->vm};
+    Account acct{.code_hash = code_hash1};
+    commit_sequential(
+        this->tdb,
+        StateDeltas({{a, StateDelta{.account = {std::nullopt, acct}}}}),
+        Code{{code_hash1, icode1}},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+    EXPECT_EQ(s.get_code_size(a), code1.size());
+}
+
+TEST_F(InMemoryStateTest, copy_code)
+{
+    BlockState bs{this->tdb, this->vm};
+    Account acct_a{.code_hash = code_hash1};
+    Account acct_b{.code_hash = code_hash2};
+
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a, StateDelta{.account = {std::nullopt, acct_a}}},
+             {b, StateDelta{.account = {std::nullopt, acct_b}}}}),
+        Code{{code_hash1, icode1}, {code_hash2, icode2}},
+        BlockHeader{});
+
+    static constexpr unsigned size{8};
+    uint8_t buffer[size];
+
+    State s{bs, Incarnation{1, 1}};
+
+    { // underflow
+        auto const total = s.copy_code(a, 0u, buffer, size);
+        EXPECT_EQ(total, code1.size());
+        EXPECT_EQ(0, std::memcmp(buffer, code1.c_str(), total));
+    }
+    { // offset
+        static constexpr auto offset = 2u;
+        static constexpr auto to_copy = 3u;
+        auto const offset_total = s.copy_code(a, offset, buffer, to_copy);
+        EXPECT_EQ(offset_total, to_copy);
+        EXPECT_EQ(0, std::memcmp(buffer, code1.c_str() + offset, offset_total));
+    }
+    { // offset overflow
+        static constexpr auto offset = 4u;
+        auto const offset_total = s.copy_code(a, offset, buffer, size);
+        EXPECT_EQ(offset_total, 3u);
+        EXPECT_EQ(0, std::memcmp(buffer, code1.c_str() + offset, offset_total));
+    }
+    { // regular overflow
+        auto const total = s.copy_code(b, 0u, buffer, size);
+        EXPECT_EQ(total, size);
+        EXPECT_EQ(0, std::memcmp(buffer, code2.c_str(), total));
+    }
+    { // empty account
+        auto const total = s.copy_code(c, 0u, buffer, size);
+        EXPECT_EQ(total, 0u);
+    }
+    { // offset outside size
+        auto const total = s.copy_code(a, 9, buffer, size);
+        EXPECT_EQ(total, 0);
+    }
+}
+
+TEST_F(InMemoryStateTest, get_code)
+{
+    byte_string const contract{0x60, 0x34, 0x00};
+
+    BlockState bs{this->tdb, this->vm};
+
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account =
+                      {std::nullopt, Account{.code_hash = code_hash1}}}}}),
+        Code{{code_hash1, vm::make_shared_intercode(contract)}},
+        BlockHeader{});
+
+    State s{bs, Incarnation{1, 1}};
+
+    {
+        s.access_account(a);
+        auto const c = s.get_code(a)->intercode();
+        EXPECT_EQ(byte_string_view(c->code(), c->size()), contract);
+    }
+    { // non-existant account
+        auto const c = s.get_code(b)->intercode();
+        EXPECT_EQ(byte_string_view(c->code(), c->size()), byte_string{});
+    }
+}
+
+TEST_F(InMemoryStateTest, set_code)
+{
+    BlockState bs{this->tdb, this->vm};
+
+    State s{bs, Incarnation{1, 1}};
+    s.create_contract(a);
+    s.create_contract(b);
+    s.set_code(a, code2);
+    s.set_code(b, byte_string{});
+
+    auto const a_icode = s.get_code(a)->intercode();
+    EXPECT_EQ(byte_string_view(a_icode->code(), a_icode->size()), code2);
+    auto const b_icode = s.get_code(b)->intercode();
+    EXPECT_EQ(
+        byte_string_view(b_icode->code(), b_icode->size()), byte_string{});
+}
+
+TEST_F(InMemoryStateTest, can_merge_same_account_different_storage)
+{
+    BlockState bs{this->tdb, this->vm};
+
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{b,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 40'000}},
+                  .storage =
+                      {{key1, {bytes32_t{}, value1}},
+                       {key2, {bytes32_t{}, value2}}}}},
+             {c,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 50'000}},
+                  .storage =
+                      {{key1, {bytes32_t{}, value1}},
+                       {key2, {bytes32_t{}, value2}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State as{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(as.account_exists(b));
+    EXPECT_EQ(as.set_storage(b, key1, value2), EVMC_STORAGE_MODIFIED);
+    EXPECT_TRUE(bs.can_merge(as));
+    bs.merge(as);
+
+    State cs{bs, Incarnation{1, 2}};
+    EXPECT_TRUE(cs.account_exists(b));
+    EXPECT_EQ(cs.set_storage(b, key2, null), EVMC_STORAGE_DELETED);
+    EXPECT_TRUE(bs.can_merge(cs));
+    bs.merge(cs);
+}
+
+TEST_F(InMemoryStateTest, cant_merge_colliding_storage)
+{
+    BlockState bs{this->tdb, this->vm};
+
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{b,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 40'000}},
+                  .storage = {{key1, {bytes32_t{}, value1}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State as{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(as.account_exists(b));
+    EXPECT_EQ(as.set_storage(b, key1, value2), EVMC_STORAGE_MODIFIED);
+
+    State cs{bs, Incarnation{1, 2}};
+    EXPECT_TRUE(cs.account_exists(b));
+    EXPECT_EQ(cs.set_storage(b, key1, null), EVMC_STORAGE_DELETED);
+
+    EXPECT_TRUE(bs.can_merge(as));
+    bs.merge(as);
+    EXPECT_FALSE(bs.can_merge(cs));
+
+    // Need to rerun txn 1 - get new changset
+    {
+        State cs{bs, Incarnation{1, 2}};
+        EXPECT_TRUE(cs.account_exists(b));
+        EXPECT_EQ(cs.set_storage(b, key1, null), EVMC_STORAGE_DELETED);
+        EXPECT_TRUE(bs.can_merge(cs));
+        bs.merge(cs);
+    }
+}
+
+TYPED_TEST(InMemoryStateTraitsTest, merge_txn0_and_txn1)
+{
+    BlockState bs{this->tdb, this->vm};
+
+    commit_sequential(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 30'000}}}},
+             {b,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 40'000}},
+                  .storage =
+                      {{key1, {bytes32_t{}, value1}},
+                       {key2, {bytes32_t{}, value2}}}}},
+             {c,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 50'000}},
+                  .storage =
+                      {{key1, {bytes32_t{}, value1}},
+                       {key2, {bytes32_t{}, value2}}}}}}),
+        Code{},
+        BlockHeader{});
+
+    State as{bs, Incarnation{1, 1}};
+    EXPECT_TRUE(as.account_exists(b));
+    EXPECT_EQ(as.set_storage(b, key1, value2), EVMC_STORAGE_MODIFIED);
+    EXPECT_EQ(as.set_storage(b, key2, null), EVMC_STORAGE_DELETED);
+    EXPECT_EQ(as.set_storage(b, key2, value2), EVMC_STORAGE_DELETED_RESTORED);
+    EXPECT_TRUE(bs.can_merge(as));
+    bs.merge(as);
+
+    State cs{bs, Incarnation{1, 2}};
+    EXPECT_TRUE(cs.account_exists(c));
+    EXPECT_EQ(cs.set_storage(c, key1, null), EVMC_STORAGE_DELETED);
+    EXPECT_EQ(cs.set_storage(c, key2, null), EVMC_STORAGE_DELETED);
+    EXPECT_EQ(
+        cs.selfdestruct<typename TestFixture::Trait>(c, a),
+        std::make_pair(true, 50'000));
+    cs.destruct_suicides<typename TestFixture::Trait>();
+    EXPECT_TRUE(bs.can_merge(cs));
+    bs.merge(cs);
+}
+
+TEST_F(InMemoryStateTest, commit_storage_and_account_together_regression)
+{
+    BlockState bs{this->tdb, this->vm};
+    State as{bs, Incarnation{1, 1}};
+
+    as.create_contract(a);
+    as.add_to_balance(a, 1);
+    as.set_storage(a, key1, value1);
+
+    bs.merge(as);
+    auto [released_state, released_code, _] = std::move(bs).release();
+    commit_simple(
+        this->tdb,
+        *released_state,
+        released_code,
+        NULL_HASH_BLAKE3,
+        BlockHeader{.number = 0},
+        {},
+        {},
+        {},
+        {},
+        {},
+        std::nullopt);
+    this->tdb.finalize(0, NULL_HASH_BLAKE3);
+    this->tdb.set_block_and_prefix(0);
+
+    EXPECT_TRUE(this->tdb.read_account(a).has_value());
+    EXPECT_EQ(this->tdb.read_account(a).value().balance, 1u);
+    EXPECT_EQ(this->tdb.read_storage(a, Incarnation{1, 1}, key1), value1);
+}
+
+TEST_F(InMemoryStateTest, set_and_then_clear_storage_in_same_commit)
+{
+    BlockState bs{this->tdb, this->vm};
+    State as{bs, Incarnation{1, 1}};
+
+    as.create_contract(a);
+    EXPECT_EQ(as.set_storage(a, key1, value1), EVMC_STORAGE_ADDED);
+    EXPECT_EQ(as.set_storage(a, key1, null), EVMC_STORAGE_ADDED_DELETED);
+    bs.merge(as);
+    auto [released_state, released_code, _] = std::move(bs).release();
+    commit_simple(
+        this->tdb,
+        *released_state,
+        released_code,
+        NULL_HASH_BLAKE3,
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        std::nullopt);
+
+    EXPECT_EQ(
+        this->tdb.read_storage(a, Incarnation{1, 1}, key1), kinet::bytes32_t{});
+}
+
+TYPED_TEST(InMemoryStateTraitsTest, commit_twice)
+{
+    this->tdb.reset_root(
+        load_header({}, this->db, BlockHeader{.number = 8}), 8);
+
+    // commit to Block 9 Finalized
+    this->tdb.set_block_and_prefix(8);
+    commit_simple(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 30'000}}}},
+             {b,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 40'000}},
+                  .storage =
+                      {{key1, {bytes32_t{}, value1}},
+                       {key2, {bytes32_t{}, value2}}}}},
+             {c,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 50'000}},
+                  .storage =
+                      {{key1, {bytes32_t{}, value1}},
+                       {key2, {bytes32_t{}, value2}}}}}}),
+        Code{},
+        bytes32_t{9},
+        BlockHeader{.number = 9});
+    this->tdb.finalize(9, bytes32_t{9});
+
+    { // Commit to Block 10 Round 5, on top of block 9 finalized
+        this->tdb.set_block_and_prefix(9);
+        BlockState bs{this->tdb, this->vm};
+        State as{bs, Incarnation{1, 1}};
+        EXPECT_TRUE(as.account_exists(b));
+        as.add_to_balance(b, 42'000);
+        as.set_nonce(b, 3);
+        EXPECT_EQ(as.set_storage(b, key1, value2), EVMC_STORAGE_MODIFIED);
+        EXPECT_EQ(as.set_storage(b, key2, null), EVMC_STORAGE_DELETED);
+        EXPECT_EQ(
+            as.set_storage(b, key2, value2), EVMC_STORAGE_DELETED_RESTORED);
+        EXPECT_TRUE(bs.can_merge(as));
+        bs.merge(as);
+        auto [released_state, released_code, _] = std::move(bs).release();
+        commit_simple(
+            this->tdb,
+            *released_state,
+            released_code,
+            bytes32_t{10},
+            BlockHeader{.number = 10});
+        this->tdb.finalize(10, bytes32_t{10});
+
+        EXPECT_EQ(this->tdb.read_storage(b, Incarnation{1, 1}, key1), value2);
+        EXPECT_EQ(this->tdb.read_storage(b, Incarnation{1, 1}, key2), value2);
+
+        this->tdb.set_block_and_prefix(10, bytes32_t{10});
+    }
+    { // Commit to Block 11 Round 6, on top of block 10 round 5
+        BlockState bs{this->tdb, this->vm};
+        State cs{bs, Incarnation{2, 1}};
+        EXPECT_TRUE(cs.account_exists(a));
+        EXPECT_TRUE(cs.account_exists(c));
+        EXPECT_EQ(cs.set_storage(c, key1, null), EVMC_STORAGE_DELETED);
+        EXPECT_EQ(cs.set_storage(c, key2, value1), EVMC_STORAGE_MODIFIED);
+        EXPECT_EQ(
+            cs.selfdestruct<typename TestFixture::Trait>(c, a),
+            std::make_pair(true, 50'000));
+        cs.destruct_suicides<typename TestFixture::Trait>();
+        EXPECT_TRUE(bs.can_merge(cs));
+        bs.merge(cs);
+        auto [released_state, released_code, _] = std::move(bs).release();
+        commit_simple(
+            this->tdb,
+            *released_state,
+            released_code,
+            bytes32_t{11},
+            BlockHeader{.number = 11});
+        EXPECT_EQ(
+            this->tdb.read_storage(c, Incarnation{2, 1}, key1),
+            kinet::bytes32_t{});
+        if constexpr (TestFixture::Trait::evm_rev() >= KINET_ETH_CANCUN) {
+            EXPECT_EQ(
+                this->tdb.read_storage(c, Incarnation{2, 1}, key2), value1);
+        }
+        else {
+            EXPECT_EQ(
+                this->tdb.read_storage(c, Incarnation{2, 1}, key2),
+                kinet::bytes32_t{});
+        }
+
+        // verify finalized state is the same as round 6
+        this->tdb.finalize(11, bytes32_t{11});
+        this->tdb.set_block_and_prefix(11);
+        EXPECT_EQ(
+            this->tdb.read_storage(c, Incarnation{2, 1}, key1),
+            kinet::bytes32_t{});
+        if constexpr (TestFixture::Trait::evm_rev() >= KINET_ETH_CANCUN) {
+            EXPECT_EQ(
+                this->tdb.read_storage(c, Incarnation{2, 1}, key2), value1);
+        }
+        else {
+            EXPECT_EQ(
+                this->tdb.read_storage(c, Incarnation{2, 1}, key2),
+                kinet::bytes32_t{});
+        }
+    }
+}
+
+TYPED_TEST(OnDiskTestSuite, commit_multiple_proposals)
+{
+    load_header({}, this->db, BlockHeader{.number = 9});
+
+    // commit to block 10, round 5
+    this->tdb.set_block_and_prefix(9);
+    commit_simple(
+        this->tdb,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 30'000}}}},
+             {b,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 40'000}},
+                  .storage =
+                      {{key1, {bytes32_t{}, value1}},
+                       {key2, {bytes32_t{}, value2}}}}},
+             {c,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 50'000}},
+                  .storage =
+                      {{key1, {bytes32_t{}, value1}},
+                       {key2, {bytes32_t{}, value2}}}}}}),
+        Code{},
+        bytes32_t{10},
+        BlockHeader{.number = 10},
+        {},
+        {},
+        {},
+        {});
+    {
+        // set to block 10 round 5
+        this->tdb.set_block_and_prefix(10, bytes32_t{10});
+        BlockState bs{this->tdb, this->vm};
+        State as{bs, Incarnation{1, 1}};
+        EXPECT_TRUE(as.account_exists(b));
+        as.add_to_balance(b, 42'000);
+        as.set_nonce(b, 3);
+        EXPECT_EQ(as.set_storage(b, key1, value2), EVMC_STORAGE_MODIFIED);
+        EXPECT_EQ(as.set_storage(b, key2, null), EVMC_STORAGE_DELETED);
+
+        EXPECT_TRUE(bs.can_merge(as));
+        bs.merge(as);
+        // Commit block 11 round 8 on top of block 10 round 5
+        auto [released_state, released_code, _] = std::move(bs).release();
+        commit_simple(
+            this->tdb,
+            *released_state,
+            released_code,
+            bytes32_t{118},
+            BlockHeader{.number = 11});
+
+        EXPECT_EQ(this->tdb.read_account(b).value().balance, 82'000);
+        EXPECT_EQ(this->tdb.read_storage(b, Incarnation{1, 1}, key1), value2);
+        EXPECT_EQ(
+            this->tdb.read_storage(b, Incarnation{1, 1}, key2), bytes32_t{});
+    }
+    auto const state_root_round8 = this->tdb.state_root();
+
+    {
+        // set to block 10 round 5
+        this->tdb.set_block_and_prefix(10, bytes32_t{10});
+        BlockState bs{this->tdb, this->vm};
+        State as{bs, Incarnation{1, 1}};
+        EXPECT_TRUE(as.account_exists(b));
+        as.add_to_balance(b, 44'000);
+        as.set_nonce(b, 3);
+        EXPECT_EQ(as.set_storage(b, key1, null), EVMC_STORAGE_DELETED);
+        EXPECT_EQ(as.set_storage(b, key2, null), EVMC_STORAGE_DELETED);
+        EXPECT_TRUE(bs.can_merge(as));
+        bs.merge(as);
+        // Commit block 11 round 6 on top of block 10 round 5
+        auto [released_state, released_code, _] = std::move(bs).release();
+        commit_simple(
+            this->tdb,
+            *released_state,
+            released_code,
+            bytes32_t{116},
+            BlockHeader{.number = 11});
+
+        EXPECT_EQ(this->tdb.read_account(b).value().balance, 84'000);
+        EXPECT_EQ(
+            this->tdb.read_storage(b, Incarnation{1, 1}, key1), bytes32_t{});
+        EXPECT_EQ(
+            this->tdb.read_storage(b, Incarnation{1, 1}, key2), bytes32_t{});
+    }
+
+    auto const state_root_round6 = this->tdb.state_root();
+    {
+        // set to block 10 round 5
+        this->tdb.set_block_and_prefix(10, bytes32_t{10});
+        BlockState bs{this->tdb, this->vm};
+        State as{bs, Incarnation{1, 1}};
+        EXPECT_TRUE(as.account_exists(b));
+        as.add_to_balance(b, 32'000);
+        as.set_nonce(b, 3);
+        EXPECT_EQ(as.set_storage(b, key1, null), EVMC_STORAGE_DELETED);
+        EXPECT_EQ(as.set_storage(b, key2, value3), EVMC_STORAGE_MODIFIED);
+        EXPECT_EQ(as.set_storage(b, key1, value2), EVMC_STORAGE_DELETED_ADDED);
+        EXPECT_TRUE(bs.can_merge(as));
+        bs.merge(as);
+        // Commit block 11 round 7 on top of block 10 round 5
+        auto [released_state, released_code, _] = std::move(bs).release();
+        commit_simple(
+            this->tdb,
+            *released_state,
+            released_code,
+            bytes32_t{117},
+            BlockHeader{.number = 11});
+
+        EXPECT_EQ(this->tdb.read_account(b).value().balance, 72'000);
+        EXPECT_EQ(this->tdb.read_storage(b, Incarnation{1, 1}, key1), value2);
+        EXPECT_EQ(this->tdb.read_storage(b, Incarnation{1, 1}, key2), value3);
+    }
+    auto const state_root_round7 = this->tdb.state_root();
+    this->tdb.finalize(11, bytes32_t{117});
+    this->tdb.set_block_and_prefix(11, bytes32_t{117}); // set to block 11
+    EXPECT_EQ(state_root_round7, this->tdb.state_root());
+
+    // check state root of previous rounds
+    this->tdb.set_block_and_prefix(11, bytes32_t{116});
+    EXPECT_EQ(state_root_round6, this->tdb.state_root());
+
+    this->tdb.set_block_and_prefix(11, bytes32_t{118});
+    EXPECT_EQ(state_root_round8, this->tdb.state_root());
+}
+
+TYPED_TEST(OnDiskCachedTestSuite, proposal_basics)
+{
+    this->tdb.reset_root(
+        load_header({}, this->db, BlockHeader{.number = 9}), 9);
+    Db &db = this->tdb;
+    EXPECT_FALSE(db.read_account(a).has_value());
+    commit_simple(
+        db,
+        StateDeltas(
+            {{a,
+              StateDelta{
+                  .account = {std::nullopt, Account{.balance = 30'000}}}}}),
+        Code{},
+        bytes32_t{10},
+        BlockHeader{.number = 10});
+    db.set_block_and_prefix(10, bytes32_t{10});
+    EXPECT_EQ(db.read_account(a).value().balance, 30'000);
+    db.finalize(10, bytes32_t{10});
+
+    db.set_block_and_prefix(10, bytes32_t{10});
+    BlockState bs1(db, this->vm);
+    auto
+        [released_state1,
+         released_code1,
+         _released_self_destruct_storage_reads1] = std::move(bs1).release();
+    commit_simple(
+        db,
+        *released_state1,
+        released_code1,
+        bytes32_t{11},
+        BlockHeader{.number = 11});
+    db.finalize(11, bytes32_t{11});
+
+    db.set_block_and_prefix(11, bytes32_t{11});
+    BlockState bs2(db, this->vm);
+    State as{bs2, Incarnation{1, 1}};
+    EXPECT_TRUE(as.account_exists(a));
+    as.add_to_balance(a, 10'000);
+    EXPECT_TRUE(bs2.can_merge(as));
+    bs2.merge(as);
+    EXPECT_EQ(db.read_account(a).value().balance, 30'000);
+    auto
+        [released_state2,
+         released_code2,
+         _released_self_destruct_storage_reads2] = std::move(bs2).release();
+    commit_simple(
+        db,
+        *released_state2,
+        released_code2,
+        bytes32_t{12},
+        BlockHeader{.number = 12});
+    EXPECT_EQ(db.read_account(a).value().balance, 40'000);
+    db.finalize(12, bytes32_t{12});
+    EXPECT_EQ(db.read_account(a).value().balance, 40'000);
+    // read an older block's state
+    db.set_block_and_prefix(11); // set to block 11 finalized
+    EXPECT_EQ(db.read_account(a).value().balance, 30'000);
+}
+
+TYPED_TEST(OnDiskCachedTestSuite, undecided_proposals)
+{
+    load_header({}, this->db, BlockHeader{.number = 9});
+    Db &db = this->tdb;
+
+    // b10 r100        a 10   b 20 v1 v2   c 30 v1 v2
+    // b11 r111 r100           +40 v2 --
+    // b12 r121 r111                        +10    v1
+    // b11 r112 r100    +20        --           --
+    // b12 r122 r112           +20 v3
+    // b13 r131 r121    +30    +20    v1        v2 __
+    // b13 r132 r122                  --        v3
+    // b11 r113 r100    +70    +70 v3 v3    +70 v3 v3
+    // finalize r111 r121 r131
+
+    LOG_INFO("block 10 round 100");
+    // b10 r100        a 10   b 20 v1 v2   c 30 v1 v2
+    std::unique_ptr<StateDeltas> state_deltas{new StateDeltas{
+        {a, StateDelta{.account = {std::nullopt, Account{.balance = 10'000}}}},
+        {b,
+         StateDelta{
+             .account = {std::nullopt, Account{.balance = 20'000}},
+             .storage =
+                 {{key1, {bytes32_t{}, value1}},
+                  {key2, {bytes32_t{}, value2}}}}},
+        {c,
+         StateDelta{
+             .account = {std::nullopt, Account{.balance = 30'000}},
+             .storage = {
+                 {key1, {bytes32_t{}, value1}},
+                 {key2, {bytes32_t{}, value2}}}}}}};
+    db.set_block_and_prefix(9);
+    commit_simple(
+        db, *state_deltas, Code{}, bytes32_t{10}, BlockHeader{.number = 10});
+    db.finalize(10, bytes32_t{10});
+    EXPECT_TRUE(db.read_account(a).has_value());
+    EXPECT_TRUE(db.read_account(b).has_value());
+    EXPECT_TRUE(db.read_account(c).has_value());
+    EXPECT_EQ(db.read_account(a).value().balance, uint256_t{10'000});
+    EXPECT_EQ(db.read_account(b).value().balance, uint256_t{20'000});
+    EXPECT_EQ(db.read_account(c).value().balance, uint256_t{30'000});
+    EXPECT_EQ(db.read_storage(b, Incarnation{0, 0}, key1), value1);
+    EXPECT_EQ(db.read_storage(b, Incarnation{0, 0}, key2), value2);
+    EXPECT_EQ(db.read_storage(c, Incarnation{0, 0}, key1), value1);
+    EXPECT_EQ(db.read_storage(c, Incarnation{0, 0}, key2), value2);
+
+    LOG_INFO("block 11 round 111 on block 10 round 100");
+    db.set_block_and_prefix(10, bytes32_t{10});
+    BlockState bs_111(db, this->vm);
+    // b11 r111 r100           +40 v2 --
+    {
+        State as{bs_111, Incarnation{11, 1}};
+        as.add_to_balance(b, 40'000);
+        EXPECT_EQ(as.set_storage(b, key1, value2), EVMC_STORAGE_MODIFIED);
+        EXPECT_EQ(as.set_storage(b, key2, null), EVMC_STORAGE_DELETED);
+        EXPECT_TRUE(bs_111.can_merge(as));
+        bs_111.merge(as);
+    }
+    auto
+        [released_state_111,
+         released_code_111,
+         _released_self_destruct_storage_reads_111] =
+            std::move(bs_111).release();
+    commit_simple(
+        db,
+        *released_state_111,
+        released_code_111,
+        bytes32_t{111},
+        BlockHeader{.number = 11});
+    auto const state_root_round_111 = db.state_root();
+    db.set_block_and_prefix(11, bytes32_t{111});
+    EXPECT_TRUE(db.read_account(a).has_value());
+    EXPECT_TRUE(db.read_account(b).has_value());
+    EXPECT_TRUE(db.read_account(c).has_value());
+    EXPECT_EQ(db.read_account(a).value().balance, uint256_t{10'000});
+    EXPECT_EQ(db.read_account(b).value().balance, uint256_t{60'000});
+    EXPECT_EQ(db.read_account(c).value().balance, uint256_t{30'000});
+    EXPECT_EQ(db.read_storage(b, Incarnation{0, 0}, key1), value2);
+    EXPECT_EQ(db.read_storage(b, Incarnation{0, 0}, key2), bytes32_t{});
+    EXPECT_EQ(db.read_storage(c, Incarnation{0, 0}, key1), value1);
+    EXPECT_EQ(db.read_storage(c, Incarnation{0, 0}, key2), value2);
+
+    LOG_INFO("block 12 round 121 on block 11 round 111");
+    db.set_block_and_prefix(11, bytes32_t{111});
+    BlockState bs_121(db, this->vm);
+    // b12 r121 r111                        +10    v1
+    {
+        State as{bs_121, Incarnation{12, 1}};
+        as.add_to_balance(c, 10'000);
+        EXPECT_EQ(as.set_storage(c, key2, value1), EVMC_STORAGE_MODIFIED);
+        EXPECT_TRUE(bs_121.can_merge(as));
+        bs_121.merge(as);
+    }
+    auto
+        [released_state_121,
+         released_code_121,
+         _released_self_destruct_storage_reads_121] =
+            std::move(bs_121).release();
+    commit_simple(
+        db,
+        *released_state_121,
+        released_code_121,
+        bytes32_t{121},
+        BlockHeader{.number = 12});
+    db.set_block_and_prefix(12, bytes32_t{121});
+    EXPECT_TRUE(db.read_account(a).has_value());
+    EXPECT_TRUE(db.read_account(b).has_value());
+    EXPECT_TRUE(db.read_account(c).has_value());
+    EXPECT_EQ(db.read_account(a).value().balance, uint256_t{10'000});
+    EXPECT_EQ(db.read_account(b).value().balance, uint256_t{60'000});
+    EXPECT_EQ(db.read_account(c).value().balance, uint256_t{40'000});
+    EXPECT_EQ(db.read_storage(b, Incarnation{0, 0}, key1), value2);
+    EXPECT_EQ(db.read_storage(b, Incarnation{0, 0}, key2), bytes32_t{});
+    EXPECT_EQ(db.read_storage(c, Incarnation{0, 0}, key1), value1);
+    EXPECT_EQ(db.read_storage(c, Incarnation{0, 0}, key2), value1);
+
+    LOG_INFO("block 11 round 112 on block 10 round 100");
+    db.set_block_and_prefix(10, bytes32_t{10});
+    BlockState bs_112(db, this->vm);
+    // b11 r112 r100    +20        --           --
+    {
+        State as{bs_112, Incarnation{11, 1}};
+        as.add_to_balance(a, 20'000);
+        EXPECT_EQ(as.set_storage(b, key1, null), EVMC_STORAGE_DELETED);
+        EXPECT_EQ(as.set_storage(c, key1, null), EVMC_STORAGE_DELETED);
+        EXPECT_TRUE(bs_112.can_merge(as));
+        bs_112.merge(as);
+    }
+    auto
+        [released_state_112,
+         released_code_112,
+         _released_self_destruct_storage_reads_112] =
+            std::move(bs_112).release();
+    commit_simple(
+        db,
+        *released_state_112,
+        released_code_112,
+        bytes32_t{112},
+        BlockHeader{.number = 11});
+
+    LOG_INFO("block 12 round 122 on block 11 round 112");
+    db.set_block_and_prefix(11, bytes32_t{112});
+    BlockState bs_122(db, this->vm);
+    //  b12 r122 r112           +20 v3              v1
+    {
+        State as{bs_122, Incarnation{12, 1}};
+        as.add_to_balance(b, 20'000);
+        EXPECT_EQ(as.set_storage(b, key1, value3), EVMC_STORAGE_ADDED);
+        EXPECT_TRUE(bs_122.can_merge(as));
+        bs_122.merge(as);
+    }
+    auto
+        [released_state_122,
+         released_code_122,
+         _released_self_destruct_storage_reads_122] =
+            std::move(bs_122).release();
+    commit_simple(
+        db,
+        *released_state_122,
+        released_code_122,
+        bytes32_t{122},
+        BlockHeader{.number = 12});
+
+    LOG_INFO("block 13 round 131 on block 12 round 121");
+    db.set_block_and_prefix(12, bytes32_t{121});
+    BlockState bs_131(db, this->vm);
+    //  b13 r131 r121    +30    +20    v1        v2 __
+    {
+        State as{bs_131, Incarnation{13, 1}};
+        as.add_to_balance(a, 30'000);
+        as.add_to_balance(b, 20'000);
+        EXPECT_EQ(as.set_storage(b, key2, value1), EVMC_STORAGE_ADDED);
+        EXPECT_EQ(as.set_storage(c, key1, value2), EVMC_STORAGE_MODIFIED);
+        EXPECT_EQ(as.set_storage(c, key2, null), EVMC_STORAGE_DELETED);
+        EXPECT_TRUE(bs_131.can_merge(as));
+        bs_131.merge(as);
+    }
+    auto
+        [released_state_131,
+         released_code_131,
+         _released_self_destruct_storage_reads_131] =
+            std::move(bs_131).release();
+    commit_simple(
+        db,
+        *released_state_131,
+        released_code_131,
+        bytes32_t{131},
+        BlockHeader{.number = 13});
+    auto const state_root_round_131 = db.state_root();
+
+    LOG_INFO("block 13 round 132 on block 12 round 122");
+    db.set_block_and_prefix(12, bytes32_t{122});
+    BlockState bs_132(db, this->vm);
+    // b13 r132 r122                  --        v3
+    {
+        State as{bs_132, Incarnation{13, 1}};
+        EXPECT_EQ(as.set_storage(b, key1, null), EVMC_STORAGE_DELETED);
+        EXPECT_EQ(as.set_storage(c, key1, value3), EVMC_STORAGE_ADDED);
+        EXPECT_TRUE(bs_132.can_merge(as));
+        bs_132.merge(as);
+    }
+    auto
+        [released_state_132,
+         released_code_132,
+         _released_self_destruct_storage_reads_132] =
+            std::move(bs_132).release();
+    commit_simple(
+        db,
+        *released_state_132,
+        released_code_132,
+        bytes32_t{132},
+        BlockHeader{.number = 13});
+
+    //  b10 r100        a 10   b 20 v1 v2   c 30 v1 v2
+    //  b11 r111 r100           +40 v2 --
+    //  b12 r121 r111                        +10    v1
+    //  b13 r131 r121    +30    +20    v1        v2 --
+    //                  a 40   b 80 v2 v1   c 40 v2 --
+    //  finalize r111 r121 r131
+    db.finalize(11, bytes32_t{111});
+    db.finalize(12, bytes32_t{121});
+    db.finalize(13, bytes32_t{131});
+
+    db.set_block_and_prefix(13, bytes32_t{131});
+    EXPECT_TRUE(db.read_account(a).has_value());
+    EXPECT_TRUE(db.read_account(b).has_value());
+    EXPECT_TRUE(db.read_account(c).has_value());
+    EXPECT_EQ(db.read_account(a).value().balance, 40'000);
+    EXPECT_EQ(db.read_account(b).value().balance, 80'000);
+    EXPECT_EQ(db.read_account(c).value().balance, 40'000);
+    EXPECT_EQ(db.read_storage(b, Incarnation{0, 0}, key1), value2);
+    EXPECT_EQ(db.read_storage(b, Incarnation{0, 0}, key2), value1);
+    EXPECT_EQ(db.read_storage(c, Incarnation{0, 0}, key1), value2);
+    EXPECT_EQ(db.read_storage(c, Incarnation{0, 0}, key2), bytes32_t{});
+
+    // check state root of previous rounds
+    db.set_block_and_prefix(11, bytes32_t{111});
+    EXPECT_EQ(state_root_round_111, db.state_root());
+
+    db.set_block_and_prefix(13, bytes32_t{131});
+    EXPECT_EQ(state_root_round_131, db.state_root());
+}
+
+namespace
+{
+    using Dist = std::uniform_int_distribution<uint64_t>;
+
+    struct RandomProposalGenerator
+    {
+        static constexpr uint64_t RANDOM_LONG = 10;
+        static constexpr uint64_t RANDOM_WIDE = 11;
+        static constexpr uint64_t RANDOM_PROPOSE = 12;
+        static constexpr uint64_t RANDOM_ADD = 20;
+        static constexpr uint64_t RANDOM_DEL = 40;
+        static constexpr uint8_t ADDR[] = {81, 82, 83, 84, 85, 86, 87, 88, 89};
+        static constexpr uint8_t KEYS[] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+
+        std::mt19937_64 rng_;
+        Db &db1_;
+        Db &db2_;
+        vm::VM &vm_;
+        uint64_t finalized_block_{0};
+        uint64_t finalized_proposal_seed_{0};
+        uint64_t highest_proposal_seed_{0};
+        uint64_t long_{0}; // build a long chain of proposals before finalize
+        uint64_t wide_{0}; // different proposals for the same block
+        uint64_t wide_parent_{0}; // parent of the wide proposal
+        // proposal seed -> {block_number, parent_seed}
+        std::map<uint64_t, std::pair<uint64_t, std::optional<uint64_t>>>
+            proposals_;
+        // block_number -> set of proposals
+        std::map<uint64_t, std::set<uint64_t>> blocks_;
+
+        bytes32_t get_dummy_block_id(uint64_t const seed)
+        {
+            return to_bytes(
+                blake3(mpt::serialize_as_big_endian<sizeof(seed)>(seed)));
+        }
+
+    public:
+        RandomProposalGenerator(
+            uint64_t const seed, Db &db1, Db &db2, vm::VM &vm)
+            : rng_(seed)
+            , db1_(db1)
+            , db2_(db2)
+            , vm_(vm)
+        {
+        }
+
+        void run(uint64_t const iterations)
+        {
+            for (uint64_t i = 0; i < iterations; ++i) {
+                LOG_INFO("=== Iteration {}", i + 1);
+                std::optional<uint64_t> parent = {};
+                uint64_t proposal_seed = 0;
+                uint64_t block = 0;
+                // long
+                if (long_) {
+                    LOG_INFO("_long_ {}", long_);
+                    parent = last_proposal_seed();
+                    proposal_seed = last_proposal_seed() + 1;
+                    block = last_proposal_block() + 1;
+                    --long_;
+                }
+                // wide
+                else if (wide_) {
+                    LOG_INFO("_wide_ {}", wide_, wide_parent_);
+                    parent = wide_parent_;
+                    KINET_ASSERT(proposals_.find(*parent) != proposals_.end());
+                    proposal_seed = highest_proposal_seed_ + 1;
+                    block = proposals_[*parent].first + 1;
+                    --wide_;
+                }
+                // empty
+                else if (blocks_.empty()) {
+                    LOG_INFO("_empty_");
+                    proposal_seed = highest_proposal_seed_ + 1;
+                    block = finalized_block_ + 1;
+                    parent = finalized_block_ == 0
+                                 ? std::nullopt
+                                 : std::make_optional(finalized_proposal_seed_);
+                }
+                // random propose
+                else if (random_propose()) {
+                    LOG_INFO("_random_propose_");
+                    proposal_seed = highest_proposal_seed_ + 1;
+                    Dist dist(0, proposals_.size());
+                    uint64_t const order = dist(rng_);
+                    if (order == 0) {
+                        block = finalized_block_ + 1;
+                    }
+                    else {
+                        auto it = proposals_.begin();
+                        KINET_ASSERT(it != proposals_.end());
+                        for (uint64_t i = 1; i < order; ++i) {
+                            ++it;
+                            KINET_ASSERT(it != proposals_.end());
+                        }
+                        block = it->second.first + 1;
+                        parent = it->first;
+                        KINET_ASSERT(parent);
+                    }
+                }
+                // propose
+                if (proposal_seed) {
+                    LOG_INFO("Propose_ {} {} {}", block, proposal_seed, parent);
+                    KINET_ASSERT(block);
+                    auto const it = proposals_.find(proposal_seed);
+                    KINET_ASSERT(it == proposals_.end()); // assert no duplicate
+                    proposals_[proposal_seed] = {block, parent};
+                    blocks_[block].insert(proposal_seed);
+                    propose(block, proposal_seed, parent);
+                    highest_proposal_seed_ =
+                        proposal_seed > highest_proposal_seed_
+                            ? proposal_seed
+                            : highest_proposal_seed_;
+                    // future random
+                    if (long_ == 0 && wide_ == 0) {
+                        if (random_long()) {
+                            long_ = random9();
+                        }
+                        else if (random_wide()) {
+                            wide_ = random9();
+                            wide_parent_ = proposal_seed;
+                        }
+                    }
+                }
+                // finalize
+                else {
+                    finalize();
+                }
+                // check
+                check();
+            }
+        }
+
+    private:
+        uint64_t last_proposal_seed() const
+        {
+            return proposals_.empty() ? highest_proposal_seed_
+                                      : proposals_.rbegin()->first;
+        }
+
+        uint64_t last_proposal_block() const
+        {
+            return proposals_.empty() ? finalized_block_
+                                      : proposals_.rbegin()->second.first;
+        }
+
+        bool random_long()
+        {
+            return random100() < RANDOM_LONG;
+        }
+
+        bool random_wide()
+        {
+            return random100() < RANDOM_WIDE;
+        }
+
+        bool random_propose()
+        {
+            return random100() < RANDOM_PROPOSE;
+        }
+
+        uint64_t random100()
+        {
+            Dist dist(0, 99);
+            return dist(rng_);
+        }
+
+        uint64_t random9()
+        {
+            Dist dist(1, 9);
+            return dist(rng_);
+        }
+
+        uint64_t random_addr()
+        {
+            return 80 + random9();
+        }
+
+        uint64_t random_key()
+        {
+            return random9();
+        }
+
+        void propose(
+            uint64_t const block, uint64_t const proposal_seed,
+            std::optional<uint64_t> const parent)
+        {
+            KINET_ASSERT(block > 0);
+            db1_.set_block_and_prefix(
+                block - 1,
+                parent.has_value() ? get_dummy_block_id(*parent) : bytes32_t{});
+            db2_.set_block_and_prefix(
+                block - 1,
+                parent.has_value() ? get_dummy_block_id(*parent) : bytes32_t{});
+            BlockState bs1(db1_, vm_);
+            BlockState bs2(db2_, vm_);
+            Incarnation const inc{block, 1};
+            State st1(bs1, inc);
+            State st2(bs2, inc);
+            uint64_t const num = random9();
+            for (uint64_t i = 0; i < num; ++i) {
+                Address const addr(random_addr());
+                uint64_t const action = random100();
+                if (action < RANDOM_ADD) {
+                    uint256_t const delta = 10 * random9();
+                    LOG_INFO(
+                        "Account_add_ a_{} {}", addr.bytes[19] % 10, delta);
+                    st1.add_to_balance(addr, delta);
+                    st2.add_to_balance(addr, delta);
+                }
+                else if (action < RANDOM_DEL) {
+                    KINET_ASSERT(
+                        st1.get_balance(addr) == st2.get_balance(addr));
+                    KINET_ASSERT(
+                        st1.get_code_hash(addr) == st2.get_code_hash(addr));
+                    KINET_ASSERT(st1.get_nonce(addr) == st2.get_nonce(addr));
+                    if (st1.account_exists(addr)) {
+                        uint256_t const bal = st1.get_balance(addr);
+                        LOG_INFO(
+                            "Account_del_ a_{} {}", addr.bytes[19] % 10, bal);
+                        st1.subtract_from_balance(addr, bal);
+                        st2.subtract_from_balance(addr, bal);
+                    }
+                    else {
+                        LOG_INFO(
+                            "Account_del_empty_ a_{}", addr.bytes[19] % 10);
+                    }
+                }
+                else { // SET_STORAGE
+                    bytes32_t const key(random_key());
+                    LOG_INFO("Account_add_ a_{} {}", addr.bytes[19] % 10, 10);
+                    st1.add_to_balance(addr, 10);
+                    st2.add_to_balance(addr, 10);
+                    bytes32_t val;
+                    val.bytes[31] = static_cast<uint8_t>(10 * random9());
+                    LOG_INFO(
+                        "Set_storage_ a_{} k_{} {}",
+                        addr.bytes[19] % 10,
+                        key.bytes[31],
+                        val.bytes[31]);
+                    st1.set_storage(addr, key, val);
+                    st2.set_storage(addr, key, val);
+                }
+            }
+            st1.destruct_touched_dead();
+            st2.destruct_touched_dead();
+            KINET_ASSERT(bs1.can_merge(st1));
+            KINET_ASSERT(bs2.can_merge(st2));
+            bs1.merge(st1);
+            bs2.merge(st2);
+            {
+                auto [state1, code1, _] = std::move(bs1).release();
+                commit_simple(
+                    db1_,
+                    *state1,
+                    code1,
+                    get_dummy_block_id(proposal_seed),
+                    BlockHeader{.number = block});
+            }
+            {
+                auto [state2, code2, _] = std::move(bs2).release();
+                commit_simple(
+                    db2_,
+                    *state2,
+                    code2,
+                    get_dummy_block_id(proposal_seed),
+                    BlockHeader{.number = block});
+            }
+        }
+
+        void finalize()
+        {
+            // block
+            KINET_ASSERT(!blocks_.empty());
+            auto const it = blocks_.begin();
+            uint64_t const block = it->first;
+            // proposal
+            auto &s1 = it->second; // set of proposals
+            for (auto it2 = s1.begin(); it2 != s1.end();) {
+                auto const it3 = proposals_.find(*it2);
+                KINET_ASSERT(it3 != proposals_.end());
+                KINET_ASSERT(it3->second.first == block);
+                auto const p = it3->second.second;
+                if (p.has_value() && *p != finalized_proposal_seed_) {
+                    it2 = s1.erase(it2);
+                }
+                else {
+                    ++it2;
+                }
+            }
+            if (s1.empty()) {
+                LOG_INFO("No_valid_proposals_to_finalize_");
+                proposals_.clear();
+                blocks_.clear();
+                return;
+            }
+            uint64_t const target = s1.size() * random100() / 100;
+            KINET_ASSERT(target < s1.size());
+            auto it2 = s1.begin();
+            for (uint64_t i = 0; i < target; ++i) {
+                ++it2;
+            }
+            KINET_ASSERT(it2 != s1.end());
+            uint64_t const proposal_seed = *it2;
+            KINET_ASSERT(proposals_.find(proposal_seed) != proposals_.end());
+            KINET_ASSERT(proposals_[proposal_seed].first == block);
+            LOG_INFO("Finalize_ {} {}", block, proposal_seed);
+            // db finalize
+            db1_.finalize(block, get_dummy_block_id(proposal_seed));
+            db2_.finalize(block, get_dummy_block_id(proposal_seed));
+            finalized_block_ = block;
+            finalized_proposal_seed_ = proposal_seed;
+            // remove block and proposals
+            for (auto const r : s1) {
+                auto it3 = proposals_.find(r);
+                KINET_ASSERT(it3 != proposals_.end());
+                proposals_.erase(it3);
+            }
+            blocks_.erase(it);
+            while (!proposals_.empty()) {
+                auto const it3 = proposals_.begin();
+                KINET_ASSERT(it3->first != proposal_seed);
+                if (it3->first > proposal_seed) {
+                    break;
+                }
+                if (it3->second.first > block) {
+                    KINET_ASSERT(
+                        blocks_.find(it3->second.first) != blocks_.end());
+                    auto &s2 = blocks_[it3->second.first];
+                    auto it4 = s2.find(it3->first);
+                    KINET_ASSERT(it4 != s2.end());
+                    s2.erase(it4);
+                }
+                proposals_.erase(it3);
+            }
+        }
+
+        void check()
+        {
+            for (uint8_t const i : ADDR) {
+                Address const addr(i);
+                auto account1 = db1_.read_account(addr);
+                auto account2 = db2_.read_account(addr);
+                if (account1) {
+                    LOG_INFO(
+                        "Check_account_ a_{} {:08} {}",
+                        addr.bytes[19] % 10,
+                        account1->incarnation.get_block(),
+                        account1->balance);
+                }
+                KINET_ASSERT(account1 == account2);
+                if (account1) {
+                    Incarnation const incarnation = account1->incarnation;
+                    for (uint8_t const j : KEYS) {
+                        bytes32_t const key(j);
+                        auto const val1 =
+                            db1_.read_storage(addr, incarnation, key);
+                        auto const val2 =
+                            db2_.read_storage(addr, incarnation, key);
+                        if (val1 != bytes32_t{0}) {
+                            LOG_INFO(
+                                "Check_storage_ a_{}          k_{} {}",
+                                addr.bytes[19] % 10,
+                                key.bytes[31],
+                                val1.bytes[31]);
+                        }
+                        if (val1 != val2) {
+                            LOG_INFO(
+                                "Check_storage_ a_{}          k_{} {}",
+                                addr.bytes[19] % 10,
+                                key.bytes[31],
+                                val2.bytes[31]);
+                        }
+                        KINET_ASSERT(val1 == val2);
+                    }
+                }
+            }
+        }
+    };
+}
+
+TYPED_TEST(TwoOnDiskSuite, random_proposals)
+{
+    this->tdb1.reset_root(
+        load_header({}, this->db1, BlockHeader{.number = 0}), 0);
+    this->tdb2.reset_root(
+        load_header({}, this->db2, BlockHeader{.number = 0}), 0);
+    Db &db1 = this->tdb1;
+    Db &db2 = this->tdb2;
+
+    uint64_t const seed = [] {
+        char const *str = std::getenv("KINET_RANDOM_PROPOSALS_SEED");
+        return str ? std::stoull(std::string(str)) : 0;
+    }();
+    std::unique_ptr<RandomProposalGenerator> gen(
+        new RandomProposalGenerator(seed, db1, db2, this->vm));
+    uint64_t const iters = [] {
+        char const *str = std::getenv("KINET_RANDOM_PROPOSALS_ITERATIONS");
+        return str ? std::stoull(std::string(str)) : 100;
+    }();
+    LOG_INFO(
+        "Random proposal generation: {} iterations with seed {}", iters, seed);
+    gen->run(iters);
+}

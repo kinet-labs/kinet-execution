@@ -1,0 +1,421 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/address.hpp>
+#include <category/core/assert.h>
+#include <category/core/config.hpp>
+#include <category/core/keccak.hpp>
+#include <category/core/log.hpp>
+#include <category/core/runtime/unaligned.hpp>
+#include <category/execution/ethereum/core/rlp/block_rlp.hpp>
+#include <category/execution/ethereum/db/test/commit_simple.hpp>
+#include <category/execution/ethereum/db/trie_db.hpp>
+#include <category/execution/ethereum/db/util.hpp>
+#include <category/execution/ethereum/state2/state_deltas.hpp>
+#include <category/mpt/db_metadata_context.hpp>
+#include <category/mpt/detail/timeline.hpp>
+#include <category/mpt/state_machine_kind.hpp>
+#include <category/mpt/trie.hpp>
+#include <category/statesync/statesync_client.h>
+#include <category/statesync/statesync_client_context.hpp>
+#include <category/statesync/statesync_messages.h>
+#include <category/statesync/statesync_server.h>
+#include <category/statesync/statesync_server_context.hpp>
+#include <category/statesync/statesync_version.h>
+
+#include <ankerl/unordered_dense.h>
+
+#include <cstdint>
+#include <deque>
+#include <limits>
+#include <optional>
+#include <span>
+#include <stdio.h>
+#include <sys/sysinfo.h>
+
+using namespace kinet;
+using namespace kinet::mpt;
+
+struct kinet_statesync_client
+{
+    std::deque<kinet_sync_request> rqs;
+    uint64_t mask;
+};
+
+struct kinet_statesync_server_network
+{
+    kinet_statesync_client *client;
+    kinet_statesync_client_context *cctx;
+    byte_string buf;
+};
+
+void statesync_send_request(
+    kinet_statesync_client *const client, kinet_sync_request const rq)
+{
+    if (client->mask & (1ull << (rq.prefix % 64))) {
+        client->rqs.push_back(rq);
+    }
+}
+
+ssize_t statesync_server_recv(
+    kinet_statesync_server_network *const net, unsigned char *const buf,
+    size_t const len)
+{
+    if (len == 1) {
+        constexpr auto MSG_TYPE = SYNC_TYPE_REQUEST;
+        std::memcpy(buf, &MSG_TYPE, 1);
+    }
+    else {
+        KINET_ASSERT(len == sizeof(kinet_sync_request));
+        std::memcpy(buf, &net->client->rqs.front(), sizeof(kinet_sync_request));
+        net->client->rqs.pop_front();
+    }
+    return static_cast<ssize_t>(len);
+}
+
+void statesync_server_send_upsert(
+    kinet_statesync_server_network *const net, kinet_sync_type const type,
+    unsigned char const *const v1, uint64_t const size1,
+    unsigned char const *const v2, uint64_t const size2)
+{
+    net->buf.clear();
+    if (v1 != nullptr) {
+        net->buf.append(v1, size1);
+    }
+    if (v2 != nullptr) {
+        net->buf.append(v2, size2);
+    }
+    KINET_ASSERT(kinet_statesync_client_handle_upsert(
+        net->cctx, 0, type, net->buf.data(), net->buf.size()));
+}
+
+void statesync_server_send_done(
+    kinet_statesync_server_network *const net, kinet_sync_done const done)
+{
+    kinet_statesync_client_handle_done(net->cctx, done);
+}
+
+namespace kinet::mpt::test
+{
+    // Friend-of-Db accessor (db.hpp friends kinet::mpt::test::DbAccessor).
+    // Lets the fresh-pool helper stamp the persisted state_machine_kind.
+    struct DbAccessor
+    {
+        static UpdateAux &aux(Db &db)
+        {
+            return const_cast<UpdateAux &>(db.aux());
+        }
+    };
+}
+
+KINET_NAMESPACE_BEGIN
+
+namespace
+{
+    struct Range
+    {
+        uint64_t begin{0};
+        uint64_t end{0};
+    };
+
+    struct FuzzState : Range
+    {
+        ankerl::unordered_dense::segmented_map<uint64_t, Range> storage;
+    };
+
+    void new_account(
+        StateDeltas &deltas, FuzzState &state, Incarnation const incarnation,
+        uint64_t const n)
+    {
+        bool const success = deltas.emplace(
+            Address{state.end},
+            StateDelta{
+                .account = AccountDelta{
+                    std::nullopt,
+                    Account{.balance = n, .incarnation = incarnation}}});
+        KINET_ASSERT(success);
+        ++state.end;
+    }
+
+    void update_account(
+        StateDeltas &deltas, FuzzState &state, TrieDb &db, uint64_t const n,
+        Incarnation const incarnation)
+    {
+        if (state.begin == state.end) {
+            return;
+        }
+        uint64_t const addr = (n % (state.end - state.begin)) + state.begin;
+        auto const orig = db.read_account(Address{addr});
+        KINET_ASSERT(orig.has_value());
+        bool const reincarnate = (n % 10) == 1;
+        bool const success = deltas.emplace(
+            Address{addr},
+            StateDelta{
+                .account = AccountDelta{
+                    orig,
+                    Account{
+                        .balance = n,
+                        .incarnation = reincarnate
+                                           ? incarnation
+                                           : orig.value().incarnation}}});
+        KINET_ASSERT(success);
+        if (reincarnate) {
+            state.storage.erase(addr);
+        }
+    }
+
+    void remove_account(StateDeltas &deltas, FuzzState &state, TrieDb &db)
+    {
+        if (state.begin == state.end) {
+            return;
+        }
+        Address const addr{state.begin};
+        bool const success = deltas.emplace(
+            addr,
+            StateDelta{
+                .account = AccountDelta{
+                    db.read_account(Address{state.begin}), std::nullopt}});
+        KINET_ASSERT(success);
+        state.storage.erase(state.begin);
+        ++state.begin;
+    }
+
+    void new_storage(
+        StateDeltas &deltas, FuzzState &state, TrieDb &db, uint64_t const n)
+    {
+        if (state.begin == state.end) {
+            return;
+        }
+        uint64_t const addr = n % (state.end - state.begin) + state.begin;
+        auto const orig = db.read_account(Address{addr});
+        KINET_ASSERT(orig.has_value());
+        StateDeltas::accessor it;
+        bytes32_t const end{state.storage[addr].end++};
+        bool success = deltas.emplace(
+            it,
+            Address{addr},
+            StateDelta{
+                .account = {orig, orig},
+                .storage = StorageDeltas{{end, {bytes32_t{}, bytes32_t{n}}}}});
+        KINET_ASSERT(success);
+    }
+
+    void update_storage(
+        StateDeltas &deltas, FuzzState &state, TrieDb &db, uint64_t const n,
+        bool const erase)
+    {
+        if (state.storage.empty()) {
+            return;
+        }
+        auto const sit = state.storage.begin() +
+                         static_cast<unsigned>(n % state.storage.size());
+        Address const addr{sit->first};
+        auto const orig = db.read_account(addr);
+        KINET_ASSERT(orig.has_value());
+        auto &[begin, end] = sit->second;
+        KINET_ASSERT(begin != end);
+        bytes32_t const key{erase ? begin : n % (end - begin) + begin};
+        bytes32_t const value{erase ? 0 : n};
+        auto const sorig = db.read_storage(addr, orig->incarnation, key);
+        bool const success = deltas.emplace(
+            addr,
+            StateDelta{
+                .account = {orig, orig},
+                .storage = StorageDeltas{{key, {sorig, value}}}});
+        KINET_ASSERT(success && sorig != bytes32_t{});
+        if (erase) {
+            ++begin;
+            if (begin == end) {
+                state.storage.erase(sit);
+            }
+        }
+    }
+
+    void update_storage(
+        StateDeltas &deltas, FuzzState &state, TrieDb &db, uint64_t const n)
+    {
+        update_storage(deltas, state, db, n, false);
+    }
+
+    void remove_storage(
+        StateDeltas &deltas, FuzzState &state, TrieDb &db, uint64_t const n)
+    {
+        update_storage(deltas, state, db, n, true);
+    }
+
+    std::unique_ptr<OnDiskMachine> make_on_disk_machine(bool const page_encoded)
+    {
+        if (page_encoded) {
+            return std::make_unique<KinetOnDiskMachine>();
+        }
+        return std::make_unique<OnDiskMachine>();
+    }
+
+    std::filesystem::path tmp_dbname(bool const page_encoded)
+    {
+        std::filesystem::path dbname(
+            KINET_ASYNC_NAMESPACE::working_temporary_directory() /
+            "kinet_fuzz_statesync_XXXXXX");
+        int const fd = ::mkstemp((char *)dbname.native().data());
+        KINET_ASSERT(fd != -1);
+        KINET_ASSERT(
+            -1 !=
+            ::ftruncate(fd, static_cast<off_t>(8ULL * 1024 * 1024 * 1024)));
+        ::close(fd);
+        char const *const path = dbname.c_str();
+        mpt::Db db{
+            make_on_disk_machine(page_encoded),
+            mpt::OnDiskDbConfig{.append = false, .dbname_paths = {path}}};
+        kinet::mpt::test::DbAccessor::aux(db)
+            .metadata_ctx()
+            .set_state_machine_kind(
+                timeline_id::primary,
+                page_encoded ? state_machine_kind::kinet
+                             : state_machine_kind::ethereum);
+        return dbname;
+    }
+
+    void run_fuzz(
+        kinet_chain_config const chain, bool const page_encoded,
+        std::span<uint8_t const> raw)
+    {
+        std::filesystem::path const cdbname{tmp_dbname(page_encoded)};
+        char const *const cdbname_str = cdbname.c_str();
+        kinet_statesync_client client;
+        kinet_statesync_client_context *const cctx =
+            kinet_statesync_client_context_create(
+                chain,
+                &cdbname_str,
+                1,
+                static_cast<unsigned>(get_nprocs() - 1),
+                &client,
+                &statesync_send_request);
+        std::filesystem::path sdbname{tmp_dbname(page_encoded)};
+        mpt::Db sdb{
+            make_on_disk_machine(page_encoded),
+            OnDiskDbConfig{.append = true, .dbname_paths = {sdbname}}};
+        TrieDb stdb{sdb};
+        std::unique_ptr<kinet_statesync_server_context> sctx =
+            std::make_unique<kinet_statesync_server_context>(stdb);
+        mpt::AsyncIOContext io_ctx{
+            ReadOnlyOnDiskDbConfig{.dbname_paths{sdbname}}};
+        mpt::Db ro{io_ctx};
+        sctx->ro = &ro;
+        kinet_statesync_server_network net{
+            .client = &client, .cctx = cctx, .buf = {}};
+        for (size_t i = 0; i < kinet_statesync_client_prefixes(); ++i) {
+            kinet_statesync_client_handle_new_peer(
+                cctx, i, kinet_statesync_version());
+        }
+        kinet_statesync_server *const server = kinet_statesync_server_create(
+            sctx.get(),
+            &net,
+            &statesync_server_recv,
+            &statesync_server_send_upsert,
+            &statesync_server_send_done);
+
+        FuzzState state{};
+
+        bytes32_t parent_hash{};
+        BlockHeader hdr{.number = 0};
+
+        // write the genesis block
+        {
+            kinet::test::commit_simple(
+                *sctx, StateDeltas({}), Code{}, NULL_HASH_BLAKE3, hdr);
+            sctx->finalize(0, NULL_HASH_BLAKE3);
+            auto const rlp = rlp::encode_block_header(sctx->read_eth_header());
+            parent_hash = to_bytes(keccak256(rlp));
+        }
+
+        while (raw.size() >= sizeof(uint64_t)) {
+            // generate state deltas for the new block
+            StateDeltas deltas;
+            uint64_t const n = unaligned_load<uint64_t>(raw.data());
+            raw = raw.subspan(sizeof(uint64_t));
+            Incarnation const incarnation{stdb.get_block_number(), 0};
+            switch (n % 6) {
+            case 0:
+                new_account(deltas, state, incarnation, n);
+                break;
+            case 1:
+                update_account(deltas, state, stdb, n, incarnation);
+                break;
+            case 2:
+                remove_account(deltas, state, stdb);
+                break;
+            case 3:
+                new_storage(deltas, state, stdb, n);
+                break;
+            case 4:
+                update_storage(deltas, state, stdb, n);
+                break;
+            case 5:
+                remove_storage(deltas, state, stdb, n);
+                break;
+            }
+            client.mask = raw.size() < sizeof(uint64_t)
+                              ? std::numeric_limits<uint64_t>::max()
+                              : n;
+
+            // write new block
+            hdr.number = stdb.get_block_number() + 1;
+            KINET_ASSERT(hdr.number > 0);
+            hdr.parent_hash = parent_hash;
+            bytes32_t const curr_block_id = bytes32_t{hdr.number};
+            sctx->set_block_and_prefix(hdr.number - 1);
+            kinet::test::commit_simple(
+                *sctx, StateDeltas(std::move(deltas)), {}, curr_block_id, hdr);
+            sctx->finalize(hdr.number, curr_block_id);
+            auto const rlp = rlp::encode_block_header(sctx->read_eth_header());
+            parent_hash = to_bytes(keccak256(rlp));
+
+            // statesync to that block
+            kinet_statesync_client_handle_target(cctx, rlp.data(), rlp.size());
+            while (!client.rqs.empty()) {
+                kinet_statesync_server_run_once(server);
+            }
+        }
+        flush_logger();
+        KINET_ASSERT(kinet_statesync_client_has_reached_target(cctx));
+        KINET_ASSERT(kinet_statesync_client_finalize(cctx));
+
+        kinet_statesync_client_context_destroy(cctx);
+        kinet_statesync_server_destroy(server);
+        std::filesystem::remove(cdbname);
+        std::filesystem::remove(sdbname);
+    }
+
+}
+
+KINET_NAMESPACE_END
+
+extern "C" int
+LLVMFuzzerTestOneInput(uint8_t const *const data, size_t const size)
+{
+    if (size < sizeof(uint64_t)) {
+        return -1;
+    }
+
+    init_root_logger(quill::LogLevel::Error);
+
+    // Fuzz both encodings each input, until slot encoding is retired:
+    // KINET_TESTNET is pre-mip_8 (slot), KINET_DEVNET is mip_8-active (page).
+    std::span<uint8_t const> const raw{data, size};
+    run_fuzz(CHAIN_CONFIG_KINET_TESTNET, false, raw);
+    run_fuzz(CHAIN_CONFIG_KINET_DEVNET, true, raw);
+
+    return 0;
+}

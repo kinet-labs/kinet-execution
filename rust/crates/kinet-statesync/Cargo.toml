@@ -1,0 +1,13 @@
+[package]
+name = "kinet-statesync"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.cargo-shear]
+ignored = ["kinet-cxx"]
+
+[dependencies]
+kinet-cxx = { workspace = true }
+
+[build-dependencies]
+kinet-build = { workspace = true, features = ["bindgen"] }

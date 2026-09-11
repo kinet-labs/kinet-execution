@@ -1,0 +1,57 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/core/address.hpp>
+#include <category/core/config.hpp>
+#include <category/core/result.hpp>
+#include <category/execution/ethereum/chain/chain.hpp>
+#include <category/execution/ethereum/core/receipt.hpp>
+#include <category/execution/ethereum/execute_transaction.hpp>
+#include <category/execution/ethereum/trace/state_tracer.hpp>
+#include <category/vm/evm/traits.hpp>
+
+#include <boost/fiber/future/promise.hpp>
+
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <vector>
+
+KINET_NAMESPACE_BEGIN
+
+class BlockHashBuffer;
+class BlockState;
+class ExecutionEventRecorder;
+class State;
+struct BlockHeader;
+struct BlockMetrics;
+struct CallTracerBase;
+struct Chain;
+struct Transaction;
+
+template <Traits traits>
+Result<Receipt> dispatch_transaction(
+    Chain const &chain, uint64_t const i, Transaction const &transaction,
+    Address const &sender,
+    std::vector<std::optional<Address>> const &authorities,
+    BlockHeader const &header, BlockHashBuffer const &block_hash_buffer,
+    BlockState &block_state, BlockMetrics &block_metrics,
+    boost::fibers::promise<void> &prev, CallTracerBase &call_tracer,
+    trace::StateTracer &state_tracer, ChainContext<traits> const &chain_ctx,
+    ExecutionEventRecorder *exec_recorder, bool trace_transfers = false);
+
+KINET_NAMESPACE_END

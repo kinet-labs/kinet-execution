@@ -1,0 +1,751 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/address.hpp>
+#include <category/core/hex.hpp>
+#include <category/execution/ethereum/precompiles.hpp>
+#include <category/execution/ethereum/state2/block_state.hpp>
+#include <category/execution/ethereum/state3/state.hpp>
+#include <category/execution/ethereum/trace/call_tracer.hpp>
+#include <category/vm/evm/traits.hpp>
+#include <kinet/test/traits_test.hpp>
+
+#include <evmc/evmc.h>
+#include <evmc/evmc.hpp>
+
+#include <gtest/gtest.h>
+
+#include <nlohmann/json.hpp>
+
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <limits>
+#include <string_view>
+#include <variant>
+#include <vector>
+
+#include "test_resource_data.h"
+
+using namespace kinet;
+
+using namespace kinet::literals;
+
+namespace fs = std::filesystem;
+
+namespace
+{
+    // the following elliptic curve input data was directly copied from
+    // https://github.com/ethereum/go-ethereum/tree/master/core/vm/testdata/precompiles
+    static auto const ECRECOVER_UNRECOVERABLE_KEY_INPUT =
+        from_hex(
+            std::string_view{
+                "a8b53bdf3306a35a7103ab5504a0c9b492295564b6202b1942a84ef3001072"
+                "81000000000000000000000000000000000000000000000000000000000000"
+                "001b3078356531653033663533636531386237373263636230303933666637"
+                "31663366353366356337356237346463623331613835616138623838393262"
+                "34653862112233445566778899101112131415161718192021222324252627"
+                "2829303132"})
+            .value();
+
+    static auto const ECRECOVER_VALID_KEY_INPUT =
+        from_hex(
+            std::string_view{
+                "18c547e4f7b0f325ad1e56f57e26c745b09a3e503d86e00e5255ff7f715d3d"
+                "1c00"
+                "0000000000000000000000000000000000000000000000000000000000001c"
+                "73b1"
+                "693892219d736caba55bdb67216e485557ea6b6af75f37096c9aa6a5a75fee"
+                "b940"
+                "b1d03b21e36b0e47e79769f095fe2ab855bd91e3a38756b7d75a9c4549"})
+            .value();
+
+    static auto const ECRECOVER_VALID_KEY_OUTPUT =
+        from_hex(std::string_view{"000000000000000000000000a94f5374fce5ed"
+                                  "bc8e2a8697c15331677e6ebf0b"})
+            .value();
+
+    // hash of empty string
+    static auto const SHA256_NULL_HASH =
+        from_hex(std::string_view{"e3b0c44298fc1c149afbf4c8996fb92427ae41"
+                                  "e4649b934ca495991b7852b855"})
+            .value();
+
+    // hash of the string "lol"
+    static auto const SHA256_LOL_HASH =
+        from_hex(std::string_view{"07123e1f482356c415f684407a3b8723e10b2c"
+                                  "bbc0b8fcd6282c49d37c9c1abc"})
+            .value();
+
+    // hash of empty string padded to 32 bytes
+    static auto const RIPEMD160_NULL_HASH =
+        from_hex(std::string_view{"0000000000000000000000009c1185a5c5e9fc"
+                                  "54612808977ee8f548b2258d31"})
+            .value();
+
+    // hash of the string "lol" padded to 32 bytes
+    static auto const RIPEMD160_LOL_HASH =
+        from_hex(std::string_view{"00000000000000000000000014d61d472ae2e9"
+                                  "74453fb7a0ef239510f36bee24"})
+            .value();
+
+    // the following point evaluation input data was directly copied from
+    // https://github.com/ethereum/go-ethereum/tree/master/core/vm/testdata/precompiles
+    static auto const POINT_EVALUATION_INPUT =
+        from_hex(
+            std::string_view{
+                "014edfed8547661f6cb416eba53061a2f6dce872c0497e6dd485a876fe2567"
+                "f156"
+                "4c0a11a0f704f4fc3e8acfe0f8245f0ad1347b378fbf96e206da11a5d36306"
+                "6d92"
+                "8e13fe443e957d82e3e71d48cb65d51028eb4483e719bf8efcdf12f7c321a4"
+                "21e2"
+                "29565952cfff4ef3517100a97da1d4fe57956fa50a442f92af03b1bf37adac"
+                "c8ad"
+                "4ed209b31287ea5bb94d9d06a444d6bb5aadc3ceb615b50d6606bd54bfe529"
+                "f592"
+                "47987cd1ab848d19de599a9052f1835fb0d0d44cf70183e19a68c9"})
+
+            .value();
+    static auto const POINT_EVALUATION_EXPECTED =
+        from_hex(std::string_view{"00000000000000000000000000000000000000"
+                                  "0000000000000000000000100073"
+                                  "eda753299d7d483339d80809a1d80553bda402"
+                                  "fffe5bfeffffffff00000001"})
+            .value();
+
+    // EIP-152 test vector 8.
+    // The resulting gas cost (1 gas / round) exceeds any practical gas limit,
+    // testing the OUT_OF_GAS path in check_call_eth_precompile (without running
+    // the precompile).
+    static auto const BLAKE2F_MAX_ROUNDS_INPUT =
+        from_hex(
+            std::string_view{
+                "ffffffff" // maximum number of rounds
+                "48c9bdf267e6096a3ba7ca8485ae67bb2bf894fe72f36e3cf1361d5f3af54f"
+                "a5d182e6ad7f520e511f6c3e2b8c68059b6bbd41fbabd9831f79217e1319cd"
+                "e05b6162630000000000000000000000000000000000000000000000000000"
+                "00000000000000000000000000000000000000000000000000000000000000"
+                "00000000000000000000000000000000000000000000000000000000000000"
+                "00000000000000000000000000000000000000000000000000000000000000"
+                "0000000000000300000000000000000000000000000001"})
+            .value();
+
+    struct evmc_some_error
+    {
+    };
+
+    struct test_case
+    {
+        std::string name;
+        evmc::bytes input;
+        std::variant<evmc::bytes, evmc_some_error, evmc_status_code> expected;
+        int64_t gas;
+        std::optional<int64_t> gas_offset;
+    };
+
+    void from_json(nlohmann::json const &j, test_case &t)
+    {
+        t.name = j.at("Name");
+        std::string input = j.at("Input");
+        t.input = from_hex(std::string_view{input}).value();
+        if (j.contains("Expected")) {
+            std::string expected = j.at("Expected");
+            t.expected = from_hex(std::string_view{expected}).value();
+        }
+        else {
+            KINET_ASSERT(j.contains("ExpectedError"));
+            t.expected = evmc_some_error{};
+        }
+
+        // Expected-to-fail tests don't have a Gas field, so we assign them the
+        // maximum gas value to prevent out-of-gas errors from masking the
+        // actual failure the test is expected to trigger.
+        t.gas = j.value("Gas", std::numeric_limits<decltype(t.gas)>::max());
+    }
+
+    std::vector<test_case> load_test_cases(fs::path const &json_path)
+    {
+        KINET_ASSERT(fs::is_regular_file(json_path));
+        std::ifstream in(json_path);
+        return nlohmann::json::parse(in);
+    }
+
+    template <typename Callable>
+    auto
+    transform_test_cases(std::vector<test_case> const &source, Callable &&f)
+    {
+        auto res = source;
+        for (auto &test_case : res) {
+            f(test_case);
+        }
+        return res;
+    }
+
+    template <typename Callable>
+    std::vector<test_case>
+    transform_test_cases(std::span<test_case const> source, Callable &&f)
+    {
+        auto res = std::vector<test_case>{};
+        for (auto &t : source) {
+            test_case copy{t};
+            f(copy);
+            res.emplace_back(std::move(copy));
+        }
+        return res;
+    }
+
+    static test_case const ECRECOVER_TEST_CASES[] = {
+        {.name = "ecrecover_unrecoverable_key_enough_gas",
+         .input = ECRECOVER_UNRECOVERABLE_KEY_INPUT,
+         .expected = evmc::bytes{},
+         .gas = 3'000,
+         .gas_offset = 3'000},
+        {.name = "ecrecover_unrecoverable_key_insufficient_gas",
+         .input = ECRECOVER_UNRECOVERABLE_KEY_INPUT,
+         .expected = evmc_status_code::EVMC_OUT_OF_GAS,
+         .gas = 3'000,
+         .gas_offset = -1},
+        {.name = "ecrecover_valid_key_enough_gas",
+         .input = ECRECOVER_VALID_KEY_INPUT,
+         .expected = ECRECOVER_VALID_KEY_OUTPUT,
+         .gas = 3'000,
+         .gas_offset = 3'000},
+        {.name = "ecrecover_valid_key_insufficient_gas",
+         .input = ECRECOVER_VALID_KEY_INPUT,
+         .expected = evmc_status_code::EVMC_OUT_OF_GAS,
+         .gas = 3'000,
+         .gas_offset = -1}};
+
+    static test_case const SHA256_TEST_CASES[] = {
+        {.name = "sha256_empty_enough_gas",
+         .input = evmc::bytes{},
+         .expected = SHA256_NULL_HASH,
+         .gas = 60,
+         .gas_offset = 40},
+        {.name = "sha256_empty_insufficient_gas",
+         .input = evmc::bytes{},
+         .expected = evmc_status_code::EVMC_OUT_OF_GAS,
+         .gas = 60,
+         .gas_offset = -1},
+        {.name = "sha256_message_enough_gas",
+         .input = evmc::bytes{reinterpret_cast<uint8_t const *>("lol"), 3},
+         .expected = SHA256_LOL_HASH,
+         .gas = 72,
+         .gas_offset = 1},
+        {.name = "sha256_message_insufficient_gas",
+         .input = evmc::bytes{reinterpret_cast<uint8_t const *>("lol"), 3},
+         .expected = evmc_status_code::EVMC_OUT_OF_GAS,
+         .gas = 72,
+         .gas_offset = -1}};
+
+    static test_case const RIPEMD160_TEST_CASES[] = {
+        {.name = "ripemd160_empty_enough_gas",
+         .input = evmc::bytes{},
+         .expected = RIPEMD160_NULL_HASH,
+         .gas = 600,
+         .gas_offset = 1},
+        {.name = "ripemd160_empty_insufficient_gas",
+         .input = evmc::bytes{},
+         .expected = evmc_status_code::EVMC_OUT_OF_GAS,
+         .gas = 600,
+         .gas_offset = -1},
+        {.name = "ripemd160_message_enough_gas",
+         .input = evmc::bytes{reinterpret_cast<uint8_t const *>("lol"), 3},
+         .expected = RIPEMD160_LOL_HASH,
+         .gas = 720,
+         .gas_offset = 1},
+        {.name = "ripemd160_message_insufficient_gas",
+         .input = evmc::bytes{reinterpret_cast<uint8_t const *>("lol"), 3},
+         .expected = evmc_status_code::EVMC_OUT_OF_GAS,
+         .gas = 720,
+         .gas_offset = -1}};
+
+    static test_case const IDENTITY_TEST_CASES[] = {
+        {.name = "identity_empty_enough_gas",
+         .input = evmc::bytes{},
+         .expected = evmc::bytes{},
+         .gas = 15,
+         .gas_offset = 1},
+        {.name = "identity_empty_insufficient_gas",
+         .input = evmc::bytes{},
+         .expected = evmc_status_code::EVMC_OUT_OF_GAS,
+         .gas = 15,
+         .gas_offset = -1},
+        {.name = "identity_nonempty_enough_gas",
+         .input = evmc::bytes{reinterpret_cast<uint8_t const *>("dead"), 4},
+         .expected = evmc::bytes{reinterpret_cast<uint8_t const *>("dead"), 4},
+         .gas = 18,
+         .gas_offset = 1},
+        {.name = "identity_nonempty_insufficient_gas",
+         .input = evmc::bytes{reinterpret_cast<uint8_t const *>("dead"), 4},
+         .expected = evmc_status_code::EVMC_OUT_OF_GAS,
+         .gas = 18,
+         .gas_offset = -1}};
+
+    static test_case const POINT_EVALUATION_CASES[] = {
+        {.name = "point_evaluation_enough_gas",
+         .input = POINT_EVALUATION_INPUT,
+         .expected = POINT_EVALUATION_EXPECTED,
+         .gas = 50'000,
+         .gas_offset = 3'000},
+        {.name = "point_evaluation_insufficient_gas",
+         .input = POINT_EVALUATION_INPUT,
+         .expected = evmc_status_code::EVMC_OUT_OF_GAS,
+         .gas = 50'000,
+         .gas_offset = -1}};
+
+    // The maximum round number 0xFFFFFFFF is impractical to actually
+    // execute, so only check that the gas cost is enforced.
+    static test_case const BLAKE2F_MAX_ROUNDS_TEST_CASES[] = {
+        {.name = "blake_2f_max_rounds_gas_cost_only",
+         .input = BLAKE2F_MAX_ROUNDS_INPUT,
+         .expected = evmc_status_code::EVMC_OUT_OF_GAS,
+         .gas = 30'000'000,
+         .gas_offset = 0}};
+
+    template <Traits traits>
+    void do_geth_tests(
+        char const *suite_name, std::span<test_case const> test_cases,
+        kinet::Address const &code_address)
+    {
+        mpt::Db db{std::make_unique<InMemoryMachine>()};
+        TrieDb tdb{db};
+        vm::VM vm;
+        BlockState bs{tdb, vm};
+        State s{bs, Incarnation{0, 0}};
+
+        for (auto const &test_case : test_cases) {
+            auto test_with_gas_offset = [&](int64_t gas_offset) {
+                evmc_message const input = {
+                    .gas = test_case.gas + gas_offset,
+                    .input_data = test_case.input.data(),
+                    .input_size = test_case.input.size(),
+                    .code_address = code_address};
+
+                NoopCallTracer call_tracer{};
+                evmc::Result const result =
+                    check_call_precompile<traits>(s, call_tracer, input)
+                        .value();
+
+                if (auto const *expected_value =
+                        std::get_if<evmc::bytes>(&test_case.expected)) {
+                    EXPECT_EQ(
+                        result.status_code, evmc_status_code::EVMC_SUCCESS)
+                        << suite_name << " test case " << test_case.name;
+
+                    EXPECT_EQ(result.gas_left, gas_offset)
+                        << suite_name << " test case " << test_case.name
+                        << " gas check failed.";
+
+                    ASSERT_EQ(result.output_size, expected_value->size())
+                        << suite_name << " test case " << test_case.name
+                        << " output buffer size check failed.";
+
+                    for (size_t i = 0; i < result.output_size; i++) {
+                        EXPECT_EQ((*expected_value)[i], result.output_data[i])
+                            << suite_name << " test case " << test_case.name
+                            << " output buffer equality check failed.";
+                    }
+                }
+                else {
+                    EXPECT_NE(
+                        result.status_code, evmc_status_code::EVMC_SUCCESS)
+                        << suite_name << " test case " << test_case.name;
+
+                    // expecting a specific error code
+                    if (auto const *expected_error_code =
+                            std::get_if<evmc_status_code>(
+                                &test_case.expected)) {
+                        EXPECT_EQ(result.status_code, *expected_error_code)
+                            << suite_name << " test case " << test_case.name;
+                    }
+
+                    EXPECT_EQ(result.gas_left, 0)
+                        << suite_name << " test case " << test_case.name
+                        << " gas check failed. It should have cleared "
+                           "gas_left.";
+                }
+            };
+
+            if (test_case.gas_offset) {
+                test_with_gas_offset(*test_case.gas_offset);
+            }
+            else {
+                test_with_gas_offset(0);
+                // only call for a test_case where gas isn't already set to
+                // int64_t max value to avoid gas overflow
+                if (test_case.gas <=
+                    std::numeric_limits<int64_t>::max() - 100) {
+                    test_with_gas_offset(100);
+                }
+            }
+        }
+    }
+
+    template <Traits traits>
+    void do_geth_tests(
+        char const *suite_name, std::string_view json_path,
+        kinet::Address const &code_address)
+    {
+        auto const tests =
+            load_test_cases(test_resource::geth_vectors_dir / json_path);
+        do_geth_tests<traits>(suite_name, tests, code_address);
+    }
+}
+
+TYPED_TEST(TraitsTest, ecrecover)
+{
+    if constexpr (is_kinet_trait_v<typename TestFixture::Trait>) {
+        if constexpr (TestFixture::Trait::kinet_rev() >= KINET_SEVEN) {
+            // KINET_SEVEN doubles the price of ecrecover
+            auto const tests = transform_test_cases(
+                ECRECOVER_TEST_CASES, [](auto &test) { test.gas *= 2; });
+            return do_geth_tests<typename TestFixture::Trait>(
+                "ecrecover", tests, 0x01_address);
+        }
+    }
+
+    do_geth_tests<typename TestFixture::Trait>(
+        "ecrecover", ECRECOVER_TEST_CASES, 0x01_address);
+}
+
+TYPED_TEST(TraitsTest, sha256)
+{
+    do_geth_tests<typename TestFixture::Trait>(
+        "sha256", SHA256_TEST_CASES, 0x02_address);
+}
+
+TYPED_TEST(TraitsTest, ripemd160)
+{
+    do_geth_tests<typename TestFixture::Trait>(
+        "ripemd160", RIPEMD160_TEST_CASES, 0x03_address);
+}
+
+TYPED_TEST(TraitsTest, identity)
+{
+    do_geth_tests<typename TestFixture::Trait>(
+        "identity", IDENTITY_TEST_CASES, 0x04_address);
+}
+
+TYPED_TEST(TraitsTest, modular_exponentiation)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_BERLIN);
+
+    if constexpr (TestFixture::Trait::evm_rev() < KINET_ETH_OSAKA) {
+        // EIP-2565 repricing since Berlin
+        do_geth_tests<typename TestFixture::Trait>(
+            "Modular Exponentiation", "modexp_eip2565.json", 0x05_address);
+    }
+    else {
+        // EIP-7883 repricing since Osaka
+        do_geth_tests<typename TestFixture::Trait>(
+            "Modular Exponentiation", "modexp_eip7883.json", 0x05_address);
+    }
+}
+
+TYPED_TEST(TraitsTest, bn_add)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_ISTANBUL);
+
+    auto tests =
+        load_test_cases(test_resource::geth_vectors_dir / "bn256Add.json");
+
+    if constexpr (is_kinet_trait_v<typename TestFixture::Trait>) {
+        if constexpr (TestFixture::Trait::kinet_rev() >= KINET_SEVEN) {
+            // KINET_SEVEN doubles the price of bn_add
+            tests =
+                transform_test_cases(tests, [](auto &test) { test.gas *= 2; });
+        }
+    }
+
+    do_geth_tests<typename TestFixture::Trait>("bn_add", tests, 0x06_address);
+}
+
+TYPED_TEST(TraitsTest, bn_mul)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_ISTANBUL);
+
+    auto tests = load_test_cases(
+        test_resource::geth_vectors_dir / "bn256ScalarMul.json");
+
+    if constexpr (is_kinet_trait_v<typename TestFixture::Trait>) {
+        if constexpr (TestFixture::Trait::kinet_rev() >= KINET_SEVEN) {
+            // KINET_SEVEN increases the price of bn_mul by 5x
+            tests =
+                transform_test_cases(tests, [](auto &test) { test.gas *= 5; });
+        }
+    }
+
+    do_geth_tests<typename TestFixture::Trait>("bn_mul", tests, 0x07_address);
+}
+
+TYPED_TEST(TraitsTest, bn_pairing)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_ISTANBUL);
+
+    auto tests =
+        load_test_cases(test_resource::geth_vectors_dir / "bn256Pairing.json");
+
+    if constexpr (is_kinet_trait_v<typename TestFixture::Trait>) {
+        if constexpr (TestFixture::Trait::kinet_rev() >= KINET_SEVEN) {
+            // KINET_SEVEN increases the price of bn_pairing by 5x
+            tests =
+                transform_test_cases(tests, [](auto &test) { test.gas *= 5; });
+        }
+    }
+
+    do_geth_tests<typename TestFixture::Trait>(
+        "bn_pairing", tests, 0x08_address);
+}
+
+TYPED_TEST(TraitsTest, blake2f)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_ISTANBUL);
+
+    auto blake2f_test = [&](char const *name, std::string_view json) {
+        std::vector<test_case> tests =
+            load_test_cases(test_resource::geth_vectors_dir / json);
+
+        if constexpr (is_kinet_trait_v<typename TestFixture::Trait>) {
+            if constexpr (TestFixture::Trait::kinet_rev() >= KINET_SEVEN) {
+                // KINET_SEVEN doubles the price of blake2F
+                tests = transform_test_cases(
+                    tests, [](auto &test) { test.gas *= 2; });
+            }
+        }
+
+        do_geth_tests<typename TestFixture::Trait>(name, tests, 0x09_address);
+    };
+
+    blake2f_test("blake_2f_valid", "blake2F.json");
+    blake2f_test("blake_2f_invalid", "fail-blake2f.json");
+
+    do_geth_tests<typename TestFixture::Trait>(
+        "blake_2f_max_rounds_gas_cost_only",
+        BLAKE2F_MAX_ROUNDS_TEST_CASES,
+        0x09_address);
+}
+
+TYPED_TEST(TraitsTest, point_evaluation)
+{
+    if constexpr (TestFixture::Trait::evm_rev() < KINET_ETH_CANCUN) {
+        EXPECT_FALSE(is_precompile<typename TestFixture::Trait>(0x0a_address));
+    }
+    else {
+        ASSERT_TRUE(init_trusted_setup());
+
+        if constexpr (is_kinet_trait_v<typename TestFixture::Trait>) {
+            if constexpr (TestFixture::Trait::kinet_rev() >= KINET_SEVEN) {
+                // In KINET_SEVEN point_evaluation cost is increased by 4x
+                auto const tests = transform_test_cases(
+                    POINT_EVALUATION_CASES, [](auto &test) { test.gas *= 4; });
+                return do_geth_tests<typename TestFixture::Trait>(
+                    "point_evaluation", tests, 0x0a_address);
+            }
+        }
+
+        do_geth_tests<typename TestFixture::Trait>(
+            "point_evaluation", POINT_EVALUATION_CASES, 0x0a_address);
+    }
+}
+
+TYPED_TEST(TraitsTest, blsg1add)
+{
+    if constexpr (TestFixture::Trait::evm_rev() < KINET_ETH_PRAGUE) {
+        EXPECT_FALSE(is_precompile<typename TestFixture::Trait>(0x0b_address));
+    }
+    else {
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls_g1_add_valid", "blsG1Add.json", 0x0b_address);
+
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls_g1_add_invalid", "fail-blsG1Add.json", 0x0b_address);
+    }
+}
+
+TYPED_TEST(TraitsTest, blsg1mul)
+{
+    if constexpr (TestFixture::Trait::evm_rev() < KINET_ETH_PRAGUE) {
+        EXPECT_FALSE(is_precompile<typename TestFixture::Trait>(0x0c_address));
+    }
+    else {
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls_g1_mul_valid", "blsG1Mul.json", 0x0c_address);
+
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls_g1_mul_invalid", "fail-blsG1Mul.json", 0x0c_address);
+
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls_g1_msm_valid", "blsG1MultiExp.json", 0x0c_address);
+
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls_g1_msm_invalid", "fail-blsG1MultiExp.json", 0x0c_address);
+    }
+}
+
+TYPED_TEST(TraitsTest, blsg2add)
+{
+    if constexpr (TestFixture::Trait::evm_rev() < KINET_ETH_PRAGUE) {
+        EXPECT_FALSE(is_precompile<typename TestFixture::Trait>(0x0d_address));
+    }
+    else {
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls_g2_add_valid", "blsG2Add.json", 0x0d_address);
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls_g2_add_invalid", "fail-blsG2Add.json", 0x0d_address);
+    }
+}
+
+TYPED_TEST(TraitsTest, blsg2mul)
+{
+    if constexpr (TestFixture::Trait::evm_rev() < KINET_ETH_PRAGUE) {
+        EXPECT_FALSE(is_precompile<typename TestFixture::Trait>(0x0e_address));
+    }
+    else {
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls_g2_mul_valid", "blsG2Mul.json", 0x0e_address);
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls_g2_mul_invalid", "fail-blsG2Mul.json", 0x0e_address);
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls_g2_msm_valid", "blsG2MultiExp.json", 0x0e_address);
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls_g2_msm_invalid", "fail-blsG2MultiExp.json", 0x0e_address);
+    }
+}
+
+TYPED_TEST(TraitsTest, bls_pairing_check)
+{
+    if constexpr (TestFixture::Trait::evm_rev() < KINET_ETH_PRAGUE) {
+        EXPECT_FALSE(is_precompile<typename TestFixture::Trait>(0x0f_address));
+    }
+    else {
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls12_pairing_check_valid", "blsPairing.json", 0x0f_address);
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls12_pairing_check_invalid",
+            "fail-blsPairing.json",
+            0x0f_address);
+    }
+}
+
+TYPED_TEST(TraitsTest, bls_map_g1)
+{
+    if constexpr (TestFixture::Trait::evm_rev() < KINET_ETH_PRAGUE) {
+        EXPECT_FALSE(is_precompile<typename TestFixture::Trait>(0x10_address));
+    }
+    else {
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls12_map_fp_to_g1_valid", "blsMapG1.json", 0x10_address);
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls12_map_fp_to_g1_invalid", "fail-blsMapG1.json", 0x10_address);
+    }
+}
+
+TYPED_TEST(TraitsTest, bls_map_g2)
+{
+    if constexpr (TestFixture::Trait::evm_rev() < KINET_ETH_PRAGUE) {
+        EXPECT_FALSE(is_precompile<typename TestFixture::Trait>(0x11_address));
+    }
+    else {
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls12_map_fp2_to_g2_valid", "blsMapG2.json", 0x11_address);
+        do_geth_tests<typename TestFixture::Trait>(
+            "bls12_map_fp2_to_g2_invalid", "fail-blsMapG2.json", 0x11_address);
+    }
+}
+
+TYPED_TEST(TraitsTest, p256_verify)
+{
+    if constexpr (!TestFixture::Trait::eip_7951_active()) {
+        EXPECT_FALSE(
+            is_precompile<typename TestFixture::Trait>(0x0100_address));
+    }
+    else {
+        do_geth_tests<typename TestFixture::Trait>(
+            "p256_verify", "p256Verify.json", 0x0100_address);
+    }
+}
+
+TYPED_TEST(TraitsTest, modexp_truncated_input)
+{
+    static_assert(TestFixture::Trait::evm_rev() >= KINET_ETH_BERLIN);
+
+    // Before Osaka, inputs to modexp could be arbitrarily large, and
+    // would just fail for gas reasons. After Osaka, the large padded
+    // modulus size in this example fails to validate.
+    static constexpr auto expected_failure =
+        TestFixture::Trait::eip_7823_active()
+            ? evmc_status_code::EVMC_PRECOMPILE_FAILURE
+            : evmc_status_code::EVMC_OUT_OF_GAS;
+
+    static constexpr auto min_gas = [] {
+        if constexpr (TestFixture::Trait::evm_rev() >= KINET_ETH_OSAKA) {
+            return 500;
+        }
+        else {
+            return 200;
+        }
+    }();
+
+    auto const test_cases = std::array{
+        test_case{
+            .name = "truncated_modulus_len",
+            .input =
+                from_hex("0x00000000000000000000000000000000000000000000000"
+                         "0000000000000000100000000000000000000000000000000"
+                         "0000000000000000000000000000000100000000000000000"
+                         "000000000000000000000000000000005")
+                    .value(),
+            .expected = expected_failure,
+            .gas = 30'000'000,
+        },
+        test_case{
+            .name = "truncated_exponent_len",
+            .input = from_hex("0x00000000000000000000000000000000000000000"
+                              "0000000000000000000000100000000000000000000"
+                              "00000000000000000000000000000005")
+                         .value(),
+            .expected = expected_failure,
+            .gas = 30'000'000,
+        },
+        test_case{
+            .name = "truncated_base_len",
+            .input = from_hex("0x000000000000000000000000000000000000"
+                              "00000000000000000500")
+                         .value(),
+            .expected = expected_failure,
+            .gas = 30'000'000,
+        },
+        test_case{
+            .name = "truncated_exponent",
+            .input = from_hex("0x00000000000000000000000000000000000"
+                              "000000000000000000000"
+                              "0000000100000000000000000000000000000"
+                              "000000000000000000000"
+                              "0000000000000200000000000000000000000"
+                              "000000000000000000000"
+                              "000000000000000000050201")
+                         .value(),
+            .expected = from_hex("0x0000000000").value(),
+            .gas = min_gas,
+        },
+    };
+
+    do_geth_tests<typename TestFixture::Trait>(
+        "modexp_truncated_input", test_cases, 0x05_address);
+}

@@ -1,0 +1,491 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#pragma once
+
+#include <category/core/assert.h>
+#include <category/core/is_specialization_of.hpp>
+#include <category/vm/evm/kinet/revision.h>
+#include <category/vm/evm/revision.h>
+
+#include <cstddef>
+#include <evmc/evmc.h>
+
+#include <concepts>
+#include <cstdint>
+#include <limits>
+
+namespace kinet
+{
+    namespace constants
+    {
+        inline constexpr kinet_eth_revision EARLIEST_SUPPORTED_EVM_FORK =
+            KINET_ETH_BERLIN;
+
+        // The latest EVM fork whose execution semantics are implemented. Later
+        // forks may exist in the kinet_eth_revision enum (so the dispatch
+        // infrastructure — explicit instantiations, switch cases, opcode and
+        // storage tables — is in place) but are not yet wired up behaviorally.
+        // Such forks are excluded from the typed-revision test matrices and
+        // must not be run through evmone (see to_evmc_revision()).
+        // TODO(amsterdam): bump to KINET_ETH_AMSTERDAM once Amsterdam support
+        // lands.
+        inline constexpr kinet_eth_revision LATEST_SUPPORTED_EVM_FORK =
+            KINET_ETH_OSAKA;
+
+        inline constexpr size_t MAX_CODE_SIZE_EIP170 = 24 * 1024; // 0x6000
+        inline constexpr size_t MAX_INITCODE_SIZE_EIP3860 =
+            2 * MAX_CODE_SIZE_EIP170; // 0xC000
+
+        inline constexpr size_t MAX_CODE_SIZE_KINET_TWO = 128 * 1024;
+        inline constexpr size_t MAX_INITCODE_SIZE_KINET_FOUR =
+            2 * MAX_CODE_SIZE_KINET_TWO;
+    }
+
+    namespace detail
+    {
+        // Mirrors LLVM's AnalysisKey: a Traits specialization carries one
+        // static member of this type, and the address of that member is its
+        // opaque unique id (see the id() contract on the Traits concept).
+        struct alignas(8) TraitsKey
+        {
+        };
+    }
+
+    template <typename T>
+    concept Traits = requires() {
+        requires sizeof(T) == 1;
+        { T::evm_rev() } -> std::same_as<kinet_eth_revision>;
+
+        // Feature flags
+
+        { T::eip_1153_active() } -> std::same_as<bool>;
+        { T::eip_3198_active() } -> std::same_as<bool>;
+        { T::eip_3855_active() } -> std::same_as<bool>;
+        { T::eip_4399_active() } -> std::same_as<bool>;
+        { T::eip_4844_active() } -> std::same_as<bool>;
+        { T::eip_5656_active() } -> std::same_as<bool>;
+        { T::eip_7685_active() } -> std::same_as<bool>;
+        { T::eip_7691_active() } -> std::same_as<bool>;
+        { T::eip_7823_active() } -> std::same_as<bool>;
+        { T::eip_7883_active() } -> std::same_as<bool>;
+        { T::eip_7918_active() } -> std::same_as<bool>;
+        { T::eip_7939_active() } -> std::same_as<bool>;
+        { T::eip_7951_active() } -> std::same_as<bool>;
+        { T::eip_7981_active() } -> std::same_as<bool>;
+        { T::mip_3_active() } -> std::same_as<bool>;
+        { T::mip_8_active() } -> std::same_as<bool>;
+        { T::mip_11_active() } -> std::same_as<bool>;
+        { T::mip_12_active() } -> std::same_as<bool>;
+        { T::can_create_inside_delegated() } -> std::same_as<bool>;
+        // If true, BLOBHASH/BLOBBASEFEE exist and return
+        // stub data. Separate from eip_4844_active.
+        { T::has_blob_opcodes() } -> std::same_as<bool>;
+
+        // Constants
+        { T::max_code_size() } -> std::same_as<size_t>;
+        { T::max_initcode_size() } -> std::same_as<size_t>;
+        { T::cold_account_cost() } -> std::same_as<int64_t>;
+        { T::cold_storage_cost() } -> std::same_as<int64_t>;
+        { T::base_sstore_cost() } -> std::same_as<int64_t>;
+
+        // Instead of storing a revision, caches should identify revision
+        // changes by storing the opaque value returned by this method. No
+        // two chain specializations will return the same value, but no
+        // further semantics should be associated with the return value.
+        { T::id() } -> std::same_as<uint64_t>;
+    };
+
+    template <kinet_eth_revision Rev>
+    struct EvmTraits
+    {
+        static_assert(Rev >= KINET_ETH_BERLIN, "EVM revision is not supported");
+
+        static consteval kinet_eth_revision evm_rev() noexcept
+        {
+            return Rev;
+        }
+
+        static consteval bool eip_1153_active() noexcept
+        {
+            return Rev >= KINET_ETH_CANCUN;
+        }
+
+        static consteval bool eip_3198_active() noexcept
+        {
+            return Rev >= KINET_ETH_LONDON;
+        }
+
+        static consteval bool eip_3855_active() noexcept
+        {
+            return Rev >= KINET_ETH_SHANGHAI;
+        }
+
+        static consteval bool eip_4399_active() noexcept
+        {
+            return Rev >= KINET_ETH_PARIS;
+        }
+
+        static consteval bool eip_4844_active() noexcept
+        {
+            return Rev >= KINET_ETH_CANCUN;
+        }
+
+        static consteval bool eip_5656_active() noexcept
+        {
+            return Rev >= KINET_ETH_CANCUN;
+        }
+
+        static consteval bool eip_7685_active() noexcept
+        {
+            return Rev >= KINET_ETH_PRAGUE;
+        }
+
+        static consteval bool eip_7691_active() noexcept
+        {
+            return Rev >= KINET_ETH_PRAGUE;
+        }
+
+        static consteval bool eip_7823_active() noexcept
+        {
+            return Rev >= KINET_ETH_OSAKA;
+        }
+
+        static consteval bool eip_7883_active() noexcept
+        {
+            return Rev >= KINET_ETH_OSAKA;
+        }
+
+        static consteval bool eip_7918_active() noexcept
+        {
+            return Rev >= KINET_ETH_OSAKA;
+        }
+
+        static consteval bool eip_7939_active() noexcept
+        {
+            return Rev >= KINET_ETH_OSAKA;
+        }
+
+        static consteval bool eip_7951_active() noexcept
+        {
+            return Rev >= KINET_ETH_OSAKA;
+        }
+
+        static consteval bool eip_7981_active() noexcept
+        {
+            return Rev >= KINET_ETH_AMSTERDAM;
+        }
+
+        static consteval bool mip_3_active() noexcept
+        {
+            return false;
+        }
+
+        static consteval bool mip_8_active() noexcept
+        {
+            return false;
+        }
+
+        static consteval bool mip_12_active() noexcept
+        {
+            return false;
+        }
+
+        static consteval bool mip_11_active() noexcept
+        {
+            return false;
+        }
+
+        static consteval bool can_create_inside_delegated() noexcept
+        {
+            return true;
+        }
+
+        static consteval bool has_blob_opcodes() noexcept
+        {
+            return Rev >= KINET_ETH_CANCUN;
+        }
+
+        static consteval size_t max_code_size() noexcept
+        {
+            return constants::MAX_CODE_SIZE_EIP170;
+        }
+
+        static consteval size_t max_initcode_size() noexcept
+        {
+            if constexpr (Rev >= KINET_ETH_SHANGHAI) {
+                return constants::MAX_INITCODE_SIZE_EIP3860;
+            }
+
+            return std::numeric_limits<size_t>::max();
+        }
+
+        static consteval int64_t cold_account_cost() noexcept
+        {
+            return 2500;
+        }
+
+        static consteval int64_t cold_storage_cost() noexcept
+        {
+            return 2000;
+        }
+
+        static consteval int64_t base_sstore_cost() noexcept
+        {
+            return 100;
+        }
+
+        static uint64_t id() noexcept
+        {
+            static_assert(sizeof(uintptr_t) <= sizeof(uint64_t));
+            return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&key));
+        }
+
+        static detail::TraitsKey key;
+    };
+
+    template <kinet_eth_revision Rev>
+    detail::TraitsKey EvmTraits<Rev>::key;
+
+    // Runtime sibling to KinetTraits::mip_8_active(), for code holding a
+    // kinet_revision value rather than a trait type. Single source of the
+    // mip-8 (page-encoding) activation cutoff.
+    constexpr bool mip_8_active(kinet_revision const rev) noexcept
+    {
+        return rev >= KINET_TEN;
+    }
+
+    template <kinet_revision Rev>
+    struct KinetTraits
+    {
+        static consteval kinet_eth_revision evm_rev() noexcept
+        {
+            if constexpr (Rev >= KINET_NEXT) {
+                return KINET_ETH_AMSTERDAM;
+            }
+            if constexpr (Rev >= KINET_NINE) {
+                return KINET_ETH_OSAKA;
+            }
+            if constexpr (Rev >= KINET_FOUR) {
+                return KINET_ETH_PRAGUE;
+            }
+
+            return KINET_ETH_CANCUN;
+        }
+
+        static consteval kinet_revision kinet_rev() noexcept
+        {
+            return Rev;
+        }
+
+        static consteval bool eip_1153_active() noexcept
+        {
+            return evm_rev() >= KINET_ETH_CANCUN;
+        }
+
+        static consteval bool eip_3198_active() noexcept
+        {
+            return evm_rev() >= KINET_ETH_LONDON;
+        }
+
+        static consteval bool eip_3855_active() noexcept
+        {
+            return evm_rev() >= KINET_ETH_SHANGHAI;
+        }
+
+        static consteval bool eip_4399_active() noexcept
+        {
+            return evm_rev() >= KINET_ETH_PARIS;
+        }
+
+        static consteval bool eip_4844_active() noexcept
+        {
+            // if this EIP is ever enabled, reserve balance must be modified
+            // such that execution (and consensus) is accounting for the blob
+            // gas used (irrevocable) in the reserve balance calculation
+            return false;
+        }
+
+        static consteval bool eip_5656_active() noexcept
+        {
+            return evm_rev() >= KINET_ETH_CANCUN;
+        }
+
+        static consteval bool eip_7685_active() noexcept
+        {
+            // Kinet Prague blocks carry a requests_hash header field, but
+            // kinet-bft currently proposes and validates it as zero rather
+            // than as an Ethereum EIP-7685 request-list hash. Keep those
+            // paths paired before enabling real request hash processing.
+            return false;
+        }
+
+        static consteval bool eip_7691_active() noexcept
+        {
+            return false;
+        }
+
+        static consteval bool eip_7823_active() noexcept
+        {
+            return evm_rev() >= KINET_ETH_OSAKA;
+        }
+
+        static consteval bool eip_7883_active() noexcept
+        {
+            return evm_rev() >= KINET_ETH_OSAKA;
+        }
+
+        static consteval bool eip_7918_active() noexcept
+        {
+            return false;
+        }
+
+        static consteval bool eip_7939_active() noexcept
+        {
+            return evm_rev() >= KINET_ETH_OSAKA;
+        }
+
+        static consteval bool eip_7951_active() noexcept
+        {
+            return Rev >= KINET_FOUR;
+        }
+
+        static consteval bool eip_7981_active() noexcept
+        {
+            return evm_rev() >= KINET_ETH_AMSTERDAM;
+        }
+
+        static consteval bool mip_3_active() noexcept
+        {
+            if constexpr (Rev >= KINET_NINE) {
+                return true;
+            }
+            return false;
+        }
+
+        static consteval bool mip_11_active() noexcept
+        {
+            return false;
+        }
+
+        static consteval bool can_create_inside_delegated() noexcept
+        {
+            return false;
+        }
+
+        static consteval bool has_blob_opcodes() noexcept
+        {
+            return evm_rev() >= KINET_ETH_CANCUN;
+        }
+
+        static consteval bool mip_8_active() noexcept
+        {
+            return ::kinet::mip_8_active(Rev);
+        }
+
+        static consteval bool mip_12_active() noexcept
+        {
+            return Rev >= KINET_NEXT;
+        }
+
+        // Pricing version 1 activates the changes in:
+        // Kinet specification §4: Opcode Gas Costs and Gas Refunds
+        static consteval uint8_t kinet_pricing_version() noexcept
+        {
+            if constexpr (Rev >= KINET_SEVEN) {
+                return 1;
+            }
+
+            return 0;
+        }
+
+        static consteval int64_t base_sstore_cost() noexcept
+        {
+            return 100;
+        }
+
+        static consteval int64_t page_write_cost() noexcept
+        {
+            return 2800;
+        }
+
+        static consteval int64_t page_growth_cost() noexcept
+        {
+            return 17000;
+        }
+
+        static consteval size_t max_code_size() noexcept
+        {
+            if constexpr (Rev >= KINET_TWO) {
+                return constants::MAX_CODE_SIZE_KINET_TWO;
+            }
+
+            return constants::MAX_CODE_SIZE_EIP170;
+        }
+
+        static consteval size_t max_initcode_size() noexcept
+        {
+            if constexpr (Rev >= KINET_FOUR) {
+                return constants::MAX_INITCODE_SIZE_KINET_FOUR;
+            }
+
+            return constants::MAX_INITCODE_SIZE_EIP3860;
+        }
+
+        static consteval int64_t cold_account_cost() noexcept
+        {
+            if constexpr (kinet_pricing_version() >= 1) {
+                return 10000;
+            }
+            return 2500;
+        }
+
+        static consteval int64_t cold_storage_cost() noexcept
+        {
+            if constexpr (kinet_pricing_version() >= 1) {
+                return 8000;
+            }
+            return 2000;
+        }
+
+        static uint64_t id() noexcept
+        {
+            static_assert(sizeof(uintptr_t) <= sizeof(uint64_t));
+            return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&key));
+        }
+
+        static detail::TraitsKey key;
+
+        // Temporary workaround that should be considered equivalent to calling
+        // evm_rev(); remove when the refactoring to use feature flags is
+        // complete.
+        using evm_base = EvmTraits<KinetTraits::evm_rev()>;
+    };
+
+    template <kinet_revision Rev>
+    detail::TraitsKey KinetTraits<Rev>::key;
+
+    template <typename T>
+    inline constexpr bool is_evm_trait_v = is_specialization_of_v<EvmTraits, T>;
+
+    template <typename T>
+    inline constexpr bool is_kinet_trait_v =
+        is_specialization_of_v<KinetTraits, T>;
+
+    static_assert(is_kinet_trait_v<KinetTraits<KINET_ZERO>> == true);
+    static_assert(is_kinet_trait_v<EvmTraits<KINET_ETH_BERLIN>> == false);
+    static_assert(is_evm_trait_v<KinetTraits<KINET_ZERO>> == false);
+    static_assert(is_evm_trait_v<EvmTraits<KINET_ETH_BERLIN>> == true);
+}

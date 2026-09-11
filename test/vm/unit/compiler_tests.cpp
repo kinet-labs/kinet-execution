@@ -1,0 +1,356 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/vm/compiler/ir/basic_blocks.hpp>
+#include <category/vm/compiler/ir/instruction.hpp>
+#include <category/vm/compiler/types.hpp>
+#include <category/vm/evm/opcodes.hpp>
+#include <category/vm/evm/traits.hpp>
+
+#include <evmc/evmc.h>
+
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <format>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+using namespace kinet;
+using namespace kinet::vm;
+using namespace kinet::vm::compiler;
+
+template <
+    typename Op, typename... Args,
+    Traits traits = EvmTraits<KINET_ETH_LATEST_STABLE_REVISION>>
+Instruction i(std::uint32_t pc, Op evm_opcode, Args &&...args)
+{
+    auto info = opcode_table<traits>[evm_opcode];
+    return Instruction(
+        pc,
+        basic_blocks::evm_op_to_opcode(evm_opcode),
+        std::forward<Args>(args)...,
+        info.min_gas,
+        info.min_stack,
+        info.index,
+        info.stack_increase,
+        info.dynamic_gas);
+}
+
+void blocks_eq(
+    std::vector<uint8_t> const &in,
+    std::unordered_map<byte_offset, block_id> const &expected_jumpdests,
+    std::vector<basic_blocks::Block> const &expected_blocks)
+{
+    basic_blocks::BasicBlocksIR const actual =
+        basic_blocks::BasicBlocksIR::unsafe_from(in);
+
+    EXPECT_EQ(actual.jump_dests(), expected_jumpdests);
+    EXPECT_EQ(actual.blocks(), expected_blocks);
+}
+
+using enum basic_blocks::Terminator;
+
+TEST(TerminatorTest, Formatter)
+{
+    EXPECT_EQ(std::format("{}", FallThrough), "FallThrough");
+    EXPECT_EQ(std::format("{}", JumpI), "JumpI");
+    EXPECT_EQ(std::format("{}", Jump), "Jump");
+    EXPECT_EQ(std::format("{}", Return), "Return");
+    EXPECT_EQ(std::format("{}", Revert), "Revert");
+    EXPECT_EQ(std::format("{}", SelfDestruct), "SelfDestruct");
+    EXPECT_EQ(std::format("{}", Stop), "Stop");
+    EXPECT_EQ(std::format("{}", InvalidInstruction), "InvalidInstruction");
+}
+
+TEST(BasicBlocksTest, ToBlocks)
+{
+    blocks_eq(
+        {},
+        {},
+        {
+            {{}, Stop, INVALID_BLOCK_ID},
+        });
+
+    blocks_eq(
+        {STOP},
+        {},
+        {
+            {{}, Stop, INVALID_BLOCK_ID},
+        });
+
+    blocks_eq(
+        {0xEE},
+        {},
+        {
+            {{}, InvalidInstruction, INVALID_BLOCK_ID},
+        });
+
+    blocks_eq(
+        {PUSH1},
+        {},
+        {
+            {{
+                 i(0, PUSH1),
+             },
+             Stop,
+             INVALID_BLOCK_ID},
+        });
+
+    blocks_eq(
+        {PUSH2, 0xf},
+        {},
+        {
+            {{
+                 i(0, PUSH2, 0xf00),
+             },
+             Stop,
+             INVALID_BLOCK_ID},
+        });
+
+    blocks_eq(
+        {STOP, ADD},
+        {},
+        {
+            {{}, Stop, INVALID_BLOCK_ID},
+        });
+
+    blocks_eq(
+        {JUMPDEST, STOP},
+        {{0, 0}},
+        {
+            {{}, Stop, INVALID_BLOCK_ID},
+        });
+
+    blocks_eq(
+        {ADD, REVERT},
+        {},
+        {
+            {{
+                 i(0, ADD),
+             },
+             Revert,
+             INVALID_BLOCK_ID},
+        });
+
+    blocks_eq(
+        {ADD, ADD, RETURN},
+        {},
+        {
+            {{
+                 i(0, ADD),
+                 i(1, ADD),
+             },
+             Return,
+             INVALID_BLOCK_ID},
+        });
+
+    blocks_eq(
+        {JUMPDEST, ADD, REVERT},
+        {{0, 0}},
+        {
+            {{
+                 i(1, ADD),
+             },
+             Revert,
+             INVALID_BLOCK_ID},
+        });
+
+    blocks_eq(
+        {JUMPI},
+        {},
+        {
+            {{}, JumpI, 1},
+            {{}, Stop, INVALID_BLOCK_ID, 1},
+        });
+
+    blocks_eq(
+        {JUMPDEST, JUMPDEST},
+        {{0, 0}, {1, 1}},
+        {
+            {{}, FallThrough, 1, 0},
+            {{}, Stop, INVALID_BLOCK_ID, 1},
+        });
+
+    blocks_eq(
+        {JUMPDEST, JUMPDEST, JUMPDEST},
+        {{0, 0}, {1, 1}, {2, 2}},
+        {
+            {{}, FallThrough, 1, 0},
+            {{}, FallThrough, 2, 1},
+            {{}, Stop, INVALID_BLOCK_ID, 2},
+        });
+
+    blocks_eq(
+        {JUMPDEST, ADD, JUMPDEST},
+        {{0, 0}, {2, 1}},
+        {
+            {{
+                 i(1, ADD),
+             },
+             FallThrough,
+             1,
+             0},
+            {{}, Stop, INVALID_BLOCK_ID, 2},
+        });
+
+    blocks_eq(
+        {ADD, ADD, JUMP, ADD, JUMPDEST, SELFDESTRUCT},
+        {{4, 1}},
+        {
+            {{
+                 i(0, ADD),
+                 i(1, ADD),
+             },
+             Jump,
+             INVALID_BLOCK_ID},
+            {{}, SelfDestruct, INVALID_BLOCK_ID, 4},
+        });
+
+    blocks_eq(
+        {ADD, ADD, JUMP, ADD, JUMPDEST, JUMPDEST, SELFDESTRUCT},
+        {{4, 1}, {5, 2}},
+        {
+            {{
+                 i(0, ADD),
+                 i(1, ADD),
+             },
+             Jump,
+             INVALID_BLOCK_ID},
+            {{}, FallThrough, 2, 4},
+            {{}, SelfDestruct, INVALID_BLOCK_ID, 5},
+        });
+}
+
+TEST(BlockTest, Formatter)
+{
+    EXPECT_EQ(
+        std::format("{}", basic_blocks::Block{{}, Return, INVALID_BLOCK_ID}),
+        "  0x00:\n    Return\n");
+
+    EXPECT_EQ(
+        std::format(
+            "{}",
+            basic_blocks::Block{
+                {
+                    i(0, ADD),
+                    i(1, ADD),
+                },
+                SelfDestruct,
+                INVALID_BLOCK_ID}),
+        "  0x00:\n      ADD\n      ADD\n    SelfDestruct\n");
+
+    EXPECT_EQ(
+        std::format(
+            "{}",
+            basic_blocks::Block{
+                {
+                    i(1, ADD),
+                },
+                JumpI,
+                0}),
+        "  0x00:\n      ADD\n    JumpI 0\n");
+}
+
+auto const instrIR0 = basic_blocks::BasicBlocksIR::unsafe_from({});
+auto const instrIR1 =
+    basic_blocks::BasicBlocksIR::unsafe_from({JUMPDEST, SUB, SUB, JUMPDEST});
+auto const instrIR2 = basic_blocks::BasicBlocksIR::unsafe_from(
+    {JUMPDEST, JUMPDEST, SUB, JUMPDEST});
+auto const instrIR3 = basic_blocks::BasicBlocksIR::unsafe_from(
+    {PUSH1,    255,      PUSH1, 14,    SWAP2, PUSH1, 17,       JUMPI,
+     JUMPDEST, PUSH1,    1,     ADD,   SWAP1, JUMP,  JUMPDEST, POP,
+     STOP,     JUMPDEST, SWAP1, PUSH1, 8,     JUMP});
+
+TEST(BasicBlocksIRTest, Validation)
+{
+    EXPECT_TRUE(instrIR0.is_valid());
+    EXPECT_TRUE(instrIR1.is_valid());
+    EXPECT_TRUE(instrIR2.is_valid());
+    EXPECT_TRUE(instrIR3.is_valid());
+}
+
+TEST(BasicBlocksIRTest, Formatter)
+{
+    EXPECT_EQ(
+        std::format("{}", instrIR0),
+        R"(basic_blocks:
+  block 0  0x00:
+    Stop
+
+  jumpdests:
+)");
+
+    EXPECT_EQ(
+        std::format("{}", instrIR1),
+        R"(basic_blocks:
+  block 0  0x00:
+      SUB
+      SUB
+    FallThrough 1
+  block 1  0x03:
+    Stop
+
+  jumpdests:
+    3:1
+    0:0
+)");
+
+    EXPECT_EQ(
+        std::format("{}", instrIR2),
+        R"(basic_blocks:
+  block 0  0x00:
+    FallThrough 1
+  block 1  0x01:
+      SUB
+    FallThrough 2
+  block 2  0x03:
+    Stop
+
+  jumpdests:
+    3:2
+    1:1
+    0:0
+)");
+
+    EXPECT_EQ(
+        std::format("{}", instrIR3),
+        R"(basic_blocks:
+  block 0  0x00:
+      PUSH1 0xff
+      PUSH1 0xe
+      SWAP2
+      PUSH1 0x11
+    JumpI 1
+  block 1  0x08:
+      PUSH1 0x1
+      ADD
+      SWAP1
+    Jump
+  block 2  0x0e:
+      POP
+    Stop
+  block 3  0x11:
+      SWAP1
+      PUSH1 0x8
+    Jump
+
+  jumpdests:
+    17:3
+    14:2
+    8:1
+)");
+}

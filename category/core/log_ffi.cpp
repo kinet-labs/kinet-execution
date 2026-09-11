@@ -1,0 +1,280 @@
+// Copyright (C) 2025 Category Labs, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#include <category/core/log.hpp>
+#include <category/core/log_ffi.h>
+
+#include <quill/Backend.h>
+#include <quill/Frontend.h>
+#include <quill/sinks/ConsoleSink.h>
+
+#include <cerrno>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <exception>
+#include <format>
+#include <memory>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+static thread_local char error_buf[1024];
+
+struct kinet_log_handler
+{
+    std::shared_ptr<quill::Sink> quill_handler;
+};
+
+// We can't #include <syslog.h>, it has some macros that conflict with quill
+enum syslog_level : uint8_t
+{
+    Emergency = 0,
+    Alert = 1,
+    Critical = 2,
+    Error = 3,
+    Warning = 4,
+    Notice = 5,
+    Info = 6,
+    Debug = 7,
+};
+
+constexpr uint8_t to_syslog_level(quill::LogLevel const l)
+{
+    using quill::LogLevel;
+
+    switch (l) {
+    case LogLevel::Critical:
+        return syslog_level::Critical;
+    case LogLevel::Error:
+        return syslog_level::Error;
+    case LogLevel::Warning:
+        return syslog_level::Warning;
+    case LogLevel::Info:
+        return syslog_level::Info;
+    case LogLevel::Debug:
+        return syslog_level::Debug;
+    case LogLevel::TraceL1:
+        return syslog_level::Debug + 1;
+    case LogLevel::TraceL2:
+        return syslog_level::Debug + 2;
+    case LogLevel::TraceL3:
+        return syslog_level::Debug + 3;
+    default:
+        return syslog_level::Alert;
+    }
+}
+
+constexpr quill::LogLevel to_quill_log_level(syslog_level const l)
+{
+    using quill::LogLevel;
+
+    switch (std::to_underlying(l)) {
+    case syslog_level::Emergency:
+        [[fallthrough]];
+    case syslog_level::Alert:
+        [[fallthrough]];
+    case syslog_level::Critical:
+        return LogLevel::Critical;
+    case syslog_level::Error:
+        return LogLevel::Error;
+    case syslog_level::Warning:
+        [[fallthrough]];
+    case syslog_level::Notice:
+        return LogLevel::Warning;
+    case syslog_level::Info:
+        return LogLevel::Info;
+    case syslog_level::Debug:
+        return LogLevel::Debug;
+    case syslog_level::Debug + 1:
+        return LogLevel::TraceL1;
+    case syslog_level::Debug + 2:
+        return LogLevel::TraceL2;
+    case syslog_level::Debug + 3:
+        return LogLevel::TraceL3;
+    default:
+        return LogLevel::None;
+    }
+}
+
+// A quill log handler that wraps quill's log message in a `kinet_log` object
+// and calls the registered callback function
+class LogCallbackSink : public quill::Sink
+{
+public:
+    LogCallbackSink(
+        kinet_log_write_callback *write_fn, kinet_log_flush_callback *flush_fn,
+        uintptr_t const user)
+        : write_fn_{write_fn}
+        , flush_fn_{flush_fn}
+        , user_{user}
+    {
+    }
+
+    QUILL_ATTRIBUTE_HOT void write_log(
+        quill::MacroMetadata const * /** log_metadata **/,
+        uint64_t /** log_timestamp **/, std::string_view /** thread_id **/,
+        std::string_view /** thread_name **/,
+        std::string const & /** process_id **/,
+        std::string_view /** logger_name **/, quill::LogLevel log_level,
+        std::string_view /** log_level_description **/,
+        std::string_view /** log_level_short_code **/,
+        std::vector<std::pair<std::string, std::string>> const
+            * /** named_args **/,
+        std::string_view /** log_message **/,
+        std::string_view log_statement) override
+    {
+
+        kinet_log const log = {
+            .syslog_level = to_syslog_level(log_level),
+            .message = log_statement.data(),
+            .message_len = log_statement.size(),
+        };
+        write_fn_(&log, user_);
+    }
+
+    QUILL_ATTRIBUTE_HOT void flush_sink() noexcept override
+    {
+        if (flush_fn_ != nullptr) {
+            flush_fn_(user_);
+        }
+    }
+
+private:
+    kinet_log_write_callback *write_fn_;
+    kinet_log_flush_callback *flush_fn_;
+    uintptr_t user_;
+};
+
+int kinet_log_handler_create(
+    struct kinet_log_handler **const handler_p, char const *const name,
+    kinet_log_write_callback *write_fn, kinet_log_flush_callback *flush_fn,
+    uintptr_t const user)
+{
+    if (name == nullptr || std::strlen(name) == 0) {
+        *std::format_to(error_buf, "invalid handler name") = '\0';
+        return EINVAL;
+    }
+    if (write_fn == nullptr) {
+        *std::format_to(error_buf, "write callback cannot be nullptr") = '\0';
+        return EFAULT;
+    }
+    try {
+        *handler_p = new kinet_log_handler{
+            .quill_handler =
+                quill::Frontend::create_or_get_sink<LogCallbackSink>(
+                    std::string{name}, write_fn, flush_fn, user)};
+    }
+    catch (std::exception const &ex) {
+        *std::format_to(
+            error_buf,
+            "exception occurred creating `{}` handler: {}",
+            name,
+            ex.what()) = '\0';
+        return EIO;
+    }
+    return 0;
+}
+
+int kinet_log_handler_create_stdout_handler(
+    struct kinet_log_handler **const handler_p)
+{
+    *handler_p = nullptr;
+    try {
+        auto stdout_sink =
+            quill::Frontend::create_or_get_sink<quill::ConsoleSink>(
+                "stdout_sink");
+        *handler_p =
+            new kinet_log_handler{.quill_handler = std::move(stdout_sink)};
+        return 0;
+    }
+    catch (std::exception const &ex) {
+        *std::format_to(
+            error_buf,
+            "exception occurred creating stdout handler: {}",
+            ex.what()) = '\0';
+        return EIO;
+    }
+}
+
+void kinet_log_handler_destroy(struct kinet_log_handler *const handler)
+{
+    delete handler;
+}
+
+int kinet_log_init(
+    struct kinet_log_handler **const handlers, size_t const handler_count,
+    uint8_t const level)
+{
+    using std::chrono::duration_cast, std::chrono::nanoseconds,
+        std::chrono::microseconds;
+
+    // quill recognizes three trace levels, which are assigned after debug;
+    // these aren't real syslog levels but we recognize them in case the
+    // caller wants to coax quill into tracing
+    if (level > syslog_level::Debug + 3) {
+        *std::format_to(
+            error_buf, "level {} out of syslog level range", level) = '\0';
+        return ERANGE;
+    }
+    quill::LogLevel const quill_level =
+        to_quill_log_level(static_cast<syslog_level>(level));
+    quill::BackendOptions backend_options{};
+    if (quill_level >= quill::LogLevel::Warning) {
+        // Quill is designed for high performance logging, which is potentially
+        // important if we're producing a lot of messages. If the logging is
+        // well-behaved, it should only ever be noisy in the case of debug or
+        // trace messages (perhaps also INFO). In the current configuration,
+        // the caller only wants to see warnings and up; we'll allow the
+        // background thread to sleep for much longer, so we don't schedule
+        // it too often; we are worried about wasting limited CPU resources,
+        // not the queue overflowing
+        backend_options.sleep_duration =
+            duration_cast<nanoseconds>(microseconds{250});
+    }
+
+    std::vector<std::shared_ptr<quill::Sink>> sinks;
+    for (kinet_log_handler *h : std::span{handlers, handler_count}) {
+        sinks.emplace_back(h->quill_handler);
+    }
+
+    try {
+        kinet_root_logger = quill::Frontend::create_or_get_logger(
+            "root",
+            sinks,
+            quill::PatternFormatterOptions{
+                kinet::quill_default_pattern,
+                kinet::quill_default_time_format,
+                quill::Timezone::GmtTime});
+        kinet_root_logger->set_log_level(quill_level);
+        quill::Backend::start(backend_options);
+    }
+    catch (std::exception const &ex) {
+        *std::format_to(
+            error_buf,
+            "exception occurred initializing logger: {}",
+            ex.what()) = '\0';
+        return EIO;
+    }
+    return 0;
+}
+
+char const *kinet_log_get_last_error()
+{
+    return error_buf;
+}
