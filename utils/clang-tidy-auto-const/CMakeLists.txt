@@ -11,7 +11,7 @@
 # Apache-2.0 license for more details.
 #
 # You should have received a copy of the Apache-2.0 license
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 find_package(LLVM 19.1.7 REQUIRED CONFIG)
 find_package(Clang 19.1.7 REQUIRED CONFIG)

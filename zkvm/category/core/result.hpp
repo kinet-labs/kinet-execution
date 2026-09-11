@@ -11,7 +11,7 @@
 // Apache-2.0 license for more details.
 //
 // You should have received a copy of the Apache-2.0 license
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 // The x86 host uses outcome::experimental::status_result<T>, whose default
 // NoValuePolicy is status_code_throw that won't compile under -fno-exceptions

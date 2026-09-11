@@ -11,7 +11,7 @@
 // Apache-2.0 license for more details.
 //
 // You should have received a copy of the Apache-2.0 license
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 #include <category/execution/ethereum/db/trie_db.hpp>
 #include <category/execution/kinet/db/page_commit_builder.hpp>

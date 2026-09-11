@@ -11,7 +11,7 @@
 # Apache-2.0 license for more details.
 #
 # You should have received a copy of the Apache-2.0 license
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 add_trie_test(TARGET append_test SOURCES "append_test.cpp")
 add_trie_test(TARGET big_endian_serialization_test SOURCES

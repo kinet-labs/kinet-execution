@@ -11,7 +11,7 @@
 // Apache-2.0 license for more details.
 //
 // You should have received a copy of the Apache-2.0 license
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 // zkVM mirror: the unwind path is implemented inline with setjmp/longjmp
 // rather than via the host's hand-rolled asm trampoline (see exit.S).

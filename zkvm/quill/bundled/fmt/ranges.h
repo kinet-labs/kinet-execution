@@ -11,7 +11,7 @@
 // Apache-2.0 license for more details.
 //
 // You should have received a copy of the Apache-2.0 license
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 // zkVM shadow of <quill/bundled/fmt/ranges.h>. Quill is dropped from the
 // guest link (fmt aliases to std::, see zkvm/category/core/log.hpp), so the

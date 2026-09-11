@@ -11,7 +11,7 @@
 // Apache-2.0 license for more details.
 //
 // You should have received a copy of the Apache-2.0 license
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 // zkVM shadow of <quill/std/Pair.h>. Quill is dropped from the guest link, so
 // the host headers that #include this quill logging-codec support for

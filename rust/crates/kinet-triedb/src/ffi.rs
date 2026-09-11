@@ -11,7 +11,7 @@
 // Apache-2.0 license for more details.
 //
 // You should have received a copy of the Apache-2.0 license
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 pub(crate) use self::bindings::{
     kinet_c_bytes32, triedb_async_ranged_get, triedb_async_read, triedb_async_read_callback_fn,

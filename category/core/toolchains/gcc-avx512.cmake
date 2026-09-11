@@ -11,7 +11,7 @@
 # Apache-2.0 license for more details.
 #
 # You should have received a copy of the Apache-2.0 license
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 # This toolchain is good for a basic AVX512 CPU
 set(CMAKE_ASM_FLAGS_INIT "-march=skylake-avx512")

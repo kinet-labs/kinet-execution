@@ -11,7 +11,7 @@
 # Apache-2.0 license for more details.
 #
 # You should have received a copy of the Apache-2.0 license
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 # Hash and signature primitives, in C so that they carry no dependency on
 # kinet_core. kinet_core links this library for kinet_keccak256(), which its

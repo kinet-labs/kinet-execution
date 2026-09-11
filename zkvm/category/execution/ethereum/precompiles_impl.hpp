@@ -11,7 +11,7 @@
 // Apache-2.0 license for more details.
 //
 // You should have received a copy of the Apache-2.0 license
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 // zkVM precompiles shim: implements the EVM precompile execute functions
 // by calling through the zkvm_accelerators.h C interface to Rust FFI.
