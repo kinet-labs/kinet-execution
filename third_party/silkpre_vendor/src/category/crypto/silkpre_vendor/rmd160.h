@@ -33,7 +33,7 @@
  *
  *      Modified 2022 for Silkpre by Andrew Ashikhmin.
  *
- *      Modified 2026 by Category Labs: renamed silkpre_rmd160 to kinet_rmd160.
+ *      Modified 2026 by Kinet Labs: renamed silkpre_rmd160 to kinet_rmd160.
  *
 \********************************************************************/
 

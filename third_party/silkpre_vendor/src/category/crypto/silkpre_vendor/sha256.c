@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-// Modified 2026 by Category Labs:
+// Modified 2026 by Kinet Labs:
 //   - renamed silkpre_sha256 to kinet_sha256
 //   - made internal helper `cpuid` static to avoid colliding with silkpre's
 //     copy at link time

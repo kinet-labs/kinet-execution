@@ -13,7 +13,7 @@
    https://blake2.net.
 */
 
-// Modified 2026 by Category Labs: renamed silkpre prefixes to kinet
+// Modified 2026 by Kinet Labs: renamed silkpre prefixes to kinet
 
 #include <category/crypto/silkpre_vendor/blake2b.h>
 

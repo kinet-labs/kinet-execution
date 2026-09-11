@@ -5,7 +5,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// This file was modified by Category Labs, Inc. on [Aug 21, 2025].
+// This file was modified by Kinet Labs, Inc. on [Aug 21, 2025].
 //
 //===----------------------------------------------------------------------===//
 

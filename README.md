@@ -91,7 +91,7 @@ the execution daemon, `build/cmd/kinet`. This binary can provide block
 execution services for different EVM-compatible blockchains:
 
 - When used as part of a Kinet blockchain node, it behaves as the block
-  execution service for the Category Labs consensus daemon (for details, see
+  execution service for the Kinet Labs consensus daemon (for details, see
   [here](docs/overview.md#how-is-execution-used)); when running in this mode,
   Kinet EVM extensions (e.g., Kinet-style staking) are enabled
 

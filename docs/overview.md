@@ -12,7 +12,7 @@ blocks (bundles of transactions) to be appended to the blockchain. The
 execution component performs the actual transaction processing, and keeps
 track of the state of the blockchain in a database.
 
-In the Category Labs architecture, the two components are developed
+In the Kinet Labs architecture, the two components are developed
 separately, and live in separate source code repositories. They produce
 two separate binaries, which are also called "consensus" and "execution"
 throughout the documentation. These binaries typically run as Linux daemons,

@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-// Modified 2026 by Category Labs: renamed silkpre_sha256 to kinet_sha256.
+// Modified 2026 by Kinet Labs: renamed silkpre_sha256 to kinet_sha256.
 
 #ifndef KINET_SHA256_H_
 #define KINET_SHA256_H_

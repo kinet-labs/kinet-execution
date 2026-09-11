@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-// Modified 2026 by Category Labs:
+// Modified 2026 by Kinet Labs:
 //   - Rename to use kinet prefixes
 //   - Remove secp256k1_ecdh and related functions
 

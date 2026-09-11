@@ -15,7 +15,7 @@
    Modified 2022 for Silkpre by Andrew Ashikhmin.
 */
 
-// Modified 2026 by Category Labs: renamed silkpre prefixes to kinet
+// Modified 2026 by Kinet Labs: renamed silkpre prefixes to kinet
 
 #ifndef KINET_BLAKE2B_H_
 #define KINET_BLAKE2B_H_

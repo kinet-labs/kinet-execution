@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-// Modified 2026 by Category Labs:
+// Modified 2026 by Kinet Labs:
 //   - alt_bn128 (EIP-196 / EIP-197) precompiles from silkpre/precompile.cpp
 //   - Rename to use kinet prefixes
 //   - Return the result in a caller-provided buffer instead of SilkpreOutput
