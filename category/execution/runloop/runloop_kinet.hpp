@@ -1,23 +1,23 @@
-// Copyright (C) 2025 Category Labs, Inc.
+// Copyright (C) 2025 Kinet Labs, Inc.
 //
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the Apache-2.0 license as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
+// Apache-2.0 license for more details.
 //
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// You should have received a copy of the Apache-2.0 license
+// along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 #pragma once
 
 #include <category/core/config.hpp>
 #include <category/core/result.hpp>
-#include <category/execution/runloop/runloop_monad_override.hpp>
+#include <category/execution/runloop/runloop_kinet_override.hpp>
 #include <category/vm/vm.hpp>
 
 #include <cstdint>
@@ -26,9 +26,9 @@
 
 #include <signal.h>
 
-MONAD_NAMESPACE_BEGIN
+KINET_NAMESPACE_BEGIN
 
-struct MonadChain;
+struct KinetChain;
 struct Db;
 class BlockHashBufferFinalized;
 class ExecutionEventRecorder;
@@ -43,11 +43,11 @@ namespace fiber
     class PriorityPool;
 }
 
-Result<std::pair<uint64_t, uint64_t>> runloop_monad(
-    MonadChain const &, std::filesystem::path const &, mpt::Db &, Db &,
+Result<std::pair<uint64_t, uint64_t>> runloop_kinet(
+    KinetChain const &, std::filesystem::path const &, mpt::Db &, Db &,
     Db *secondary_db, vm::VM &, BlockHashBufferFinalized &,
     fiber::PriorityPool &, uint64_t &, uint64_t, sig_atomic_t const volatile &,
     bool enable_tracing, ExecutionEventRecorder *,
-    RunloopMonadOverride runloop_override = {});
+    RunloopKinetOverride runloop_override = {});
 
-MONAD_NAMESPACE_END
+KINET_NAMESPACE_END

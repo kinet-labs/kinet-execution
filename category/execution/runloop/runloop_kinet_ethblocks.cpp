@@ -1,19 +1,19 @@
-// Copyright (C) 2025 Category Labs, Inc.
+// Copyright (C) 2025 Kinet Labs, Inc.
 //
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the Apache-2.0 license as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
+// Apache-2.0 license for more details.
 //
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// You should have received a copy of the Apache-2.0 license
+// along with this program.  If not, see <http://www.apache.org/licenses/>.
 
-#include "runloop_monad_ethblocks.hpp"
+#include "runloop_kinet_ethblocks.hpp"
 
 #include <category/core/assert.h>
 #include <category/core/bytes.hpp>
@@ -40,10 +40,10 @@
 #include <category/execution/ethereum/trace/call_tracer.hpp>
 #include <category/execution/ethereum/validate_block.hpp>
 #include <category/execution/ethereum/validate_transaction.hpp>
-#include <category/execution/monad/chain/monad_chain.hpp>
-#include <category/execution/monad/db/commit_block_migration.hpp>
-#include <category/execution/monad/reserve_balance.hpp>
-#include <category/execution/monad/validate_monad_block.hpp>
+#include <category/execution/kinet/chain/kinet_chain.hpp>
+#include <category/execution/kinet/db/commit_block_migration.hpp>
+#include <category/execution/kinet/reserve_balance.hpp>
+#include <category/execution/kinet/validate_kinet_block.hpp>
 #include <category/vm/evm/switch_traits.hpp>
 #include <category/vm/evm/traits.hpp>
 
@@ -60,7 +60,7 @@
 #include <thread>
 #include <vector>
 
-MONAD_ANONYMOUS_NAMESPACE_BEGIN
+KINET_ANONYMOUS_NAMESPACE_BEGIN
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-variable"
@@ -87,7 +87,7 @@ void log_tps(
         ntxs,
         tps,
         gps,
-        monad_procfs_self_resident() / (1L << 20));
+        kinet_procfs_self_resident() / (1L << 20));
 };
 
 void get_block_with_retry(
@@ -105,7 +105,7 @@ void get_block_with_retry(
 
         if (timeout == std::chrono::seconds::zero() ||
             std::chrono::steady_clock::now() - start_time >= timeout) {
-            MONAD_ABORT_PRINTF(
+            KINET_ABORT_PRINTF(
                 "Could not read block %lu from blockdb", block_num);
         }
 
@@ -115,11 +115,11 @@ void get_block_with_retry(
 
 #pragma GCC diagnostic pop
 
-// Process a single Monad block stored in Ethereum format
+// Process a single Kinet block stored in Ethereum format
 template <Traits traits>
-    requires is_monad_trait_v<traits>
-Result<void> process_monad_block(
-    MonadChain const &chain, Db &db, Db *const mirror_db, vm::VM &vm,
+    requires is_kinet_trait_v<traits>
+Result<void> process_kinet_block(
+    KinetChain const &chain, Db &db, Db *const mirror_db, vm::VM &vm,
     BlockHashBufferFinalized &block_hash_buffer,
     fiber::PriorityPool &priority_pool, Block &block, bytes32_t const &block_id,
     bytes32_t const &parent_block_id, bool const enable_tracing,
@@ -135,9 +135,9 @@ Result<void> process_monad_block(
     auto const block_begin = std::chrono::steady_clock::now();
 
     // This is exactly the same as the recording call in runloop_ethereum.cpp;
-    // even though these are historical Monad block inputs, we don't have the
+    // even though these are historical Kinet block inputs, we don't have the
     // additional information from the consensus header here (the consensus
-    // timestamp, the `monad_c_native_block_input` protocol extensions, etc.),
+    // timestamp, the `kinet_c_native_block_input` protocol extensions, etc.),
     // so there are a few std::nullopt values, and the timestamp is approximate
     record_block_start(
         exec_recorder,
@@ -177,7 +177,7 @@ Result<void> process_monad_block(
         combine_senders_and_authorities(senders, recovered_authorities);
 
     BOOST_OUTCOME_TRY(
-        static_validate_monad_body<traits>(senders, block.transactions));
+        static_validate_kinet_body<traits>(senders, block.transactions));
 
     // Call tracer initialization
     std::vector<std::vector<CallFrame>> call_frames{block.transactions.size()};
@@ -217,7 +217,7 @@ Result<void> process_monad_block(
 
     BlockMetrics block_metrics;
     BlockState block_state(db, vm, mirror_db);
-    record_block_marker_event(exec_recorder, MONAD_EXEC_BLOCK_PERF_EVM_ENTER);
+    record_block_marker_event(exec_recorder, KINET_EXEC_BLOCK_PERF_EVM_ENTER);
     BOOST_OUTCOME_TRY(
         auto const receipts,
         execute_block<traits>(
@@ -234,7 +234,7 @@ Result<void> process_monad_block(
             system_call_state_tracer,
             chain_context,
             exec_recorder));
-    record_block_marker_event(exec_recorder, MONAD_EXEC_BLOCK_PERF_EVM_EXIT);
+    record_block_marker_event(exec_recorder, KINET_EXEC_BLOCK_PERF_EVM_EXIT);
 
     // Database commit of state changes (incl. Merkle root calculations)
     block_state.log_debug();
@@ -328,12 +328,12 @@ Result<void> process_monad_block(
     return outcome_e::success();
 }
 
-MONAD_ANONYMOUS_NAMESPACE_END
+KINET_ANONYMOUS_NAMESPACE_END
 
-MONAD_NAMESPACE_BEGIN
+KINET_NAMESPACE_BEGIN
 
-Result<std::pair<uint64_t, uint64_t>> runloop_monad_ethblocks(
-    MonadChain const &chain, std::filesystem::path const &ledger_dir, Db &db,
+Result<std::pair<uint64_t, uint64_t>> runloop_kinet_ethblocks(
+    KinetChain const &chain, std::filesystem::path const &ledger_dir, Db &db,
     Db *const secondary_db, vm::VM &vm,
     BlockHashBufferFinalized &block_hash_buffer,
     fiber::PriorityPool &priority_pool, uint64_t &finalized_block_num,
@@ -425,33 +425,33 @@ Result<std::pair<uint64_t, uint64_t>> runloop_monad_ethblocks(
         get_block_with_retry(block_db, block_num, block, block_db_timeout);
 
         bytes32_t const block_id = bytes32_t{block.header.number};
-        monad_revision const rev =
-            chain.get_monad_revision(block.header.timestamp);
+        kinet_revision const rev =
+            chain.get_kinet_revision(block.header.timestamp);
 
         // Blocks always execute on and commit to the primary; the primary's
         // encoding must match the block's revision. Before the mip-8 cutoff
         // the primary is the slot db and a page-encoded secondary, when
         // open, is mirrored so it can be promoted at the cutoff (offline,
-        // via monad-mpt). After the promote the primary is the page db and
+        // via kinet-mpt). After the promote the primary is the page db and
         // the slot secondary is frozen history that takes no writes.
-        MONAD_ASSERT_PRINTF(
+        KINET_ASSERT_PRINTF(
             db.is_page_encoded() == mip_8_active(rev),
-            "monad revision %d at block %lu needs a %s-encoded primary "
+            "kinet revision %d at block %lu needs a %s-encoded primary "
             "(found %s); %s",
             rev,
             block.header.number,
             mip_8_active(rev) ? "page" : "slot",
             db.is_page_encoded() ? "page" : "slot",
             mip_8_active(rev)
-                ? "run monad-mpt --promote-secondary offline"
+                ? "run kinet-mpt --promote-secondary offline"
                 : "pre MIP-8 blocks cannot replay on a promoted db");
 
         Db *const mirror_db = !mip_8_active(rev) ? secondary_db : nullptr;
 
         ankerl::unordered_dense::segmented_set<Address> senders_and_authorities;
         BOOST_OUTCOME_TRY([&] {
-            SWITCH_MONAD_TRAITS(
-                process_monad_block,
+            SWITCH_KINET_TRAITS(
+                process_kinet_block,
                 chain,
                 db,
                 mirror_db,
@@ -466,7 +466,7 @@ Result<std::pair<uint64_t, uint64_t>> runloop_monad_ethblocks(
                 parent_senders_and_authorities,
                 senders_and_authorities,
                 exec_recorder);
-            MONAD_ABORT_PRINTF("unhandled rev switch case: %d", rev);
+            KINET_ABORT_PRINTF("unhandled rev switch case: %d", rev);
         }());
 
         record_mock_consensus_events(exec_recorder, block_id, block_num);
@@ -504,4 +504,4 @@ Result<std::pair<uint64_t, uint64_t>> runloop_monad_ethblocks(
     return {ntxs, total_gas};
 }
 
-MONAD_NAMESPACE_END
+KINET_NAMESPACE_END

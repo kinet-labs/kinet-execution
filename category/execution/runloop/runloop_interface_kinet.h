@@ -1,17 +1,17 @@
-// Copyright (C) 2025-26 Category Labs, Inc.
+// Copyright (C) 2025-26 Kinet Labs, Inc.
 //
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the Apache-2.0 license as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
+// Apache-2.0 license for more details.
 //
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// You should have received a copy of the Apache-2.0 license
+// along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 #pragma once
 
@@ -22,49 +22,49 @@ extern "C"
 {
 #endif
 
-struct MonadRunloopWord
+struct KinetRunloopWord
 {
     uint8_t bytes[32];
 };
 
-struct MonadRunloopAddress
+struct KinetRunloopAddress
 {
     uint8_t bytes[20];
 };
 
 // Opaque runloop structure:
-typedef void MonadRunloop;
+typedef void KinetRunloop;
 
 // Make a new runloop client
-MonadRunloop *monad_runloop_new(
+KinetRunloop *kinet_runloop_new(
     uint64_t chain_id, char const *ledger_path, char const *db_path);
 
 // Deallocate a runloop client
-void monad_runloop_delete(MonadRunloop *);
+void kinet_runloop_delete(KinetRunloop *);
 
 // Execute and finalize `nblocks` number of blocks.
-void monad_runloop_run(MonadRunloop *, uint64_t nblocks);
+void kinet_runloop_run(KinetRunloop *, uint64_t nblocks);
 
 // Set balance of the account with given address.
-void monad_runloop_set_balance(
-    MonadRunloop *, MonadRunloopAddress const *, MonadRunloopWord const *);
+void kinet_runloop_set_balance(
+    KinetRunloop *, KinetRunloopAddress const *, KinetRunloopWord const *);
 
 // Get balance of the account with given address.
 // Balance is stored in `result_balance`
-void monad_runloop_get_balance(
-    MonadRunloop *, MonadRunloopAddress const *,
-    MonadRunloopWord *result_balance);
+void kinet_runloop_get_balance(
+    KinetRunloop *, KinetRunloopAddress const *,
+    KinetRunloopWord *result_balance);
 
 // Store current primary state root in `result_state_root`.
-void monad_runloop_get_primary_state_root(
-    MonadRunloop *, MonadRunloopWord *result_state_root);
+void kinet_runloop_get_primary_state_root(
+    KinetRunloop *, KinetRunloopWord *result_state_root);
 
 // Store current secondary state root in `result_state_root`.
-void monad_runloop_get_secondary_state_root(
-    MonadRunloop *, MonadRunloopWord *result_state_root);
+void kinet_runloop_get_secondary_state_root(
+    KinetRunloop *, KinetRunloopWord *result_state_root);
 
 // Dump the current state of the database to stdout
-void monad_runloop_dump(MonadRunloop *);
+void kinet_runloop_dump(KinetRunloop *);
 
 #ifdef __cplusplus
 }

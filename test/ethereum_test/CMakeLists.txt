@@ -27,28 +27,8 @@ ExternalProject_Add(
 
 ExternalProject_Add(
   KinetSpecTestFixtures
-  URL "https://github.com/kinet-developers/execution-specs/releases/download/tests-kinet@v1.2.1/fixtures_kinet.tar.gz"
-  URL_HASH "SHA256=ee4392e2012f3bab03b12a63faa5eb208dca4f6b032e7ba01b7b148ac3998403"
-  PREFIX ${CMAKE_BINARY_DIR}
-  CONFIGURE_COMMAND ""
-  BUILD_COMMAND ""
-  INSTALL_COMMAND ""
-  LOG_DOWNLOAD ON)
-
-ExternalProject_Add(
-  KinetAmsterdamSpecTestFixtures
-  URL "https://github.com/kinet-developers/execution-specs/releases/download/tests-kinet_amsterdam@v0.2.0/fixtures_kinet_amsterdam.tar.gz"
-  URL_HASH "SHA256=20b2a55f49a4b777f1abc6c196dc0afad22475b0ac598a39cc94fc598e22619d"
-  PREFIX ${CMAKE_BINARY_DIR}
-  CONFIGURE_COMMAND ""
-  BUILD_COMMAND ""
-  INSTALL_COMMAND ""
-  LOG_DOWNLOAD ON)
-
-ExternalProject_Add(
-  KinetEip7981SpecTestFixtures
-  URL "https://github.com/kinet-developers/execution-specs/releases/download/tests-kinet_eip7981@v0.1.0/fixtures_kinet_eip7981.tar.gz"
-  URL_HASH "SHA256=d624ec9c38c945c48f43ffb229c0a963660b8506d5bf4fe8068e13df4fdf0b8d"
+  URL "https://github.com/kinet-labs/execution-specs/releases/download/tests-kinet@v1.2.1/fixtures_kinet.tar.gz"
+  URL_HASH "SHA256=d42c558cb16ba64ed1f39ebeff3ec1f316c5eb6ef5589bd3f10f1a3251f4b43e"
   PREFIX ${CMAKE_BINARY_DIR}
   CONFIGURE_COMMAND ""
   BUILD_COMMAND ""

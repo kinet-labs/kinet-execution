@@ -1,17 +1,17 @@
-// Copyright (C) 2025 Category Labs, Inc.
+// Copyright (C) 2025 Kinet Labs, Inc.
 //
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the Apache-2.0 license as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
+// Apache-2.0 license for more details.
 //
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// You should have received a copy of the Apache-2.0 license
+// along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 #include "runloop_ethereum.hpp"
 
@@ -53,7 +53,7 @@
 #include <memory>
 #include <vector>
 
-MONAD_ANONYMOUS_NAMESPACE_BEGIN
+KINET_ANONYMOUS_NAMESPACE_BEGIN
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-variable"
@@ -80,7 +80,7 @@ void log_tps(
         ntxs,
         tps,
         gps,
-        monad_procfs_self_resident() / (1L << 20));
+        kinet_procfs_self_resident() / (1L << 20));
 };
 
 #pragma GCC diagnostic pop
@@ -95,7 +95,7 @@ Result<void> process_ethereum_block(
     bytes32_t const &parent_block_id, bool const enable_tracing,
     ExecutionEventRecorder *const exec_recorder)
 {
-    static_assert(traits::evm_rev() >= MONAD_ETH_CONSTANTINOPLE);
+    static_assert(traits::evm_rev() >= KINET_ETH_CONSTANTINOPLE);
 
     [[maybe_unused]] auto const block_start = std::chrono::system_clock::now();
     auto const block_begin = std::chrono::steady_clock::now();
@@ -161,7 +161,7 @@ Result<void> process_ethereum_block(
     BlockState block_state(db, vm);
 
     ChainContext<traits> const chain_ctx{};
-    record_block_marker_event(exec_recorder, MONAD_EXEC_BLOCK_PERF_EVM_ENTER);
+    record_block_marker_event(exec_recorder, KINET_EXEC_BLOCK_PERF_EVM_ENTER);
     BOOST_OUTCOME_TRY(
         auto const receipts,
         execute_block<traits>(
@@ -178,7 +178,7 @@ Result<void> process_ethereum_block(
             system_call_state_tracer,
             chain_ctx,
             exec_recorder));
-    record_block_marker_event(exec_recorder, MONAD_EXEC_BLOCK_PERF_EVM_EXIT);
+    record_block_marker_event(exec_recorder, KINET_EXEC_BLOCK_PERF_EVM_EXIT);
 
     // Database commit of state changes (incl. Merkle root calculations)
     block_state.log_debug();
@@ -267,9 +267,9 @@ Result<void> process_ethereum_block(
     return outcome_e::success();
 }
 
-MONAD_ANONYMOUS_NAMESPACE_END
+KINET_ANONYMOUS_NAMESPACE_END
 
-MONAD_NAMESPACE_BEGIN
+KINET_NAMESPACE_BEGIN
 
 Result<std::pair<uint64_t, uint64_t>> runloop_ethereum(
     Chain const &chain, std::filesystem::path const &ledger_dir, Db &db,
@@ -298,20 +298,20 @@ Result<std::pair<uint64_t, uint64_t>> runloop_ethereum(
 
     while (block_num <= end_block_num && stop == 0) {
         Block block;
-        MONAD_ASSERT_PRINTF(
+        KINET_ASSERT_PRINTF(
             block_db.get(block_num, block),
             "Could not query %lu from blockdb",
             block_num);
 
         BlockHeader const parent_header = db.read_eth_header();
-        MONAD_ASSERT_PRINTF(
+        KINET_ASSERT_PRINTF(
             parent_header.number + 1 == block.header.number,
             "parent header number %lu does not precede block %lu",
             parent_header.number,
             block.header.number);
 
         bytes32_t const block_id = bytes32_t{block.header.number};
-        monad_eth_revision const rev =
+        kinet_eth_revision const rev =
             chain.get_revision(block.header.number, block.header.timestamp);
 
         BOOST_OUTCOME_TRY([&] {
@@ -328,7 +328,7 @@ Result<std::pair<uint64_t, uint64_t>> runloop_ethereum(
                 parent_block_id,
                 enable_tracing,
                 exec_recorder);
-            MONAD_ABORT_PRINTF("unhandled rev switch case: %d", rev);
+            KINET_ABORT_PRINTF("unhandled rev switch case: %d", rev);
         }());
 
         record_mock_consensus_events(exec_recorder, block_id, block_num);
@@ -360,4 +360,4 @@ Result<std::pair<uint64_t, uint64_t>> runloop_ethereum(
     return {ntxs, total_gas};
 }
 
-MONAD_NAMESPACE_END
+KINET_NAMESPACE_END

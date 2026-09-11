@@ -1,17 +1,17 @@
-// Copyright (C) 2025 Category Labs, Inc.
+// Copyright (C) 2025 Kinet Labs, Inc.
 //
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the Apache-2.0 license as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
+// Apache-2.0 license for more details.
 //
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// You should have received a copy of the Apache-2.0 license
+// along with this program.  If not, see <http://www.apache.org/licenses/>.
 
 #pragma once
 
@@ -27,9 +27,9 @@
 
 #include <signal.h>
 
-MONAD_NAMESPACE_BEGIN
+KINET_NAMESPACE_BEGIN
 
-struct MonadChain;
+struct KinetChain;
 struct Db;
 class BlockHashBufferFinalized;
 class ExecutionEventRecorder;
@@ -44,10 +44,10 @@ namespace fiber
 // non-null, is the pre-promote migration backfill and is mirrored on every
 // commit; a slot-encoded secondary is post-promote frozen history and takes no
 // writes.
-Result<std::pair<uint64_t, uint64_t>> runloop_monad_ethblocks(
-    MonadChain const &, std::filesystem::path const &, Db &, Db *secondary_db,
+Result<std::pair<uint64_t, uint64_t>> runloop_kinet_ethblocks(
+    KinetChain const &, std::filesystem::path const &, Db &, Db *secondary_db,
     vm::VM &, BlockHashBufferFinalized &, fiber::PriorityPool &, uint64_t &,
     uint64_t, sig_atomic_t const volatile &, bool enable_tracing,
     std::chrono::seconds block_db_timeout, ExecutionEventRecorder *);
 
-MONAD_NAMESPACE_END
+KINET_NAMESPACE_END
